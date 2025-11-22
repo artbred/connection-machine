@@ -30,7 +30,6 @@ def generate_connection_message(profile_content: str) -> str:
 
     url = "https://openrouter.ai/api/v1/chat/completions"
 
-
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
@@ -60,7 +59,7 @@ def generate_connection_message(profile_content: str) -> str:
             message = data["choices"][0]["message"]["content"].strip()
             if len(message) > MAX_MESSAGE_LENTGH:
                 logger.warning("Generated message is too long, truncating...")
-                message = message[:MAX_MESSAGE_LENTGH - 3] + "..."
+                message = message[: MAX_MESSAGE_LENTGH - 3] + "..."
             return message
 
     except Exception as e:
