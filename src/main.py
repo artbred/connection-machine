@@ -171,6 +171,9 @@ def main():
             
             logger.info("Starting task dispatcher loop...")
             while True:
+                new_context = get_session_context(session_id)
+                if new_context:
+                    save_local_context(new_context)
                 try:
                     dispatcher.poll()
                 except SessionExpiredException:
