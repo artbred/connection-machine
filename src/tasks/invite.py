@@ -5,12 +5,13 @@ from markdownify import markdownify as md
 
 logger = logging.getLogger(__name__)
 
+
 class InviteTask(BaseTask):
     def run(self, payload: dict):
         url = payload.get("url")
         if not url:
             raise ValueError("URL is required for invite task")
-            
+
         try_personal_message = payload.get("try_personal_message", True)
         self.send_connection_request(url, try_personal_message)
 
@@ -40,6 +41,19 @@ class InviteTask(BaseTask):
             self.page.goto(url)
 
             self.page.wait_for_selector("h1", timeout=10000)
+            person_name = self.page.locator("h1").last.text_content()
+
+            self.page.locator("button[aria-label='More actions']").last.click()
+
+            try:
+                self.page.wait_for_selector(
+                    f"div[aria-label='Invite {person_name} to connect']", timeout=5000
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Can't find invite button for {url}, possibly already connected"
+                )
+                return
 
             connection_message = None
 
@@ -52,22 +66,26 @@ class InviteTask(BaseTask):
                             f"Generated connection message: {connection_message[:50]}..."
                         )
 
-            person_name = self.page.locator("h1").last.text_content()
-
             self.page.locator("button[aria-label='More actions']").last.click()
-            self.page.locator(f"div[aria-label='Invite {person_name} to connect']").last.click()
+            self.page.locator(
+                f"div[aria-label='Invite {person_name} to connect']"
+            ).last.click()
 
             if connection_message:
                 try:
                     self.page.locator("button[aria-label='Add a note']").last.click()
                     self.page.fill("#custom-message", connection_message)
-                    self.page.locator("button[aria-label='Send invitation']").last.click()
+                    self.page.locator(
+                        "button[aria-label='Send invitation']"
+                    ).last.click()
                 except Exception as e:
                     logger.error(f"Error filling custom message: {e}")
                     return self.send_connection_request(url, False)
 
             else:
-                self.page.locator("button[aria-label='Send without a note']").last.click()
+                self.page.locator(
+                    "button[aria-label='Send without a note']"
+                ).last.click()
 
         except Exception as e:
             logger.error(f"Error sending connection request: {e}")
