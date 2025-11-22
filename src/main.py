@@ -11,6 +11,7 @@ from playwright.sync_api import Page
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from db import get_pending_connections
+from llm import generate_connection_message
 
 load_dotenv()
 
@@ -128,25 +129,31 @@ def login(page):
     except Exception as e:
         logger.error(f"Error logging in: {e}")
 
+
 def get_profile_content(url: str):
     """Get the content of the profile page."""
     try:
-        response = firecrawl.scrape(url, formats=["markdown"], only_main_content=True, fast_mode=True)
+        response = firecrawl.scrape(
+            url, formats=["markdown"], only_main_content=True, fast_mode=True
+        )
         return response.markdown
     except Exception as e:
         logger.error(f"Error getting profile content: {e}")
         return ""
 
-def send_connection_request(page: Page, url: str):
+
+def send_connection_request(page: Page, url: str, try_personal_message: bool = True):
     """Send a connection request to the user."""
     logger.info(f"Sending connection request to {url}...")
 
-    profile_content = get_profile_content(url)
     connection_message = None
 
-    if len(profile_content) > 0:
-        pass
-
+    if try_personal_message:
+        profile_content = get_profile_content(url)
+        if len(profile_content) > 0:
+            connection_message = generate_connection_message(profile_content)
+            if connection_message:
+                logger.info(f"Generated connection message: {connection_message[:50]}...")
 
     try:
         page.goto(url)
@@ -155,8 +162,17 @@ def send_connection_request(page: Page, url: str):
 
         page.locator("button[aria-label='More actions']").last.click()
         page.locator(f"div[aria-label='Invite {person_name} to connect']").last.click()
-        page.locator("button[aria-label='Add a note']").last.click()
 
+        if connection_message:
+            try:
+                page.locator("button[aria-label='Add a note']").last.click()
+                page.fill("#custom-message", connection_message)
+            except Exception as e:
+                logger.error(f"Error filling custom message: {e}")
+                return send_connection_request(page, url, False)
+
+        else:
+            page.locator("button[aria-label='Send without a note']").last.click()
 
     except Exception as e:
         logger.error(f"Error sending connection request: {e}")
