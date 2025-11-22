@@ -16,5 +16,5 @@ services:
     image: ghcr.io/steel-dev/steel-browser
     ports:
       - "127.0.0.1:9223:9223"
-      - "127.0.0.1:3000:3000"
+      - "127.0.0.1:3001:3000"
     restart: unless-stopped
