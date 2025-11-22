@@ -53,10 +53,10 @@ def test_dispatcher():
         assert task.executed_at is not None
         logger.info("Task executed successfully")
 
-    # Test 2: Rate Limiting
-    logger.info("Test 2: Rate Limiting")
+    # Test 2: Rate Limiting and Non-Blocking
+    logger.info("Test 2: Rate Limiting and Non-Blocking")
+    
     # Insert 50 completed tasks for create_post (limit is 50)
-    # We need to manually insert them as "completed" with executed_at
     with SessionLocal() as db:
         for _ in range(50):
             task = Task(
@@ -68,23 +68,75 @@ def test_dispatcher():
             db.add(task)
         db.commit()
         
-    # Create another task
+    # Create a blocked task (create_post) and a non-blocked task (send_invite)
     with SessionLocal() as db:
-        task = Task(
+        blocked_task = Task(
             type=TaskType.CREATE_POST,
-            payload=json.dumps({"content": "Should be rate limited"}),
+            payload=json.dumps({"content": "Blocked"}),
             status=TaskStatus.PENDING
         )
-        db.add(task)
+        db.add(blocked_task)
+        
+        allowed_task = Task(
+            type=TaskType.SEND_INVITE,
+            payload=json.dumps({"url": "http://example.com"}),
+            status=TaskStatus.PENDING
+        )
+        db.add(allowed_task)
         db.commit()
-        task_id = task.id
+        blocked_id = blocked_task.id
+        allowed_id = allowed_task.id
+        
+    # Poll should skip blocked task and pick up allowed task
+    dispatcher.poll()
+    
+    with SessionLocal() as db:
+        blocked = db.query(Task).filter(Task.id == blocked_id).first()
+        allowed = db.query(Task).filter(Task.id == allowed_id).first()
+        
+        assert blocked.status == TaskStatus.PENDING
+        assert allowed.status == TaskStatus.COMPLETED
+        logger.info("Rate limiting correctly skipped blocked task and executed allowed task")
+
+    # Test 3: Zombie Cleanup
+    logger.info("Test 3: Zombie Cleanup")
+    with SessionLocal() as db:
+        zombie = Task(
+            type=TaskType.CREATE_POST,
+            payload=json.dumps({"content": "Zombie"}),
+            status=TaskStatus.PROCESSING
+        )
+        db.add(zombie)
+        db.commit()
+        zombie_id = zombie.id
+        
+    dispatcher.cleanup_zombie_tasks()
+    
+    with SessionLocal() as db:
+        zombie = db.query(Task).filter(Task.id == zombie_id).first()
+        assert zombie.status == TaskStatus.PENDING
+        logger.info("Zombie task correctly reset to PENDING")
+
+    # Test 4: Scheduled Tasks
+    logger.info("Test 4: Scheduled Tasks")
+    future_time = datetime.utcnow() + timedelta(hours=1)
+    with SessionLocal() as db:
+        future_task = Task(
+            type=TaskType.SEND_INVITE,
+            payload=json.dumps({"url": "http://example.com/future"}),
+            status=TaskStatus.PENDING,
+            scheduled_for=future_time
+        )
+        db.add(future_task)
+        db.commit()
+        future_id = future_task.id
         
     dispatcher.poll()
     
     with SessionLocal() as db:
-        task = db.query(Task).filter(Task.id == task_id).first()
-        assert task.status == TaskStatus.PENDING # Should still be pending
-        logger.info("Task correctly rate limited (remains pending)")
+        future = db.query(Task).filter(Task.id == future_id).first()
+        assert future.status == TaskStatus.PENDING
+        logger.info("Future task correctly ignored")
 
 if __name__ == "__main__":
     try:

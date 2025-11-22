@@ -166,7 +166,8 @@ def main():
                 raise Exception("Failed to login to LinkedIn")
 
             dispatcher = TaskDispatcher(page)
-
+            dispatcher.cleanup_zombie_tasks()
+            
             logger.info("Starting task dispatcher loop...")
             while True:
                 dispatcher.poll()

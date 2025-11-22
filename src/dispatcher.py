@@ -1,6 +1,7 @@
 import json
 import logging
 from datetime import datetime, timedelta
+from sqlalchemy import or_
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
@@ -19,6 +20,20 @@ class TaskDispatcher:
             TaskType.SEND_INVITE: 10,
             TaskType.CREATE_POST: 50,
         }
+
+    def cleanup_zombie_tasks(self):
+        """Reset tasks that were stuck in PROCESSING state (e.g. due to crash)."""
+        with SessionLocal() as db:
+            zombies = (
+                db.query(Task)
+                .filter(Task.status == TaskStatus.PROCESSING)
+                .all()
+            )
+            if zombies:
+                logger.warning(f"Found {len(zombies)} zombie tasks. Resetting to PENDING.")
+                for task in zombies:
+                    task.status = TaskStatus.PENDING
+                db.commit()
 
     def check_rate_limit(self, task_type: TaskType) -> bool:
         """Check if the rate limit for the given task type has been reached."""
@@ -50,44 +65,54 @@ class TaskDispatcher:
     def poll(self):
         """Fetch and execute pending tasks."""
         with SessionLocal() as db:
-            # Get the next pending task
-            task = (
+            # Get pending tasks, ordered by priority/time
+            # We fetch a batch to find one that isn't rate limited
+            tasks = (
                 db.query(Task)
-                .filter(Task.status == TaskStatus.PENDING)
+                .filter(
+                    Task.status == TaskStatus.PENDING,
+                    or_(Task.scheduled_for.is_(None), Task.scheduled_for <= datetime.utcnow())
+                )
                 .order_by(Task.created_at)
-                .first()
+                .limit(10) # Fetch top 10 to avoid blocking if first one is rate limited
+                .all()
             )
 
-            if not task:
+            if not tasks:
                 return
 
-            logger.info(f"Found task: {task}")
-
-            # Check rate limit
-            if not self.check_rate_limit(task.type):
-                # Skip this task for now
+            task_to_run = None
+            for task in tasks:
+                if self.check_rate_limit(task.type):
+                    task_to_run = task
+                    break
+            
+            if not task_to_run:
+                logger.info("All pending tasks are currently rate limited.")
                 return
+
+            logger.info(f"Found task: {task_to_run}")
 
             # Mark as processing
-            task.status = TaskStatus.PROCESSING
+            task_to_run.status = TaskStatus.PROCESSING
             db.commit()
 
             try:
-                handler = self.handlers.get(task.type)
+                handler = self.handlers.get(task_to_run.type)
                 if not handler:
-                    raise ValueError(f"No handler for task type: {task.type}")
+                    raise ValueError(f"No handler for task type: {task_to_run.type}")
 
-                payload = json.loads(task.payload)
+                payload = json.loads(task_to_run.payload)
                 handler.run(payload)
 
                 # Mark as completed
-                task.status = TaskStatus.COMPLETED
-                task.executed_at = datetime.utcnow()
-
+                task_to_run.status = TaskStatus.COMPLETED
+                task_to_run.executed_at = datetime.utcnow()
+                
             except Exception as e:
                 logger.error(f"Task failed: {e}")
-                task.status = TaskStatus.FAILED
-                task.error = str(e)
+                task_to_run.status = TaskStatus.FAILED
+                task_to_run.error = str(e)
 
             finally:
                 db.commit()
