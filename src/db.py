@@ -81,7 +81,13 @@ def get_pending_connections(limit: int = 10) -> list[Connection]:
         list[Connection]: A list of Connection objects. Defaults to 10.
     """
     with SessionLocal() as db:
-        return db.query(Connection).filter(Connection.is_sent.is_(False)).order_by(desc(Connection.created_at)).limit(limit).all()
+        return (
+            db.query(Connection)
+            .filter(Connection.is_sent.is_(False))
+            .order_by(desc(Connection.created_at))
+            .limit(limit)
+            .all()
+        )
 
 
 if __name__ == "__main__":

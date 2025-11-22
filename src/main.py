@@ -176,6 +176,7 @@ def send_connection_request(page: Page, url: str, try_personal_message: bool = T
             try:
                 page.locator("button[aria-label='Add a note']").last.click()
                 page.fill("#custom-message", connection_message)
+                page.locator("button[aria-label='Send invitation']").last.click()
             except Exception as e:
                 logger.error(f"Error filling custom message: {e}")
                 return send_connection_request(page, url, False)
