@@ -186,6 +186,8 @@ def main():
 
                 time.sleep(10)
 
+            browser.close()
+
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
@@ -193,7 +195,6 @@ def main():
         if new_context:
             save_local_context(new_context)
 
-        browser.close()
         if session_id:
             release_session(session_id)
 
