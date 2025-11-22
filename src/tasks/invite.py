@@ -50,10 +50,7 @@ class InviteTask(BaseTask):
                     f"div[aria-label='Invite {person_name} to connect']", timeout=5000
                 )
             except Exception as e:
-                logger.warning(
-                    f"Can't find invite button for {url}, possibly already connected"
-                )
-                return
+                raise Exception("Can't find invite button, possibly already connected")
 
             connection_message = None
 
