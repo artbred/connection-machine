@@ -27,7 +27,6 @@ class InviteTask(BaseTask):
             else:
                 html = self.page.content()
 
-            # Convert HTML to Markdown
             return md(html)
         except Exception as e:
             logger.error(f"Error getting profile content: {e}")
@@ -49,7 +48,7 @@ class InviteTask(BaseTask):
                 self.page.wait_for_selector(
                     f"div[aria-label='Invite {person_name} to connect']", timeout=5000
                 )
-            except Exception as e:
+            except Exception:
                 raise Exception("Can't find invite button, possibly already connected")
 
             connection_message = None
