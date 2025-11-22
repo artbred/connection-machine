@@ -14,3 +14,14 @@ class BaseTask(ABC):
         Execute the task with the given payload.
         """
         pass
+
+    def validate_session(self):
+        """
+        Check if the session is still valid.
+        Raises SessionExpiredException if not.
+        """
+        # Simple check: look for login form
+        # Note: This is a basic check. More robust checks might be needed depending on the page state.
+        if self.page.locator("form.login__form").count() > 0:
+            from exceptions import SessionExpiredException
+            raise SessionExpiredException("Login form detected")

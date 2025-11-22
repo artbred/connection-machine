@@ -5,6 +5,7 @@ from sqlalchemy import or_
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
+from exceptions import SessionExpiredException
 
 logger = logging.getLogger(__name__)
 
@@ -109,10 +110,18 @@ class TaskDispatcher:
                 task_to_run.status = TaskStatus.COMPLETED
                 task_to_run.executed_at = datetime.utcnow()
                 
+            except SessionExpiredException as e:
+                logger.warning(f"Session expired during task {task_to_run.id}: {e}")
+                # Reset task to PENDING so it can be retried after re-auth
+                task_to_run.status = TaskStatus.PENDING
+                db.commit()
+                raise e
+
             except Exception as e:
                 logger.error(f"Task failed: {e}")
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = str(e)
+                db.commit()
 
             finally:
                 db.commit()

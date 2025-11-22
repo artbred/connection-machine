@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
 from db import init_db
 from dispatcher import TaskDispatcher
+from exceptions import SessionExpiredException
 
 load_dotenv()
 
@@ -170,7 +171,19 @@ def main():
             
             logger.info("Starting task dispatcher loop...")
             while True:
-                dispatcher.poll()
+                try:
+                    dispatcher.poll()
+                except SessionExpiredException:
+                    logger.warning("Session expired. Re-authenticating...")
+                    login(page)
+                    # Verify login
+                    if not check_linkedin_auth(page):
+                        logger.error("Re-authentication failed.")
+                        # Optionally break or sleep longer
+                        time.sleep(60)
+                    else:
+                        logger.info("Re-authentication successful.")
+
                 time.sleep(10)
 
     except Exception as e:
