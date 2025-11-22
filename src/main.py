@@ -5,18 +5,16 @@ import os
 import json
 import time
 
-from firecrawl import Firecrawl
 from playwright.sync_api import Page
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from markdownify import markdownify as md
 from db import get_pending_connections
 from llm import generate_connection_message
 
 load_dotenv()
 
-
-firecrawl = Firecrawl(api_key=os.getenv("FIRECRAWL_API_KEY"))
 
 # Configure logging
 logging.basicConfig(
@@ -130,13 +128,20 @@ def login(page):
         logger.error(f"Error logging in: {e}")
 
 
-def get_profile_content(url: str):
-    """Get the content of the profile page."""
+def get_profile_content(page: Page):
+    """Get the content of the profile page using Playwright."""
     try:
-        response = firecrawl.scrape(
-            url, formats=["markdown"], only_main_content=True, fast_mode=True
-        )
-        return response.markdown
+        # Wait for the main content to load
+        page.wait_for_selector("main", state="attached", timeout=5000)
+
+        # Get the HTML content of the main element
+        if page.locator("main").count() > 0:
+            html = page.locator("main").inner_html()
+        else:
+            html = page.content()
+
+        # Convert HTML to Markdown
+        return md(html)
     except Exception as e:
         logger.error(f"Error getting profile content: {e}")
         return ""
@@ -146,17 +151,21 @@ def send_connection_request(page: Page, url: str, try_personal_message: bool = T
     """Send a connection request to the user."""
     logger.info(f"Sending connection request to {url}...")
 
-    connection_message = None
-
-    if try_personal_message:
-        profile_content = get_profile_content(url)
-        if len(profile_content) > 0:
-            connection_message = generate_connection_message(profile_content)
-            if connection_message:
-                logger.info(f"Generated connection message: {connection_message[:50]}...")
-
     try:
         page.goto(url)
+
+        page.wait_for_selector("h1", timeout=10000)
+
+        connection_message = None
+
+        if try_personal_message:
+            profile_content = get_profile_content(page)
+            if len(profile_content) > 0:
+                connection_message = generate_connection_message(profile_content)
+                if connection_message:
+                    logger.info(
+                        f"Generated connection message: {connection_message[:50]}..."
+                    )
 
         person_name = page.locator("h1").last.text_content()
 

@@ -4,12 +4,12 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-MAX_MESSAGE_LENGTH = 150
+MAX_MESSAGE_LENTGH = 200
 
 # Prompt for generating connection messages
 CONNECTION_MESSAGE_PROMPT = """
 You are a professional networking assistant.
-Generate a personalized LinkedIn connection message (maximum {MAX_MESSAGE_LENGTH} characters) based on the provided profile content.
+Generate a personalized LinkedIn connection message (maximum {max_message_length} characters) based on the provided profile content.
 The message should be polite, professional, and mention specific details from the user's experience or summary to show genuine interest.
 Do not include placeholders like "[Your Name]" - write it as a template ready to send or generic enough.
 Focus on finding common ground or appreciating their work.
@@ -44,11 +44,11 @@ def generate_connection_message(profile_content: str) -> str:
                 "role": "user",
                 "content": CONNECTION_MESSAGE_PROMPT.format(
                     profile_content=profile_content,
-                    max_message_length=MAX_MESSAGE_LENGTH
+                    max_message_length=MAX_MESSAGE_LENTGH,
                 ),
             }
         ],
-        "temperature": 0.6
+        "temperature": 0.6,
     }
 
     try:
@@ -58,10 +58,9 @@ def generate_connection_message(profile_content: str) -> str:
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
             message = data["choices"][0]["message"]["content"].strip()
-            # Ensure it's not too long (LinkedIn limit is 300)
-            if len(message) > MAX_MESSAGE_LENGTH:
+            if len(message) > MAX_MESSAGE_LENTGH:
                 logger.warning("Generated message is too long, truncating...")
-                message = message[:297] + "..."
+                message = message[:MAX_MESSAGE_LENTGH - 3] + "..."
             return message
 
     except Exception as e:
