@@ -123,6 +123,7 @@ def login(page):
         page.fill("#username", os.getenv("LINKEDIN_USERNAME"))
         page.fill("#password", os.getenv("LINKEDIN_PASSWORD"))
         page.click("button[type='submit']")
+        time.sleep(60)
     except Exception as e:
         logger.error(f"Error logging in: {e}")
 
