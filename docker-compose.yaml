@@ -16,8 +16,8 @@ services:
   steel:
     image: ghcr.io/steel-dev/steel-browser
     ports:
-      - "9223:9223"
-      - "3000:3000"
+      - "127.0.0.1:9223:9223"
+      - "127.0.0.1:3000:3000"
     healthcheck:
       test: [ "CMD", "curl", "-f", "http://localhost:3000/v1/health" ]
       interval: 5s
