@@ -64,6 +64,11 @@ def create_session(context=None):
         "deviceConfig": {"device": "desktop"},
     }
 
+    proxy_url = os.getenv("STEEL_PROXY")
+    if proxy_url:
+        logger.info(f"Using proxy: {proxy_url}")
+        payload["proxy"] = proxy_url
+
     if context:
         logger.info("Injecting existing session context...")
         payload["sessionContext"] = context
@@ -128,6 +133,20 @@ def login(page):
         logger.error(f"Error logging in: {e}")
 
 
+def check_ip(page):
+    """Check and log the current IP address."""
+    logger.info("Checking current IP address...")
+    try:
+        response = page.goto("https://api.ipify.org?format=json")
+        if response and response.ok:
+            ip_data = json.loads(response.text())
+            logger.info(f"Current IP: {ip_data.get('ip')}")
+        else:
+            logger.warning("Failed to get IP address.")
+    except Exception as e:
+        logger.error(f"Error checking IP: {e}")
+
+
 def main():
     init_db()
     session_id = None
@@ -153,6 +172,8 @@ def main():
             # Get the default context that was created with our session options
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[0] if context.pages else context.new_page()
+
+            check_ip(page)
 
             is_logged_in = False
 
