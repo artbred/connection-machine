@@ -1,11 +1,12 @@
 import json
 import logging
 import os
+import signal
 import socket
-import subprocess
+import sys
+import threading
 import time
-import urllib.request
-from contextlib import contextmanager
+import urllib
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -14,12 +15,12 @@ from db import init_db
 from dispatcher import TaskDispatcher
 from exceptions import SessionExpiredException
 
+# Global shutdown flag
+shutdown_event = threading.Event()
+
 # --- Configuration ---
 INTERNAL_DEBUG_PORT = 9224
-SOCKS_HOST = os.getenv("SOCKS_HOST")  # e.g., proxy.example.com
-SOCKS_PORT = os.getenv("SOCKS_PORT", "1080")
-SOCKS_USER = os.getenv("SOCKS_USER")
-SOCKS_PASS = os.getenv("SOCKS_PASS")
+SOCKS_PROXY = os.getenv("SOCKS_PROXY")
 
 load_dotenv()
 
@@ -52,55 +53,6 @@ def get_free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("", 0))
         return s.getsockname()[1]
-
-
-@contextmanager
-def proxy_bridge():
-    """
-    Starts a local pproxy instance to bridge auth if credentials are provided.
-    Returns the string address (e.g., 'socks5://127.0.0.1:12345') or None.
-    """
-    # 1. If no proxy host is set, return None (Direct Connection)
-    if not SOCKS_HOST:
-        yield None
-        return
-
-    # 2. Calculate upstream URL
-    # Format: socks5://user:pass@host:port
-    if SOCKS_USER and SOCKS_PASS:
-        upstream = f"socks5://{SOCKS_USER}:{SOCKS_PASS}@{SOCKS_HOST}:{SOCKS_PORT}"
-    else:
-        upstream = f"socks5://{SOCKS_HOST}:{SOCKS_PORT}"
-
-    # 3. Find a local port and start pproxy
-    local_port = get_free_port()
-
-    # pproxy command: listen on local_port, relay to upstream
-    cmd = [
-        "pproxy",
-        "-l",
-        f"socks5://127.0.0.1:{local_port}",
-        "-r",
-        upstream,
-        "-v",  # verbose (optional)
-    ]
-
-    print(
-        f"[Proxy] Starting bridge: 127.0.0.1:{local_port} -> {SOCKS_HOST}:{SOCKS_PORT}"
-    )
-
-    # Start pproxy in the background
-    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-    # Give it a moment to bind
-    time.sleep(0.5)
-
-    try:
-        yield f"socks5://127.0.0.1:{local_port}"
-    finally:
-        print("[Proxy] Shutting down bridge...")
-        proc.terminate()
-        proc.wait()
 
 
 def login(page):
@@ -143,75 +95,103 @@ def log_ws_endpoint():
         logger.error(f"Failed to get DevTools URL: {e}")
 
 
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    signal_name = signal.Signals(signum).name
+    logger.info(f"Received {signal_name} signal. Initiating graceful shutdown...")
+    shutdown_event.set()
+
+
 def main():
+    # Register signal handlers for graceful shutdown
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+
+    logger.info("Initializing database...")
     init_db()
 
     try:
-        with proxy_bridge() as local_proxy_url:
-            launch_args = [
-                f"--remote-debugging-port={INTERNAL_DEBUG_PORT}",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-allow-origins=*",
-                "--no-sandbox",
-            ]
+        launch_args = [
+            f"--remote-debugging-port={INTERNAL_DEBUG_PORT}",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-allow-origins=*",
+            "--no-sandbox",
+        ]
 
-            launch_args.append("--proxy-server=socks5://127.0.0.1:10808")
+        if len(SOCKS_PROXY) > 0:
+            launch_args.append(f"--proxy-server={SOCKS_PROXY}")
 
-            # if local_proxy_url:
-            #     launch_args.append("--proxy-server=socks5://127.0.0.1:10808")
+        with sync_playwright() as p:
+            logger.info("Launching browser with persistent context...")
+            browser = p.chromium.launch_persistent_context(
+                user_data_dir="./data/trel-chrome",
+                headless=False,
+                args=launch_args,
+            )
 
-            with sync_playwright() as p:
-                browser = p.chromium.launch_persistent_context(
-                    user_data_dir="./data/trel-chrome",
-                    headless=False,
-                    args=launch_args,
-                )
+            log_ws_endpoint()
 
-                log_ws_endpoint()
+            page = browser.new_page()
+            check_ip(page)
 
-                page = browser.new_page()
-                check_ip(page)
+            is_logged_in = False
+            max_login_attempts = 5
 
-                is_logged_in = False
-                max_login_attempts = 5
+            for _ in range(max_login_attempts):
+                if shutdown_event.is_set():
+                    logger.info("Shutdown requested during login. Exiting...")
+                    break
 
-                for _ in range(max_login_attempts):
-                    if check_linkedin_auth(page):
-                        is_logged_in = True
-                        break
-                    else:
-                        login(page)
-                        time.sleep(5)
+                if check_linkedin_auth(page):
+                    is_logged_in = True
+                    break
+                else:
+                    login(page)
+                    time.sleep(5)
 
-                if not is_logged_in:
-                    raise Exception("Failed to login to LinkedIn")
-
-                dispatcher = TaskDispatcher(page)
-                dispatcher.cleanup_zombie_tasks()
-
-                logger.info("Starting task dispatcher loop...")
-                while True:
-                    try:
-                        dispatcher.poll()
-                    except SessionExpiredException:
-                        logger.warning("Session expired. Re-authenticating...")
-                        login(page)
-                        if not check_linkedin_auth(page):
-                            logger.error("Re-authentication failed.")
-                            time.sleep(60)
-                            max_login_attempts -= 1
-                            if max_login_attempts == 0:
-                                raise Exception("Failed to re-authenticate to LinkedIn")
-                        else:
-                            max_login_attempts = 5
-                            logger.info("Re-authentication successful.")
-
-                    time.sleep(10)
-
+            if shutdown_event.is_set():
+                logger.info("Gracefully closing browser and saving cookies...")
                 browser.close()
+                logger.info("Browser closed successfully. Cookies and state saved.")
+                return
 
+            if not is_logged_in:
+                raise Exception("Failed to login to LinkedIn")
+
+            dispatcher = TaskDispatcher(page)
+            dispatcher.cleanup_zombie_tasks()
+
+            logger.info("Starting task dispatcher loop...")
+            while not shutdown_event.is_set():
+                try:
+                    dispatcher.poll()
+                except SessionExpiredException:
+                    logger.warning("Session expired. Re-authenticating...")
+                    login(page)
+                    if not check_linkedin_auth(page):
+                        logger.error("Re-authentication failed.")
+                        time.sleep(60)
+                        max_login_attempts -= 1
+                        if max_login_attempts == 0:
+                            raise Exception("Failed to re-authenticate to LinkedIn")
+                    else:
+                        max_login_attempts = 5
+                        logger.info("Re-authentication successful.")
+
+                time.sleep(10)
+
+            logger.info("Gracefully closing browser and saving cookies...")
+            browser.close()
+            logger.info("Browser closed successfully. Cookies and state saved.")
+
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received. Shutting down...")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
+    finally:
+
+        logger.info("Shutdown complete. Exiting.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
