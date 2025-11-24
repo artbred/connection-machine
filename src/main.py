@@ -67,7 +67,9 @@ def create_session(context=None):
     proxy_url = os.getenv("STEEL_PROXY")
     if proxy_url:
         logger.info(f"Using proxy: {proxy_url}")
-        payload["proxy"] = proxy_url
+        payload["use_proxy"] = {
+            "server": proxy_url
+        }
 
     if context:
         logger.info("Injecting existing session context...")
