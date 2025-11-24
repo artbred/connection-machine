@@ -6,9 +6,6 @@ services:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      - API_BASE_URL=http://steel:3000
-      - WS_URL=ws://steel:3000
     volumes:
       - ./session_context.json:/app/session_context.json
     restart: unless-stopped
