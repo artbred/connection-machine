@@ -163,19 +163,29 @@ def main():
                     dispatcher.poll()
                 except SessionExpiredException:
                     logger.warning("Session expired. Re-authenticating...")
-                    login(page)
-                    if not check_linkedin_auth(page):
-                        logger.error("Re-authentication failed.")
-                        time.sleep(60)
-                        max_login_attempts -= 1
-                        if max_login_attempts == 0:
-                            raise Exception("Failed to re-authenticate to LinkedIn")
-                    else:
-                        max_login_attempts = 5
-                        logger.info("Re-authentication successful.")
+
+                    re_authenticated = False
+                    for attempt in range(max_login_attempts):
+                        if shutdown_event.is_set():
+                            break
+
+                        login(page)
+                        if check_linkedin_auth(page):
+                            logger.info("Re-authentication successful.")
+                            re_authenticated = True
+                            break
+                        else:
+                            logger.error(
+                                f"Re-authentication attempt {attempt + 1}/5 failed."
+                            )
+                            time.sleep(60)
+
+                    if not re_authenticated:
+                        raise Exception(
+                            "Failed to re-authenticate to LinkedIn after 5 attempts"
+                        )
 
                 time.sleep(10)
-
 
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received.")
