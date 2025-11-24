@@ -8,6 +8,7 @@ dependencies = [
     "httpx>=0.28.1",
     "markdownify>=1.2.2",
     "playwright>=1.56.0",
+    "pproxy>=2.7.9",
     "psycopg2-binary>=2.9.11",
     "python-dotenv>=1.2.1",
     "sqlalchemy>=2.0.44",

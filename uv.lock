@@ -171,6 +171,14 @@ wheels = [
 ]
 
 [[package]]
+name = "pproxy"
+version = "2.7.9"
+source = { registry = "https://pypi.org/simple" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/c6/673a10a729061d2594b85aedd7dd2e470db4d54b12d4f95a306353bb2967/pproxy-2.7.9-py3-none-any.whl", hash = "sha256:a073d02616a47c43e1d20a547918c307dbda598c6d53869b165025f3cfe58e80", size = 42842, upload-time = "2024-01-16T11:33:35.286Z" },
+]
+
+[[package]]
 name = "psycopg2-binary"
 version = "2.9.11"
 source = { registry = "https://pypi.org/simple" }
@@ -315,6 +323,7 @@ dependencies = [
     { name = "httpx" },
     { name = "markdownify" },
     { name = "playwright" },
+    { name = "pproxy" },
     { name = "psycopg2-binary" },
     { name = "python-dotenv" },
     { name = "sqlalchemy" },
@@ -325,6 +334,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "markdownify", specifier = ">=1.2.2" },
     { name = "playwright", specifier = ">=1.56.0" },
+    { name = "pproxy", specifier = ">=2.7.9" },
     { name = "psycopg2-binary", specifier = ">=2.9.11" },
     { name = "python-dotenv", specifier = ">=1.2.1" },
     { name = "sqlalchemy", specifier = ">=2.0.44" },
