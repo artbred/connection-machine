@@ -42,7 +42,6 @@ def check_linkedin_auth(page):
             return False
 
         return True
-
     except Exception as e:
         logger.error(f"Error checking auth: {e}")
         return False
@@ -58,6 +57,7 @@ def get_free_port():
 def login(page):
     """Login to LinkedIn."""
     logger.info("Logging in to LinkedIn...")
+    page.goto("https://www.linkedin.com/login")
     try:
         page.fill("#username", os.getenv("LINKEDIN_USERNAME"))
         page.fill("#password", os.getenv("LINKEDIN_PASSWORD"))
@@ -118,7 +118,7 @@ def main():
             "--no-sandbox",
         ]
 
-        if len(SOCKS_PROXY) > 0:
+        if SOCKS_PROXY and len(SOCKS_PROXY) > 0:
             launch_args.append(f"--proxy-server={SOCKS_PROXY}")
 
         with sync_playwright() as p:
@@ -139,7 +139,6 @@ def main():
 
             for _ in range(max_login_attempts):
                 if shutdown_event.is_set():
-                    logger.info("Shutdown requested during login. Exiting...")
                     break
 
                 if check_linkedin_auth(page):
@@ -150,9 +149,6 @@ def main():
                     time.sleep(5)
 
             if shutdown_event.is_set():
-                logger.info("Gracefully closing browser and saving cookies...")
-                browser.close()
-                logger.info("Browser closed successfully. Cookies and state saved.")
                 return
 
             if not is_logged_in:
@@ -180,17 +176,13 @@ def main():
 
                 time.sleep(10)
 
-            logger.info("Gracefully closing browser and saving cookies...")
-            browser.close()
-            logger.info("Browser closed successfully. Cookies and state saved.")
 
     except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received. Shutting down...")
+        logger.info("KeyboardInterrupt received.")
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
-
-        logger.info("Shutdown complete. Exiting.")
+        logger.info("Shutdown complete.")
         sys.exit(0)
 
 
