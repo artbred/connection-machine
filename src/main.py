@@ -21,6 +21,7 @@ shutdown_event = threading.Event()
 # --- Configuration ---
 INTERNAL_DEBUG_PORT = 9224
 SOCKS_PROXY = os.getenv("SOCKS_PROXY")
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
 load_dotenv()
 
@@ -125,7 +126,7 @@ def main():
             logger.info("Launching browser with persistent context...")
             browser = p.chromium.launch_persistent_context(
                 user_data_dir="./data/trel-chrome",
-                headless=False,
+                headless=HEADLESS,
                 args=launch_args,
             )
 

@@ -30,7 +30,7 @@ RUN playwright install --with-deps chromium
 RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
 
 # Copy startup script
-COPY start.sh /app/start.sh
+COPY /utils/start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
 # Reset the entrypoint, don't invoke `uv`
