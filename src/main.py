@@ -69,7 +69,7 @@ def create_session(context=None):
         logger.info(f"Using proxy: {proxy_url}")
         payload["use_proxy"] = json.dumps({"server": proxy_url})
 
-    print(payload)
+    logger.info(f"Payload: {payload}")
 
     if context:
         logger.info("Injecting existing session context...")
