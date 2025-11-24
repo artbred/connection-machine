@@ -2,6 +2,7 @@ import logging
 import os
 import json
 import time
+import urllib.request
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -61,21 +62,36 @@ def check_ip(page):
         logger.error(f"Error checking IP: {e}")
 
 
+def log_ws_endpoint():
+    """Fetch and log the DevTools WebSocket URL."""
+    try:
+        # Give the browser a moment to ensure the DevTools server is up
+        time.sleep(2)
+        with urllib.request.urlopen("http://127.0.0.1:9224/json/version") as response:
+            data = json.loads(response.read().decode())
+            logger.info(f"DevTools listening on {data['webSocketDebuggerUrl']}")
+    except Exception as e:
+        logger.error(f"Failed to get DevTools URL: {e}")
+
+
 def main():
     init_db()
-    
+
     try:
         with sync_playwright() as p:
             browser = p.chromium.launch_persistent_context(
-                user_data_dir="/tmp/trel-chrome",
-                headless=False,
+                user_data_dir="./data/trel-chrome",
+                headless=True,
                 args=[
-                    "--remote-debugging-port=9222",
-                    "--remote-debugging-address=0.0.0.0",
+                    "--remote-debugging-port=9224",
                     "--no-sandbox",
+                    "--remote-debugging-address=127.0.0.1"
+                    "--remote-allow-origins=*",
                 ],
             )
-            
+
+            log_ws_endpoint()
+
             page = browser.new_page()
             check_ip(page)
 
@@ -94,7 +110,7 @@ def main():
 
             dispatcher = TaskDispatcher(page)
             dispatcher.cleanup_zombie_tasks()
-            
+
             logger.info("Starting task dispatcher loop...")
             while True:
                 try:
@@ -114,6 +130,7 @@ def main():
 
     except Exception as e:
         logger.error(f"An error occurred: {e}")
+
 
 if __name__ == "__main__":
     main()

@@ -1,6 +1,14 @@
 services:
   trel:
-    build: .
+    build:
+      context: .
     env_file:
       - .env
+    environment:
+      - CHROME_PORT=9225
     restart: unless-stopped
+    ports:
+      - "127.0.0.1:9225:9225"
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - ./data/trel-chrome:/app/data/trel-chrome

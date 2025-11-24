@@ -23,7 +23,17 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Install Playwright browsers and system dependencies
+RUN playwright install --with-deps chromium
+
+# Install ncat for port forwarding
+RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
+
+# Copy startup script
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
 # Reset the entrypoint, don't invoke `uv`
 ENTRYPOINT []
 
-CMD ["python", "src/main.py"]
+CMD ["/app/start.sh"]
