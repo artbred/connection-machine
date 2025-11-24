@@ -1,23 +1,6 @@
 services:
   trel:
     build: .
-    depends_on:
-      steel:
-        condition: service_healthy
     env_file:
       - .env
-    volumes:
-      - ./session_context.json:/app/session_context.json
-    restart: unless-stopped
-
-  steel:
-    image: ghcr.io/steel-dev/steel-browser
-    ports:
-      - "127.0.0.1:9223:9223"
-      - "127.0.0.1:3000:3000"
-    healthcheck:
-      test: [ "CMD", "curl", "-f", "http://localhost:3000/v1/health" ]
-      interval: 5s
-      timeout: 5s
-      retries: 10
     restart: unless-stopped
