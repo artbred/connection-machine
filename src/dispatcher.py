@@ -25,13 +25,11 @@ class TaskDispatcher:
     def cleanup_zombie_tasks(self):
         """Reset tasks that were stuck in PROCESSING state (e.g. due to crash)."""
         with SessionLocal() as db:
-            zombies = (
-                db.query(Task)
-                .filter(Task.status == TaskStatus.PROCESSING)
-                .all()
-            )
+            zombies = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).all()
             if zombies:
-                logger.warning(f"Found {len(zombies)} zombie tasks. Resetting to PENDING.")
+                logger.warning(
+                    f"Found {len(zombies)} zombie tasks. Resetting to PENDING."
+                )
                 for task in zombies:
                     task.status = TaskStatus.PENDING
                 db.commit()
@@ -72,10 +70,15 @@ class TaskDispatcher:
                 db.query(Task)
                 .filter(
                     Task.status == TaskStatus.PENDING,
-                    or_(Task.scheduled_for.is_(None), Task.scheduled_for <= datetime.utcnow())
+                    or_(
+                        Task.scheduled_for.is_(None),
+                        Task.scheduled_for <= datetime.utcnow(),
+                    ),
                 )
                 .order_by(Task.created_at)
-                .limit(10) # Fetch top 10 to avoid blocking if first one is rate limited
+                .limit(
+                    10
+                )  # Fetch top 10 to avoid blocking if first one is rate limited
                 .all()
             )
 
@@ -87,7 +90,7 @@ class TaskDispatcher:
                 if self.check_rate_limit(task.type):
                     task_to_run = task
                     break
-            
+
             if not task_to_run:
                 logger.info("All pending tasks are currently rate limited.")
                 return
@@ -109,7 +112,7 @@ class TaskDispatcher:
                 # Mark as completed
                 task_to_run.status = TaskStatus.COMPLETED
                 task_to_run.executed_at = datetime.utcnow()
-                
+
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")
                 # Reset task to PENDING so it can be retried after re-auth
@@ -122,6 +125,11 @@ class TaskDispatcher:
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = str(e)
                 db.commit()
-
+                
             finally:
                 db.commit()
+                try:
+                    logger.info("Navigating back to feed after task...")
+                    self.page.goto("https://www.linkedin.com/feed/", timeout=60000, wait_until="domcontentloaded")
+                except Exception as nav_e:
+                    logger.error(f"Failed to navigate back to feed: {nav_e}")
