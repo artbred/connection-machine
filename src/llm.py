@@ -40,7 +40,7 @@ def generate_connection_message(profile_content: str) -> str:
     }
 
     payload = {
-        "model": "qwen/qwen3-max",
+        "model": "qwen/qwen3-next-80b-a3b-instruct",
         "messages": [
             {
                 "role": "user",
