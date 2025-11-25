@@ -5,7 +5,6 @@ import signal
 import socket
 import sys
 import threading
-import time
 import urllib
 
 from dotenv import load_dotenv
@@ -64,7 +63,7 @@ def login(page):
         page.fill("#username", os.getenv("LINKEDIN_USERNAME"))
         page.fill("#password", os.getenv("LINKEDIN_PASSWORD"))
         page.click("button[type='submit']")
-        time.sleep(60)
+        shutdown_event.wait(60)
     except Exception as e:
         logger.error(f"Error logging in: {e}")
 
@@ -87,7 +86,7 @@ def log_ws_endpoint():
     """Fetch and log the DevTools WebSocket URL."""
     try:
         # Give the browser a moment to ensure the DevTools server is up
-        time.sleep(2)
+        shutdown_event.wait(2)
         with urllib.request.urlopen(
             f"http://127.0.0.1:{INTERNAL_DEBUG_PORT}/json/version"
         ) as response:
@@ -154,7 +153,8 @@ def main():
                     break
                 else:
                     login(page)
-                    time.sleep(5)
+                    if shutdown_event.wait(5):
+                        break
 
             if shutdown_event.is_set():
                 return
@@ -186,14 +186,18 @@ def main():
                             logger.error(
                                 f"Re-authentication attempt {attempt + 1}/5 failed."
                             )
-                            time.sleep(60)
+                            if shutdown_event.wait(60):
+                                break
 
                     if not re_authenticated:
+                        if shutdown_event.is_set():
+                            break
                         raise Exception(
                             "Failed to re-authenticate to LinkedIn after 5 attempts"
                         )
 
-                time.sleep(10)
+                if shutdown_event.wait(10):
+                    break
 
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt received.")
