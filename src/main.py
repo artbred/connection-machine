@@ -135,7 +135,7 @@ def main():
         with sync_playwright() as p:
             context = p.chromium.launch_persistent_context(
                 user_data_dir,
-                headless=True,
+                headless=HEADLESS,
                 channel="chrome",
                 ignore_https_errors=True,
                 args=launch_args,
@@ -145,6 +145,12 @@ def main():
             log_ws_endpoint()
 
             page = context.new_page()
+            page.goto("https://deviceandbrowserinfo.com/are_you_a_bot")
+            import time
+
+            time.sleep(60)
+            page.screenshot(path="screenshot.png")
+            return
             check_ip(page)
 
             is_logged_in = False
