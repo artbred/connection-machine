@@ -24,7 +24,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 ENV PATH="/app/.venv/bin:$PATH"
 
 # Install Playwright browsers and system dependencies
-RUN patchright install --with-deps chrome
+RUN patchright install --with-deps chromium
 
 # Install ncat for port forwarding
 RUN apt-get update && apt-get install -y socat && rm -rf /var/lib/apt/lists/*
