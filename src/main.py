@@ -10,6 +10,7 @@ import urllib
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
+from playwright_stealth import stealth_sync
 
 from db import init_db
 from dispatcher import TaskDispatcher
@@ -133,6 +134,7 @@ def main():
             log_ws_endpoint()
 
             page = browser.new_page()
+            stealth_sync(page)
             check_ip(page)
 
             is_logged_in = False
