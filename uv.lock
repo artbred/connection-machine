@@ -152,6 +152,25 @@ wheels = [
 ]
 
 [[package]]
+name = "patchright"
+version = "1.56.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "greenlet" },
+    { name = "pyee" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/0d/d6/ac03353f1b3138541356a044c2d7d3e01b73f9555c7281dab3423c5d44da/patchright-1.56.0-py3-none-macosx_10_13_x86_64.whl", hash = "sha256:9df1e0b2c35a298ad2807044699476d3e872f76117c319077b68d7b8ac8bffae", size = 40595069, upload-time = "2025-11-11T18:59:20.801Z" },
+    { url = "https://files.pythonhosted.org/packages/a8/f2/e33cd3e6916ed959f5b9be1182363e19771be81541a77b2c5615a6434cc8/patchright-1.56.0-py3-none-macosx_11_0_arm64.whl", hash = "sha256:e0d8e86d743f4da99f83e9962f9317bd3aaabe4e9db86d3e12cb1d0f39e2f469", size = 39383869, upload-time = "2025-11-11T18:59:23.829Z" },
+    { url = "https://files.pythonhosted.org/packages/5f/49/510b8fb761a7e6a2cbd8381f2254fd9442055e27961c0565944d5634ccb6/patchright-1.56.0-py3-none-macosx_11_0_universal2.whl", hash = "sha256:e939a9651ebad6ed5afb84e6cf8b874fd80e4b03a912509dc5159f0fa2d4a752", size = 40595069, upload-time = "2025-11-11T18:59:26.9Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/ad/17f72b906a1d3d9750b26964d4481340defbfc02f039c888756061f41a33/patchright-1.56.0-py3-none-manylinux1_x86_64.whl", hash = "sha256:cef0f31334dece118fa8dbe20e0c0ac97ea539a2a3e7dd007a67d05b4c3e0512", size = 46246766, upload-time = "2025-11-11T18:59:29.985Z" },
+    { url = "https://files.pythonhosted.org/packages/53/b4/6546fb868f464c888cee8e95d5b0cc4e276afc5e531bc3ca737e2a910f77/patchright-1.56.0-py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:02329457d4f9e92b49209adceec33097042b6a6f03de31185a2f99721aeded6a", size = 46094291, upload-time = "2025-11-11T18:59:32.883Z" },
+    { url = "https://files.pythonhosted.org/packages/11/4b/a43f86570cb72f732723c19ba71f1c02200ed1cc762d71daa2c35718a529/patchright-1.56.0-py3-none-win32.whl", hash = "sha256:5502899cd8764ccc7a18c3cb47a76e49b25ec4eae155ec5ebea9e5e0022cc811", size = 35623487, upload-time = "2025-11-11T18:59:36.156Z" },
+    { url = "https://files.pythonhosted.org/packages/95/8d/37cc3127c6085ffa6482832a07f84587f2f04dbbaf194cc395bb2afa811c/patchright-1.56.0-py3-none-win_amd64.whl", hash = "sha256:0fe85d8f6b541689185115f3ce69e87a7f5dd964ec6aaeac635d4db5a906aec1", size = 35623491, upload-time = "2025-11-11T18:59:38.853Z" },
+    { url = "https://files.pythonhosted.org/packages/c5/37/0b79ddfc6a2ba16e9f258670ea40a74c791d925f1847cf4ad0e739bc7506/patchright-1.56.0-py3-none-win_arm64.whl", hash = "sha256:8bbf1c753e7b07b889a3ff43109ce3cea457605ea6b0477e65af4d9a2c5585cf", size = 31232602, upload-time = "2025-11-11T18:59:41.537Z" },
+]
+
+[[package]]
 name = "playwright"
 version = "1.56.0"
 source = { registry = "https://pypi.org/simple" }
@@ -326,6 +345,7 @@ source = { virtual = "." }
 dependencies = [
     { name = "httpx" },
     { name = "markdownify" },
+    { name = "patchright" },
     { name = "playwright" },
     { name = "playwright-stealth" },
     { name = "psycopg2-binary" },
@@ -337,6 +357,7 @@ dependencies = [
 requires-dist = [
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "markdownify", specifier = ">=1.2.2" },
+    { name = "patchright", specifier = ">=1.56.0" },
     { name = "playwright", specifier = ">=1.56.0" },
     { name = "playwright-stealth", specifier = ">=2.0.0" },
     { name = "psycopg2-binary", specifier = ">=2.9.11" },
