@@ -21,6 +21,18 @@ echo "Starting Python application..."
 # Ensure your python script passes the INTERNAL_PORT to Chrome
 python src/main.py & pid_python=$!
 
+echo "Waiting for internal port $INTERNAL_PORT to be available..."
+timeout=30
+while ! (echo > /dev/tcp/127.0.0.1/$INTERNAL_PORT) >/dev/null 2>&1; do
+    sleep 1
+    timeout=$((timeout - 1))
+    if [ "$timeout" -le 0 ]; then
+        echo "Timed out waiting for internal port $INTERNAL_PORT"
+        kill -TERM "$pid_python" 2>/dev/null || true
+        exit 1
+    fi
+done
+echo "Internal port $INTERNAL_PORT is ready."
 
 echo "Starting socat port forwarder on port $CHROME_PORT -> localhost:$INTERNAL_PORT"
 # TCP-LISTEN: Listen on the external port
