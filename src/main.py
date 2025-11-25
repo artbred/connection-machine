@@ -10,7 +10,6 @@ import urllib
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
-from playwright_stealth import stealth_sync
 
 from db import init_db
 from dispatcher import TaskDispatcher
@@ -124,17 +123,15 @@ def main():
             launch_args.append(f"--proxy-server={SOCKS_PROXY}")
 
         with sync_playwright() as p:
-            logger.info("Launching browser with persistent context...")
             browser = p.chromium.launch_persistent_context(
                 user_data_dir="./data/trel-chrome",
                 headless=HEADLESS,
-                args=launch_args,
+                args=launch_args
             )
 
             log_ws_endpoint()
 
             page = browser.new_page()
-            stealth_sync(page)
             check_ip(page)
 
             is_logged_in = False
