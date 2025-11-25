@@ -145,12 +145,6 @@ def main():
             log_ws_endpoint()
 
             page = context.new_page()
-            page.goto("https://deviceandbrowserinfo.com/are_you_a_bot")
-            import time
-
-            time.sleep(60)
-            page.screenshot(path="screenshot.png")
-            return
             check_ip(page)
 
             is_logged_in = False
