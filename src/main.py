@@ -132,13 +132,6 @@ def main():
             "--disable-web-security",
             "--disable-dev-mode",
             "--disable-debug-mode",
-            # New
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-background-timer-throttling",
-            "--disable-backgrounding-occluded-windows",
-            "--disable-renderer-backgrounding",
-            "--mute-audio"
         ]
 
         if SOCKS_PROXY and len(SOCKS_PROXY) > 0:
@@ -153,7 +146,6 @@ def main():
             context = p.chromium.launch_persistent_context(
                 user_data_dir,
                 headless=HEADLESS,
-                # channel="chrome",
                 ignore_https_errors=True,
                 args=launch_args,
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",

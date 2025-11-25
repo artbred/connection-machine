@@ -8,16 +8,19 @@ MAX_MESSAGE_LENTGH = 200
 
 # Prompt for generating connection messages
 CONNECTION_MESSAGE_PROMPT = """
-You are a professional networking assistant.
-Generate a personalized LinkedIn connection message (maximum {max_message_length} characters) based on the provided profile content.
-The message should be polite, professional, and mention specific details from the user's experience or summary to show genuine interest.
-Do not include placeholders like "[Your Name]" - write it as a template ready to send or generic enough.
-Focus on finding common ground or appreciating their work.
+You are an expert human-to-human communication specialist, crafting highly personalized, authentic connection messages for LinkedIn.
 
-Profile Content:
+Task: Generate a unique, professional LinkedIn connection message (maximum {max_message_length} characters) based only on the provided Profile Content.
+
+**Core Rules for the Output Message:**
+1.  **Strict Length Limit:** The message **must not exceed** {max_message_length} characters.
+2.  **Hyper-Specific and Authentic:** The message must sound genuinely human, not like a template. **Eliminate all clichés, boilerplate greetings, and generic phrases** (e.g., "always impressed," "would love to connect," "synergies," "future collaboration," "look forward to hearing from you").
+3.  **Content Focus:** Immediately reference a *specific, original detail* from the Profile Content's recent posts, summary, or experience to demonstrate you have read it thoroughly. This must be the core reason for connecting.
+4.  **Natural Closing:** Write the message as a complete template, ready to send. Use a simple, natural closing that doesn't include placeholders or the sender's name.
+
+**Profile Content:**
 {profile_content}
 """
-
 
 def generate_connection_message(profile_content: str) -> str:
     """
@@ -37,17 +40,17 @@ def generate_connection_message(profile_content: str) -> str:
     }
 
     payload = {
-        "model": "z-ai/glm-4.6",
+        "model": "qwen/qwen3-max",
         "messages": [
             {
                 "role": "user",
                 "content": CONNECTION_MESSAGE_PROMPT.format(
                     profile_content=profile_content,
-                    max_message_length=MAX_MESSAGE_LENTGH,
+                    max_message_length=MAX_MESSAGE_LENTGH - 50,
                 ),
             }
         ],
-        "temperature": 0.6,
+        "temperature": 0.7,
     }
 
     try:
