@@ -36,7 +36,11 @@ def check_linkedin_auth(page):
 
     logger.info("Navigating to LinkedIn...")
     try:
-        page.goto("https://www.linkedin.com/feed/")
+        page.goto(
+            "https://www.linkedin.com/feed/",
+            timeout=60000,
+            wait_until="domcontentloaded",
+        )
 
         if page.locator("form.login__form").count() > 0:
             return False
@@ -57,12 +61,19 @@ def get_free_port():
 def login(page):
     """Login to LinkedIn."""
     logger.info("Logging in to LinkedIn...")
-    page.goto("https://www.linkedin.com/login")
     try:
+        page.goto(
+            "https://www.linkedin.com/login",
+            timeout=60000,
+            wait_until="domcontentloaded",
+        )
+
+        page.wait_for_selector("#username", timeout=30000)
         page.fill("#username", os.getenv("LINKEDIN_USERNAME"))
         page.fill("#password", os.getenv("LINKEDIN_PASSWORD"))
         page.click("button[type='submit']")
-        shutdown_event.wait(60)
+
+        shutdown_event.wait(100)
     except Exception as e:
         logger.error(f"Error logging in: {e}")
 
@@ -117,7 +128,6 @@ def main():
             "--remote-allow-origins=*",
             "--no-sandbox",
             "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
             "--disable-gpu",
             "--disable-web-security",
             "--disable-dev-mode",

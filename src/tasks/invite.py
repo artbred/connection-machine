@@ -37,9 +37,9 @@ class InviteTask(BaseTask):
         logger.info(f"Sending connection request to {url}...")
 
         try:
-            self.page.goto(url)
+            self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
 
-            self.page.wait_for_selector("h1", timeout=10000)
+            self.page.wait_for_selector("h1", timeout=15000)
             person_name = self.page.locator("h1").last.text_content()
 
             self.page.locator("button[aria-label='More actions']").last.click()
