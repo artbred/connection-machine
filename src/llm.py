@@ -4,7 +4,7 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
-MAX_MESSAGE_LENTGH = 200
+MAX_MESSAGE_LENTGH = 300
 
 # Prompt for generating connection messages
 CONNECTION_MESSAGE_PROMPT = """
@@ -46,11 +46,11 @@ def generate_connection_message(profile_content: str) -> str:
                 "role": "user",
                 "content": CONNECTION_MESSAGE_PROMPT.format(
                     profile_content=profile_content,
-                    max_message_length=MAX_MESSAGE_LENTGH - 50,
+                    max_message_length=MAX_MESSAGE_LENTGH - 25,
                 ),
             }
         ],
-        "temperature": 0.7,
+        "temperature": 0.5,
     }
 
     try:
