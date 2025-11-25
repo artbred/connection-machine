@@ -145,7 +145,6 @@ def main():
             log_ws_endpoint()
 
             page = context.new_page()
-    
             check_ip(page)
 
             is_logged_in = False
