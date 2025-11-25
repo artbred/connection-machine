@@ -131,7 +131,14 @@ def main():
             "--disable-gpu",
             "--disable-web-security",
             "--disable-dev-mode",
-            "--disable-debug-mode"
+            "--disable-debug-mode",
+            # New
+            "--disable-extensions",
+            "--disable-background-networking",
+            "--disable-background-timer-throttling",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--mute-audio"
         ]
 
         if SOCKS_PROXY and len(SOCKS_PROXY) > 0:

@@ -8,6 +8,7 @@ services:
     environment:
       - CHROME_PORT=9225
     restart: unless-stopped
+    shm_size: '1gb'
     ports:
       - "127.0.0.1:9225:9225"
     volumes:
