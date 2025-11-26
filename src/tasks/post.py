@@ -10,9 +10,15 @@ class PostTask(BaseTask):
             raise ValueError("Content is required for post task")
             
         logger.info(f"Creating post with content: {content[:50]}...")
+        
         # Placeholder for actual post creation logic
         # self.page.goto("https://www.linkedin.com/feed/")
-        # self.page.click("button.share-box-feed-entry__trigger")
-        # self.page.fill(".ql-editor", content)
-        # self.page.click("button.share-actions__primary-action")
+        # self.human.random_sleep(2, 4)
+        
+        # self.human.click("button.share-box-feed-entry__trigger")
+        # self.human.type(".ql-editor", content)
+        # self.human.random_sleep(1, 2)
+        
+        # self.human.click("button.share-actions__primary-action")
+        
         logger.info("Post created (simulated)")

@@ -17,6 +17,8 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 2.  **Hyper-Specific and Authentic:** The message must sound genuinely human, not like a template. **Eliminate all clichés, boilerplate greetings, and generic phrases** (e.g., "always impressed," "would love to connect," "synergies," "future collaboration," "look forward to hearing from you").
 3.  **Content Focus:** Immediately reference a *specific, original detail* from the Profile Content's recent posts, summary, or experience to demonstrate you have read it thoroughly. This must be the core reason for connecting.
 4.  **Natural Closing:** Write the message as a complete template, ready to send. Use a simple, natural closing that doesn't include placeholders or the sender's name.
+5.  Do not use any formatting or markdown. Only plain text.
+6.  Do not write anything like "I am building the same thing", "I have experience in this and e.g", only "I understand how this might be important" allowed.
 
 **Profile Content:**
 {profile_content}
@@ -46,7 +48,7 @@ def generate_connection_message(profile_content: str) -> str:
                 "role": "user",
                 "content": CONNECTION_MESSAGE_PROMPT.format(
                     profile_content=profile_content,
-                    max_message_length=MAX_MESSAGE_LENTGH - 25,
+                    max_message_length=MAX_MESSAGE_LENTGH - 50,
                 ),
             }
         ],
@@ -62,7 +64,10 @@ def generate_connection_message(profile_content: str) -> str:
             message = data["choices"][0]["message"]["content"].strip()
             if len(message) > MAX_MESSAGE_LENTGH:
                 logger.warning("Generated message is too long, truncating...")
-                message = message[: MAX_MESSAGE_LENTGH - 3] + "..."
+                truncated = message[:MAX_MESSAGE_LENTGH]
+                if " " in truncated:
+                    truncated = truncated[:truncated.rfind(" ")]
+                message = truncated.rstrip()
             return message
 
     except Exception as e:

@@ -1,12 +1,14 @@
 from abc import ABC, abstractmethod
 import logging
 from playwright.sync_api import Page
+from human_actions import HumanActions
 
 logger = logging.getLogger(__name__)
 
 class BaseTask(ABC):
     def __init__(self, page):
         self.page: Page = page
+        self.human = HumanActions(page)
 
     @abstractmethod
     def run(self, payload: dict):
