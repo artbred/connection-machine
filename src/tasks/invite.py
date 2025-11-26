@@ -41,7 +41,7 @@ class InviteTask(BaseTask):
 
         try:
             self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            self.human.random_sleep(2.0, 4.0)  # Wait a bit after load
+            self.human.random_sleep(2.0, 4.0)
 
             self.page.wait_for_selector("h1", timeout=15000)
             person_name = self.page.locator("h1").text_content()
@@ -76,22 +76,7 @@ class InviteTask(BaseTask):
                         logger.info(
                             f"Generated connection message: {connection_message}"
                         )
-                        # Close "More actions" if it was opened/interacted with?
-                        # Actually the original code opened it here oddly twice in different branches
-                        # Just ensuring menu is handled if needed
-                        # For now keeping flow similar but with human clicks
-
-            # Logic in original was: click 'More actions', then click 'connect_button'.
-            # But 'connect_button' is usually on the main card or in 'More actions'.
-            # If it's in 'More actions', we need to open it.
-            # The selector search implies we found the button. If it's visible, we click it.
-            # If not visible (inside menu), we might need to click "More actions" first.
-
-            # Simplified flow assumption based on original code structure:
-            # It seems the original code tried to click "More actions" blindly?
-            # self.page.locator("button[aria-label='More actions']").last.click()
-
-            # Let's try to locate the connect button. If not visible, try opening "More actions".
+                
             connect_btn = self.page.locator(connect_button_selector).last
             if not connect_btn.is_visible():
                 more_actions = self.page.locator(
@@ -118,10 +103,6 @@ class InviteTask(BaseTask):
                     logger.warning(
                         "Possibly ran out of personalized connection messages, trying without"
                     )
-                    # Recursively try without message - ensure we don't infinite loop if something else breaks
-                    # But here we just want to close/cancel and retry without msg?
-                    # Or just click "Send without note" if the previous steps failed?
-                    # Safest is to return and retry with flag False
                     return self.send_connection_request(url, False)
 
             else:
@@ -131,8 +112,6 @@ class InviteTask(BaseTask):
                 if send_without_note_btn.is_visible():
                     self.human.click(send_without_note_btn)
                 else:
-                    # Sometimes "Send" is the button if no note option was presented differently?
-                    # Fallback to looking for just "Send"
                     self.human.click("button[aria-label='Send now']")
 
             self.human.random_sleep(1.0, 3.0)
