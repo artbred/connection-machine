@@ -1,7 +1,6 @@
 import json
 import logging
 from datetime import datetime, timedelta
-from sqlalchemy import or_
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
@@ -69,11 +68,7 @@ class TaskDispatcher:
             tasks = (
                 db.query(Task)
                 .filter(
-                    Task.status == TaskStatus.PENDING,
-                    or_(
-                        Task.scheduled_for.is_(None),
-                        Task.scheduled_for <= datetime.utcnow(),
-                    ),
+                    Task.status == TaskStatus.PENDING
                 )
                 .order_by(Task.created_at)
                 .limit(
@@ -115,7 +110,6 @@ class TaskDispatcher:
 
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")
-                # Reset task to PENDING so it can be retried after re-auth
                 task_to_run.status = TaskStatus.PENDING
                 db.commit()
                 raise e
