@@ -126,12 +126,8 @@ def main():
             f"--remote-debugging-port={INTERNAL_DEBUG_PORT}",
             "--remote-debugging-address=127.0.0.1",
             "--remote-allow-origins=*",
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
             "--disable-gpu",
-            "--disable-web-security",
-            "--disable-dev-mode",
-            "--disable-debug-mode",
+            "--disable-web-security"
         ]
 
         if SOCKS_PROXY and len(SOCKS_PROXY) > 0:

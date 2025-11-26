@@ -37,9 +37,8 @@ class TaskDispatcher:
         """Check if the rate limit for the given task type has been reached."""
         limit = self.rate_limits.get(task_type)
         if not limit:
-            return True  # No limit for this task type
+            return True 
 
-        # Count tasks executed in the last 24 hours
         last_24h = datetime.utcnow() - timedelta(hours=24)
         with SessionLocal() as db:
             count = (
@@ -63,8 +62,6 @@ class TaskDispatcher:
     def poll(self):
         """Fetch and execute pending tasks."""
         with SessionLocal() as db:
-            # Get pending tasks, ordered by priority/time
-            # We fetch a batch to find one that isn't rate limited
             tasks = (
                 db.query(Task)
                 .filter(
@@ -73,7 +70,7 @@ class TaskDispatcher:
                 .order_by(Task.created_at)
                 .limit(
                     10
-                )  # Fetch top 10 to avoid blocking if first one is rate limited
+                ) 
                 .all()
             )
 
@@ -92,7 +89,6 @@ class TaskDispatcher:
 
             logger.info(f"Found task: {task_to_run}")
 
-            # Mark as processing
             task_to_run.status = TaskStatus.PROCESSING
             db.commit()
 
@@ -103,27 +99,18 @@ class TaskDispatcher:
 
                 payload = json.loads(task_to_run.payload)
                 handler.run(payload)
-
-                # Mark as completed
                 task_to_run.status = TaskStatus.COMPLETED
                 task_to_run.executed_at = datetime.utcnow()
 
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")
                 task_to_run.status = TaskStatus.PENDING
-                db.commit()
                 raise e
 
             except Exception as e:
                 logger.error(f"Task failed: {e}")
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = str(e)
-                db.commit()
                 
             finally:
                 db.commit()
-                try:
-                    logger.info("Navigating back to feed after task...")
-                    self.page.goto("https://www.linkedin.com/feed/", timeout=60000, wait_until="domcontentloaded")
-                except Exception as nav_e:
-                    logger.error(f"Failed to navigate back to feed: {nav_e}")

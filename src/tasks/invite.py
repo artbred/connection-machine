@@ -50,9 +50,11 @@ class InviteTask(BaseTask):
                 f"button[aria-label='Invite {person_name} to connect']"
             )
             try:
-                self.page.wait_for_selector(
-                    connect_button_selector, timeout=5000, state="attached"
-                )
+                connect_buttons = self.page.locator(connect_button_selector)
+                if connect_buttons.count() == 0:
+                    raise Exception("No connect buttons found")
+                connect_btn = connect_buttons.last
+                connect_btn.wait_for(state="visible", timeout=5000)
             except Exception:
                 try:
                     connect_button_selector = (
@@ -82,10 +84,8 @@ class InviteTask(BaseTask):
                 more_actions = self.page.locator(
                     "button[aria-label='More actions']"
                 ).last
-                if more_actions.is_visible():
-                    self.human.click(more_actions)
-                    self.human.random_sleep(0.5, 1.0)
-
+                self.human.click(more_actions)
+            
             self.human.click(connect_btn)
             self.human.random_sleep(0.5, 1.0)
 
