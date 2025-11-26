@@ -18,7 +18,7 @@ class TaskDispatcher:
             TaskType.CREATE_POST: PostTask(page),
         }
         self.rate_limits = {
-            TaskType.SEND_INVITE: 10,
+            TaskType.SEND_INVITE: 30,
             TaskType.CREATE_POST: 50,
         }
 
