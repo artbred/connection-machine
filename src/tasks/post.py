@@ -8,5 +8,4 @@ class PostTask(BaseTask):
         content = payload.get("content")
         if not content:
             raise ValueError("Content is required for post task")
-            
         

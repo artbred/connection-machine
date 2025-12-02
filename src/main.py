@@ -11,8 +11,7 @@ from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
 from db import init_db
-from dispatcher import TaskDispatcher
-from exceptions import SessionExpiredException
+from dispatcher import TaskDispatcher, SessionExpiredException
 
 # Global shutdown flag
 shutdown_event = threading.Event()

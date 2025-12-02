@@ -4,9 +4,13 @@ from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
-from exceptions import SessionExpiredException
 
 logger = logging.getLogger(__name__)
+
+
+class SessionExpiredException(Exception):
+    """Raised when the LinkedIn session has expired."""
+    pass
 
 
 class TaskDispatcher:
