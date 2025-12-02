@@ -8,9 +8,8 @@ services:
     environment:
       - CHROME_PORT=9225
     restart: always
-    ports:
-      - "127.0.0.1:9225:9225"
     dns: 1.1.1.1
+    network_mode: host
     logging:
       driver: "json-file"
       options:
@@ -23,5 +22,7 @@ services:
     image: teddysun/xray:25.10.15
     container_name: xray
     restart: always
+    ports:
+      - "127.0.0.1:10808:10808"
     volumes:
       - ./data/xray:/etc/xray
