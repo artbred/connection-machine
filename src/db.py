@@ -47,12 +47,26 @@ class TaskStatus(str, enum.Enum):
 
 
 class Task(Base):
-    __tablename__ = "tasks"
+    __tablename__ = "linkedin_tasks"
 
     id = Column(Integer, primary_key=True, index=True)
-    type = Column(SqlEnum(TaskType), nullable=False)
+    type = Column(
+        SqlEnum(
+            TaskType,
+            name="linkedin_task_type",
+            values_callable=lambda e: [x.value for x in e],
+        ),
+        nullable=False,
+    )
     payload = Column(Text, nullable=False)
-    status = Column(SqlEnum(TaskStatus), default=TaskStatus.PENDING)
+    status = Column(
+        SqlEnum(
+            TaskStatus,
+            name="linkedin_task_status",
+            values_callable=lambda e: [x.value for x in e],
+        ),
+        default=TaskStatus.PENDING,
+    )
     created_at = Column(DateTime, server_default=func.now())
     updated_at = Column(DateTime, server_default=func.now(), onupdate=func.now())
     executed_at = Column(DateTime, nullable=True)
