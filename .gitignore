@@ -11,6 +11,7 @@ data
 .venv
 
 .env
+.DS_Store
 
 *.png
 
