@@ -72,75 +72,62 @@ class TaskDispatcher:
                     task.status = TaskStatus.PENDING
                 db.commit()
 
-    def check_rate_limit(self, task_type: TaskType, logged_rate_limits: set = None) -> bool:
-        """Check if the rate limit for the given task type has been reached."""
-        limit = self.rate_limits.get(task_type)
-        if not limit:
-            return True
-
-        last_24h = datetime.utcnow() - timedelta(hours=24)
-        with SessionLocal() as db:
-            count = (
-                db.query(Task)
-                .filter(
-                    Task.type == task_type,
-                    Task.executed_at >= last_24h,
-                    Task.status == TaskStatus.COMPLETED,
-                )
-                .count()
-            )
-
-            if count >= limit:
-                if logged_rate_limits is None or task_type not in logged_rate_limits:
-                    logger.warning(
-                        f"Rate limit reached for {task_type}: {count}/{limit} in last 24h"
-                    )
-                    if logged_rate_limits is not None:
-                        logged_rate_limits.add(task_type)
-                return False
-
-            next_allowed = self.next_execution_at.get(task_type)
-            if next_allowed and datetime.utcnow() < next_allowed:
-                if logged_rate_limits is None or task_type not in logged_rate_limits:
-                    wait_time = (next_allowed - datetime.utcnow()).seconds // 60
-                    logger.info(
-                        f"Spacing delay: waiting ~{wait_time} min before next {task_type}"
-                    )
-                    if logged_rate_limits is not None:
-                        logged_rate_limits.add(task_type)
-                return False
-
-        return True
-
     def schedule_next_execution(self, task_type: TaskType):
         """Set the next allowed execution time for a task type after completion."""
         interval = self.get_spacing_interval(task_type)
         self.next_execution_at[task_type] = datetime.utcnow() + interval
         logger.info(f"Next {task_type} scheduled in ~{interval.seconds // 60} minutes")
 
+    def get_rate_limited_types(self) -> list[TaskType]:
+        """Return list of task types currently blocked by rate limits or spacing delays."""
+        blocked = []
+        last_24h = datetime.utcnow() - timedelta(hours=24)
+
+        with SessionLocal() as db:
+            for task_type, limit in self.rate_limits.items():
+                # Check daily rate limit
+                count = (
+                    db.query(Task)
+                    .filter(
+                        Task.type == task_type,
+                        Task.executed_at >= last_24h,
+                        Task.status == TaskStatus.COMPLETED,
+                    )
+                    .count()
+                )
+                if count >= limit:
+                    logger.info(
+                        f"Rate limit reached for {task_type}: {count}/{limit} in last 24h"
+                    )
+                    blocked.append(task_type)
+                    continue
+
+                # Check spacing delay
+                next_allowed = self.next_execution_at.get(task_type)
+                if next_allowed and datetime.utcnow() < next_allowed:
+                    wait_time = (next_allowed - datetime.utcnow()).seconds // 60
+                    logger.info(
+                        f"Spacing delay: waiting ~{wait_time} min before next {task_type}"
+                    )
+                    blocked.append(task_type)
+
+        return blocked
+
     def poll(self):
         """Fetch and execute pending tasks."""
+        # Pre-filter to exclude rate-limited task types
+        blocked_types = self.get_rate_limited_types()
+
         with SessionLocal() as db:
-            tasks = (
-                db.query(Task)
-                .filter(Task.status == TaskStatus.PENDING)
-                .order_by(Task.created_at)
-                .limit(10)
-                .all()
-            )
+            query = db.query(Task).filter(Task.status == TaskStatus.PENDING)
+            if blocked_types:
+                query = query.filter(Task.type.notin_(blocked_types))
 
-            if not tasks:
-                return
-
-            task_to_run = None
-            logged_rate_limits = set()
-            for task in tasks:
-                if self.check_rate_limit(task.type, logged_rate_limits):
-                    task_to_run = task
-                    break
+            task_to_run = query.order_by(Task.created_at).first()
 
             if not task_to_run:
-                logger.info("All pending tasks are currently rate limited.")
+                if blocked_types:
+                    logger.info("All pending tasks are currently rate limited.")
                 return
 
             logger.info(f"Found task: {task_to_run}")
