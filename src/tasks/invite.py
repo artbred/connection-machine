@@ -1,10 +1,10 @@
 import logging
+
 from .base import BaseTask
 from llm import generate_connection_message
 from markdownify import markdownify as md
 
 logger = logging.getLogger(__name__)
-
 
 class InviteTask(BaseTask):
     def run(self, payload: dict):
