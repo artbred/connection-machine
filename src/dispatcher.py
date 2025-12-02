@@ -72,7 +72,7 @@ class TaskDispatcher:
                     task.status = TaskStatus.PENDING
                 db.commit()
 
-    def check_rate_limit(self, task_type: TaskType) -> bool:
+    def check_rate_limit(self, task_type: TaskType, logged_rate_limits: set = None) -> bool:
         """Check if the rate limit for the given task type has been reached."""
         limit = self.rate_limits.get(task_type)
         if not limit:
@@ -91,17 +91,23 @@ class TaskDispatcher:
             )
 
             if count >= limit:
-                logger.warning(
-                    f"Rate limit reached for {task_type}: {count}/{limit} in last 24h"
-                )
+                if logged_rate_limits is None or task_type not in logged_rate_limits:
+                    logger.warning(
+                        f"Rate limit reached for {task_type}: {count}/{limit} in last 24h"
+                    )
+                    if logged_rate_limits is not None:
+                        logged_rate_limits.add(task_type)
                 return False
 
             next_allowed = self.next_execution_at.get(task_type)
             if next_allowed and datetime.utcnow() < next_allowed:
-                wait_time = (next_allowed - datetime.utcnow()).seconds // 60
-                logger.info(
-                    f"Spacing delay: waiting ~{wait_time} min before next {task_type}"
-                )
+                if logged_rate_limits is None or task_type not in logged_rate_limits:
+                    wait_time = (next_allowed - datetime.utcnow()).seconds // 60
+                    logger.info(
+                        f"Spacing delay: waiting ~{wait_time} min before next {task_type}"
+                    )
+                    if logged_rate_limits is not None:
+                        logged_rate_limits.add(task_type)
                 return False
 
         return True
@@ -127,8 +133,9 @@ class TaskDispatcher:
                 return
 
             task_to_run = None
+            logged_rate_limits = set()
             for task in tasks:
-                if self.check_rate_limit(task.type):
+                if self.check_rate_limit(task.type, logged_rate_limits):
                     task_to_run = task
                     break
 
