@@ -3,8 +3,10 @@ import logging
 from .base import BaseTask
 from llm import generate_connection_message
 from markdownify import markdownify as md
+from notifications import send_notification
 
 logger = logging.getLogger(__name__)
+
 
 class InviteTask(BaseTask):
     def run(self, payload: dict):
@@ -78,14 +80,14 @@ class InviteTask(BaseTask):
                         logger.info(
                             f"Generated connection message: {connection_message}"
                         )
-                
+
             connect_btn = self.page.locator(connect_button_selector).last
             if not connect_btn.is_visible():
                 more_actions = self.page.locator(
                     "button[aria-label='More actions']"
                 ).last
                 self.human.click(more_actions)
-            
+
             self.human.click(connect_btn)
             self.human.random_sleep(0.5, 1.0)
 
@@ -116,6 +118,14 @@ class InviteTask(BaseTask):
 
             self.human.random_sleep(1.0, 3.0)
             logger.info("Connection request sent successfully")
+
+            # Send notification with task details
+            message_preview = (
+                f'"{connection_message[:50]}..."'
+                if connection_message and len(connection_message) > 50
+                else (f'"{connection_message}"' if connection_message else "None")
+            )
+            send_notification(f"Send Invite to {url}\nMessage: {message_preview}")
 
         except Exception as e:
             logger.error(f"Error sending connection request: {e}")

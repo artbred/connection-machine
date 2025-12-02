@@ -1,5 +1,6 @@
 import logging
 from .base import BaseTask
+from notifications import send_notification
 
 logger = logging.getLogger(__name__)
 
@@ -23,4 +24,8 @@ class PostTask(BaseTask):
         self.human.type("div[role='textbox']", content)
         self.human.random_sleep(1.0, 3.0)
         self.human.click("button.share-actions__primary-action")
+
+        # Send notification with task details
+        content_preview = f'"{content[:50]}..."' if len(content) > 50 else f'"{content}"'
+        send_notification(f"Create Post\nContent: {content_preview}")
 
