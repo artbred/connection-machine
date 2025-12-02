@@ -23,7 +23,6 @@ services:
     image: teddysun/xray:25.10.15
     container_name: xray
     restart: always
-    dns: 1.1.1.1
     ports:
       - "127.0.0.1:10808:10808"
     volumes:
