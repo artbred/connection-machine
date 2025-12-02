@@ -24,5 +24,7 @@ services:
     container_name: xray
     restart: always
     dns: 1.1.1.1
+    ports:
+      - "127.0.0.1:10808:10808"
     volumes:
       - ./data/xray:/etc/xray
