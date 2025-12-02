@@ -1,9 +1,11 @@
 import json
 import logging
+
 from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
+from notifications import send_notification
 
 logger = logging.getLogger(__name__)
 
@@ -117,4 +119,6 @@ class TaskDispatcher:
                 task_to_run.error = str(e)
                 
             finally:
+                message = f"Task {task_to_run.id} completed with status {task_to_run.status}"
+                send_notification(message)
                 db.commit()
