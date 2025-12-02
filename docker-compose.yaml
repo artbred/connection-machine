@@ -7,7 +7,7 @@ services:
       - .env
     environment:
       - CHROME_PORT=9225
-    restart: unless-stopped
+    restart: always
     ports:
       - "127.0.0.1:9225:9225"
     dns: 1.1.1.1
@@ -22,7 +22,7 @@ services:
   xray:
     image: teddysun/xray:25.10.15
     container_name: xray
-    restart: unless-stopped
+    restart: always
     dns: 1.1.1.1
     volumes:
       - ./data/xray:/etc/xray
