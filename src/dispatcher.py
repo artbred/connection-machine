@@ -78,13 +78,22 @@ class TaskDispatcher:
         self.next_execution_at[task_type] = datetime.utcnow() + interval
         logger.info(f"Next {task_type} scheduled in ~{interval.seconds // 60} minutes")
 
-    def get_rate_limited_types(self) -> list[TaskType]:
-        """Return list of task types currently blocked by rate limits or spacing delays."""
+    def get_rate_limited_types(self, pending_types: set[TaskType]) -> list[TaskType]:
+        """Return list of task types currently blocked by rate limits or spacing delays.
+
+        Only checks task types that are in pending_types (have pending tasks).
+        """
+        if not pending_types:
+            return []
+
         blocked = []
         last_24h = datetime.utcnow() - timedelta(hours=24)
 
         with SessionLocal() as db:
             for task_type, limit in self.rate_limits.items():
+                if task_type not in pending_types:
+                    continue
+
                 # Check daily rate limit
                 count = (
                     db.query(Task)
@@ -115,8 +124,17 @@ class TaskDispatcher:
 
     def poll(self):
         """Fetch and execute pending tasks."""
-        # Pre-filter to exclude rate-limited task types
-        blocked_types = self.get_rate_limited_types()
+        # Get distinct pending task types first
+        with SessionLocal() as db:
+            pending_types = set(
+                row[0]
+                for row in db.query(Task.type)
+                .filter(Task.status == TaskStatus.PENDING)
+                .distinct()
+                .all()
+            )
+
+        blocked_types = self.get_rate_limited_types(pending_types)
 
         with SessionLocal() as db:
             query = db.query(Task).filter(Task.status == TaskStatus.PENDING)

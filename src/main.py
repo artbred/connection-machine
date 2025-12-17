@@ -36,9 +36,7 @@ def check_linkedin_auth(page):
     logger.info("Navigating to LinkedIn...")
     try:
         page.goto(
-            "https://www.linkedin.com/feed/",
-            timeout=60000,
-            wait_until="domcontentloaded",
+            "https://www.linkedin.com/feed/"
         )
 
         if page.locator("form.login__form").count() > 0:
@@ -117,9 +115,6 @@ def main():
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
 
-    logger.info("Initializing database...")
-    init_db()
-
     try:
         launch_args = [
             f"--remote-debugging-port={INTERNAL_DEBUG_PORT}",
@@ -146,8 +141,6 @@ def main():
                 user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
             )
 
-            log_ws_endpoint()
-
             page = context.new_page()
             check_ip(page)
 
@@ -160,19 +153,19 @@ def main():
 
                 if check_linkedin_auth(page):
                     is_logged_in = True
+                    logger.info("Logged in to LinkedIn successfully.")
                     break
                 else:
+                    logger.info("Logging in to LinkedIn...")
                     login(page)
                     if shutdown_event.wait(5):
                         break
-
-            if shutdown_event.is_set():
-                return
 
             if not is_logged_in:
                 raise Exception("Failed to login to LinkedIn")
 
             dispatcher = TaskDispatcher(page)
+            logger.info("Task dispatcher initialized.")
             dispatcher.cleanup_zombie_tasks()
 
             logger.info("Starting task dispatcher loop...")

@@ -19,6 +19,7 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 4.  **Natural Closing:** Write the message as a complete template, ready to send. Use a simple, natural closing that doesn't include placeholders or the sender's name.
 5.  Do not use any formatting or markdown. Only plain text.
 6.  Do not write anything like "I am building the same thing", "I have experience in this and e.g", only "I understand how this might be important" allowed.
+7.  DO NOT WRITE amount of character in the message, output ONLY THE MESSAGE
 
 **Profile Content:**
 {profile_content}

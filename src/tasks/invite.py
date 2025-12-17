@@ -45,11 +45,11 @@ class InviteTask(BaseTask):
             self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
             self.human.random_sleep(2.0, 4.0)
 
-            self.page.wait_for_selector("h1", timeout=15000)
-            person_name = self.page.locator("h1").text_content()
+            self.page.wait_for_selector("h2", timeout=15000)
+            person_name = self.page.locator("h2").nth(1).text_content()
 
             connect_button_selector = (
-                f"button[aria-label='Invite {person_name} to connect']"
+                f"a[aria-label='Invite {person_name} to connect']"
             )
             try:
                 connect_buttons = self.page.locator(connect_button_selector)
