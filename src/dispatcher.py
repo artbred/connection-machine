@@ -32,6 +32,7 @@ class TaskDispatcher:
 
     def _init_spacing_from_db(self):
         """Initialize next execution times from last executed tasks in DB."""
+        self.next_execution_at.clear()
         with SessionLocal() as db:
             for task_type in self.rate_limits.keys():
                 last_task = (
@@ -85,6 +86,9 @@ class TaskDispatcher:
         """
         if not pending_types:
             return []
+
+        # Refresh spacing delays from DB to handle external changes (e.g. DB cleared)
+        self._init_spacing_from_db()
 
         blocked = []
         last_24h = datetime.utcnow() - timedelta(hours=24)
