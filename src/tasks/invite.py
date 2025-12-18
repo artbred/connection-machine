@@ -56,14 +56,14 @@ class InviteTask(BaseTask):
                 if connect_buttons.count() == 0:
                     raise Exception("No connect buttons found")
                 connect_btn = connect_buttons.last
-                connect_btn.wait_for(state="attached", timeout=5000)
+                connect_btn.wait_for(state="attached", timeout=30000)
             except Exception:
                 try:
                     connect_button_selector = (
                         f"a[aria-label='Invite {person_name} to connect']"
                     )
                     self.page.wait_for_selector(
-                        connect_button_selector, timeout=5000, state="visible"
+                        connect_button_selector, timeout=5000, state="attached"
                     )
                 except Exception:
                     raise Exception(

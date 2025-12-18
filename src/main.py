@@ -1,3 +1,4 @@
+import argparse
 import json
 import logging
 import os
@@ -11,6 +12,7 @@ from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
 from dispatcher import TaskDispatcher, SessionExpiredException
+from tasks.invite import InviteTask
 
 # Global shutdown flag
 shutdown_event = threading.Event()
@@ -109,7 +111,24 @@ def signal_handler(signum, frame):
     shutdown_event.set()
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="LinkedIn task automation")
+    parser.add_argument(
+        "--debug-invite",
+        metavar="URL",
+        help="Debug mode: send invite to a specific profile URL and exit",
+    )
+    parser.add_argument(
+        "--no-message",
+        action="store_true",
+        help="Skip generating personal message (use with --debug-invite)",
+    )
+    return parser.parse_args()
+
+
 def main():
+    args = parse_args()
+
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, signal_handler)
     signal.signal(signal.SIGINT, signal_handler)
@@ -162,6 +181,17 @@ def main():
 
             if not is_logged_in:
                 raise Exception("Failed to login to LinkedIn")
+
+            # Debug mode: run single invite task and exit
+            if args.debug_invite:
+                logger.info(f"Debug mode: sending invite to {args.debug_invite}")
+                invite_task = InviteTask(page)
+                invite_task.run({
+                    "url": args.debug_invite,
+                    "try_personal_message": not args.no_message,
+                })
+                logger.info("Debug invite completed.")
+                return
 
             dispatcher = TaskDispatcher(page)
             logger.info("Task dispatcher initialized.")
