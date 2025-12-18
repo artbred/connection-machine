@@ -48,27 +48,16 @@ class InviteTask(BaseTask):
             self.page.wait_for_selector("h2", timeout=15000)
             person_name = self.page.locator("h2").nth(1).text_content()
 
+            username = url.split("/")[-1].replace("/", "")
+
             connect_button_selector = (
-                f"div[aria-label='Invite {person_name} to connect']"
+                f"a[href='/preload/custom-invite/?vanityName={username}']"
             )
             try:
-                connect_buttons = self.page.locator(connect_button_selector)
-                if connect_buttons.count() == 0:
-                    raise Exception("No connect buttons found")
-                connect_btn = connect_buttons.last
-                connect_btn.wait_for(state="attached", timeout=30000)
-            except Exception:
-                try:
-                    connect_button_selector = (
-                        f"a[aria-label='Invite {person_name} to connect']"
-                    )
-                    self.page.wait_for_selector(
-                        connect_button_selector, timeout=5000, state="attached"
-                    )
-                except Exception:
-                    raise Exception(
-                        "Can't find invite button, possibly already connected"
-                    )
+                self.page.locator(connect_button_selector)
+            except Exception as e:
+                logger.error(e)
+                raise Exception("Can't find invite button, possibly already connected")
 
             connection_message = None
 
@@ -81,15 +70,7 @@ class InviteTask(BaseTask):
                             f"Generated connection message: {connection_message}"
                         )
 
-            connect_btn = self.page.locator(connect_button_selector).last
-            if not connect_btn.is_visible():
-                more_actions = self.page.locator(
-                    "button[aria-label='More actions']"
-                ).last
-                self.human.click(more_actions)
-
-            self.human.click(connect_btn)
-            self.human.random_sleep(0.5, 1.0)
+            self.page.goto(f"https://www.linkedin.com/preload/custom-invite/?vanityName={username}")
 
             if connection_message:
                 try:

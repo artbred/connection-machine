@@ -20,6 +20,7 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 5.  Do not use any formatting or markdown. Only plain text.
 6.  Do not write anything like "I am building the same thing", "I have experience in this and e.g", only "I understand how this might be important" allowed.
 7.  DO NOT WRITE amount of character in the message, output ONLY THE MESSAGE
+8.  Make sure the text does not look AI generated, it should be human-like. If the person is well-known, make sure you adapt to this and your main goal everytime is to try to slightly praise them.
 
 **Profile Content:**
 {profile_content}
