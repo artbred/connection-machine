@@ -1,7 +1,7 @@
 import logging
 
 from .base import BaseTask
-from llm import generate_connection_message
+from llm import generate_connection_message, get_connect_button_selector
 from markdownify import markdownify as md
 from notifications import send_notification
 
@@ -46,18 +46,19 @@ class InviteTask(BaseTask):
             self.human.random_sleep(2.0, 4.0)
 
             self.page.wait_for_selector("h2", timeout=15000)
-            person_name = self.page.locator("h2").nth(1).text_content()
+            user_section = self.page.locator("section.artdeco-card").first
 
-            username = url.split("/")[-1].replace("/", "")
+            self.page.wait_for_selector("button[aria-label='More actions']", state='attached')
+            self.page.locator("button[aria-label='More actions']").last.click(force=True)
 
-            connect_button_selector = (
-                f"a[href='/preload/custom-invite/?vanityName={username}']"
-            )
-            try:
-                self.page.locator(connect_button_selector)
-            except Exception as e:
-                logger.error(e)
-                raise Exception("Can't find invite button, possibly already connected")
+            connect_button_selector = get_connect_button_selector(user_section.inner_html())
+            if connect_button_selector is None:
+                raise ValueError('Connect button selector is none')
+            
+            print(connect_button_selector)
+            self.page.click(connect_button_selector, force=True)
+            self.page.wait_for_selector("button[aria-label='Add a note']")
+            self.page.click("button[aria-label='Add a note']")
 
             connection_message = None
 
@@ -70,32 +71,11 @@ class InviteTask(BaseTask):
                             f"Generated connection message: {connection_message}"
                         )
 
-            self.page.goto(f"https://www.linkedin.com/preload/custom-invite/?vanityName={username}")
+            self.page.wait_for_selector("#custom-message", timeout=1000)
+            self.human.type("#custom-message", connection_message)
 
-            if connection_message:
-                try:
-                    add_note_btn = self.page.locator("button[aria-label='Add a note']")
-                    self.human.click(add_note_btn)
-
-                    self.page.wait_for_selector("#custom-message", timeout=1000)
-                    self.human.type("#custom-message", connection_message)
-
-                    send_btn = self.page.locator("button[aria-label='Send invitation']")
-                    self.human.click(send_btn)
-                except Exception:
-                    logger.warning(
-                        "Possibly ran out of personalized connection messages, trying without"
-                    )
-                    return self.send_connection_request(url, False)
-
-            else:
-                send_without_note_btn = self.page.locator(
-                    "button[aria-label='Send without a note']"
-                )
-                if send_without_note_btn.is_visible():
-                    self.human.click(send_without_note_btn)
-                else:
-                    self.human.click("button[aria-label='Send now']")
+            send_btn = self.page.locator("button[aria-label='Send invitation']")
+            self.human.click(send_btn)
 
             self.human.random_sleep(1.0, 3.0)
             logger.info("Connection request sent successfully")

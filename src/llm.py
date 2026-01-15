@@ -26,6 +26,12 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 {profile_content}
 """
 
+BUTTON_SELECTOR_PROMPT = """
+Your task is to provide a selector for the connect button, do not output any extra text, just provide the css selector from this html
+
+{section_html}
+"""
+
 def generate_connection_message(profile_content: str) -> str:
     """
     Generates a personalized LinkedIn connection message using OpenRouter.
@@ -70,6 +76,51 @@ def generate_connection_message(profile_content: str) -> str:
                 if " " in truncated:
                     truncated = truncated[:truncated.rfind(" ")]
                 message = truncated.rstrip()
+            return message
+
+    except Exception as e:
+        logger.error(f"Failed to generate connection message: {e}")
+
+    return None
+
+def get_connect_button_selector(section_html: str) -> str:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        logger.warning("OPENROUTER_API_KEY is not set. Skipping message generation.")
+        return None
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "LinkedIn Auto-Connector",
+    }
+
+    payload = {
+        "model": "anthropic/claude-haiku-4.5",
+        "messages": [
+            {
+                "role": "system",
+                "content": "You must provide only response in one string without any formatting and other stuff"
+            },
+            {
+                "role": "user",
+                "content": BUTTON_SELECTOR_PROMPT.format(
+                    section_html=section_html
+                ),
+            }
+        ],
+        "temperature": 0,
+    }
+
+    try:
+        response = httpx.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            message = data["choices"][0]["message"]["content"].strip()
             return message
 
     except Exception as e:
