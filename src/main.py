@@ -192,6 +192,7 @@ def main():
             dispatcher = TaskDispatcher(page)
             logger.info("Task dispatcher initialized.")
             dispatcher.cleanup_zombie_tasks()
+            dispatcher.cleanup_old_pending_posts()
 
             logger.info("Starting task dispatcher loop...")
             while not shutdown_event.is_set():

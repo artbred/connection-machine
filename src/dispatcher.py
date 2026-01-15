@@ -73,6 +73,27 @@ class TaskDispatcher:
                     task.status = TaskStatus.PENDING
                 db.commit()
 
+    def cleanup_old_pending_posts(self):
+        """Delete pending CREATE_POST tasks older than 1 hour."""
+        with SessionLocal() as db:
+            one_hour_ago = datetime.utcnow() - timedelta(hours=1)
+            old_posts = (
+                db.query(Task)
+                .filter(
+                    Task.type == TaskType.CREATE_POST,
+                    Task.status == TaskStatus.PENDING,
+                    Task.created_at < one_hour_ago,
+                )
+                .all()
+            )
+            if old_posts:
+                logger.warning(
+                    f"Deleting {len(old_posts)} stale pending CREATE_POST tasks (older than 1 hour)."
+                )
+                for task in old_posts:
+                    db.delete(task)
+                db.commit()
+
     def schedule_next_execution(self, task_type: TaskType):
         """Set the next allowed execution time for a task type after completion."""
         interval = self.get_spacing_interval(task_type)

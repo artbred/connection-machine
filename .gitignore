@@ -12,6 +12,7 @@ data
 
 .env
 .DS_Store
+.claude
 
 *.png
 

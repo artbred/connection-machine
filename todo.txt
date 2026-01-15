@@ -1,1 +1,0 @@
-1. on startup delete all pending create post tasks from db if they are longer than 1 hour
