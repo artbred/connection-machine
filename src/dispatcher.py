@@ -41,7 +41,7 @@ class TaskDispatcher:
                     db.query(Task)
                     .filter(
                         Task.type == task_type,
-                        Task.status.in_([TaskStatus.COMPLETED, TaskStatus.FAILED]),
+                        Task.status == TaskStatus.COMPLETED,
                     )
                     .order_by(Task.executed_at.desc())
                     .first()
