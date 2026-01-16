@@ -221,7 +221,6 @@ class TaskDispatcher:
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = str(e)
                 task_to_run.executed_at = datetime.utcnow()
-                self.schedule_next_execution(task_to_run.type)
 
             finally:
                 db.commit()
