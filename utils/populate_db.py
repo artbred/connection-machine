@@ -14,13 +14,12 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def url_exists_in_db(session, url: str) -> bool:
-    """Check if a task with this LinkedIn URL already exists."""
-    existing = session.query(Task).filter(
+def get_existing_task(session, url: str) -> Task | None:
+    """Get existing task for this LinkedIn URL, if any."""
+    return session.query(Task).filter(
         Task.type == TaskType.SEND_INVITE,
         Task.payload.contains(f'"url": "{url}"')
     ).first()
-    return existing is not None
 
 
 def populate_db_from_csv(csv_path: str):
@@ -42,6 +41,7 @@ def populate_db_from_csv(csv_path: str):
             reader = csv.DictReader(f)
 
             added_count = 0
+            retried_count = 0
             skipped_count = 0
             for row in reader:
                 linkedin_url = row.get("LinkedIn URL")
@@ -50,9 +50,22 @@ def populate_db_from_csv(csv_path: str):
                     continue
 
                 # Check if URL already exists in the database
-                if url_exists_in_db(session, linkedin_url):
-                    logger.info(f"Skipping duplicate URL: {linkedin_url}")
-                    skipped_count += 1
+                existing_task = get_existing_task(session, linkedin_url)
+                if existing_task:
+                    if existing_task.status == TaskStatus.FAILED:
+                        # Re-add failed tasks as new pending tasks
+                        logger.info(f"Re-adding failed URL: {linkedin_url}")
+                        payload_dict = {"url": linkedin_url}
+                        new_task = Task(
+                            type=TaskType.SEND_INVITE,
+                            payload=json.dumps(payload_dict),
+                            status=TaskStatus.PENDING,
+                        )
+                        session.add(new_task)
+                        retried_count += 1
+                    else:
+                        logger.info(f"Skipping duplicate URL: {linkedin_url}")
+                        skipped_count += 1
                     continue
 
                 # Create the payload
@@ -70,7 +83,7 @@ def populate_db_from_csv(csv_path: str):
                 added_count += 1
 
             session.commit()
-            logger.info(f"Successfully added {added_count} tasks to the database. Skipped {skipped_count} duplicates.")
+            logger.info(f"Added {added_count} new tasks, retried {retried_count} failed tasks, skipped {skipped_count} duplicates.")
 
     except Exception as e:
         session.rollback()
