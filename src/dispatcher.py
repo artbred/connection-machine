@@ -28,6 +28,8 @@ class TaskDispatcher:
             TaskType.CREATE_POST: 50,
         }
         self.next_execution_at: dict[TaskType, datetime] = {}
+        self._previously_blocked: set[TaskType] = set()
+        self._last_idle_log: datetime | None = None
         self._init_spacing_from_db()
 
     def _init_spacing_from_db(self):
@@ -104,6 +106,7 @@ class TaskDispatcher:
         """Return list of task types currently blocked by rate limits or spacing delays.
 
         Only checks task types that are in pending_types (have pending tasks).
+        Only logs when blocking state changes to reduce noise.
         """
         if not pending_types:
             return []
@@ -127,21 +130,31 @@ class TaskDispatcher:
                     .count()
                 )
                 if count >= limit:
-                    logger.info(
-                        f"Rate limit reached for {task_type}: {count}/{limit} in last 24h"
-                    )
                     blocked.append(task_type)
                     continue
 
                 # Check spacing delay
                 next_allowed = self.next_execution_at.get(task_type)
                 if next_allowed and datetime.utcnow() < next_allowed:
-                    wait_time = (next_allowed - datetime.utcnow()).seconds // 60
-                    logger.info(
-                        f"Spacing delay: waiting ~{wait_time} min before next {task_type}"
-                    )
                     blocked.append(task_type)
 
+        # Log only on state changes
+        blocked_set = set(blocked)
+        newly_blocked = blocked_set - self._previously_blocked
+        newly_unblocked = self._previously_blocked - blocked_set
+
+        for task_type in newly_blocked:
+            next_allowed = self.next_execution_at.get(task_type)
+            if next_allowed:
+                wait_min = (next_allowed - datetime.utcnow()).seconds // 60
+                logger.info(f"{task_type} blocked (next in ~{wait_min} min)")
+            else:
+                logger.info(f"{task_type} blocked (rate limit reached)")
+
+        for task_type in newly_unblocked:
+            logger.info(f"{task_type} unblocked, ready to execute")
+
+        self._previously_blocked = blocked_set
         return blocked
 
     def poll(self):
@@ -166,11 +179,23 @@ class TaskDispatcher:
             task_to_run = query.order_by(Task.created_at).first()
 
             if not task_to_run:
-                if blocked_types:
-                    logger.info("All pending tasks are currently rate limited.")
+                # Log idle status at most once per 5 minutes
+                now = datetime.utcnow()
+                should_log = (
+                    self._last_idle_log is None
+                    or (now - self._last_idle_log) > timedelta(minutes=5)
+                )
+                if should_log and (pending_types or blocked_types):
+                    if blocked_types:
+                        logger.info(f"Waiting: {len(blocked_types)} task type(s) rate-limited")
+                    elif not pending_types:
+                        logger.info("Idle: no pending tasks")
+                    self._last_idle_log = now
                 return
 
-            logger.info(f"Found task: {task_to_run}")
+            # Reset idle log when we have work to do
+            self._last_idle_log = None
+            logger.info(f"Executing: {task_to_run}")
 
             task_to_run.status = TaskStatus.PROCESSING
             db.commit()
