@@ -108,9 +108,6 @@ class TaskDispatcher:
         if not pending_types:
             return []
 
-        # Refresh spacing delays from DB to handle external changes (e.g. DB cleared)
-        self._init_spacing_from_db()
-
         blocked = []
         last_24h = datetime.utcnow() - timedelta(hours=24)
 
