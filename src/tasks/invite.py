@@ -1,11 +1,15 @@
+import base64
 import logging
 
 from .base import BaseTask
-from llm import generate_connection_message, get_connect_button_selector
+from llm import generate_connection_message, get_next_connect_action
 from markdownify import markdownify as md
 from notifications import send_notification
 
 logger = logging.getLogger(__name__)
+
+MAX_CONNECT_ITERATIONS = 5
+ADD_NOTE_SELECTOR = "button[aria-label='Add a note']"
 
 
 class InviteTask(BaseTask):
@@ -46,19 +50,46 @@ class InviteTask(BaseTask):
             self.human.random_sleep(2.0, 4.0)
 
             self.page.wait_for_selector("h2", timeout=15000)
-            user_section = self.page.locator("section.artdeco-card").first
 
-            self.page.wait_for_selector("button[aria-label='More actions']", state='attached')
-            self.page.locator("button[aria-label='More actions']").last.click(force=True)
+            # Iterative LLM loop to reach "Add a note" modal
+            for iteration in range(MAX_CONNECT_ITERATIONS):
+                logger.info(f"Connection flow iteration {iteration + 1}/{MAX_CONNECT_ITERATIONS}")
 
-            connect_button_selector = get_connect_button_selector(user_section.inner_html())
-            if connect_button_selector is None:
-                raise ValueError('Connect button selector is none')
-            
-            print(connect_button_selector)
-            self.page.click(connect_button_selector, force=True)
-            self.page.wait_for_selector("button[aria-label='Add a note']")
-            self.page.click("button[aria-label='Add a note']")
+                # Capture current state
+                screenshot_bytes = self.page.screenshot()
+                screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+
+                user_section = self.page.locator("body").first
+                section_html = user_section.inner_html()
+
+                # Ask LLM what to click
+                result = get_next_connect_action(screenshot_base64, section_html)
+
+                if result is None or "selector" not in result:
+                    raise ValueError(f"LLM returned invalid response: {result}")
+
+                selector = result["selector"]
+                logger.info(f"LLM suggested selector: {selector}")
+
+                try:
+                    locator = self.page.locator(selector).first
+                    self.human.click(locator, timeout=5000)
+                    self.human.random_sleep(0.5, 1.5)
+                except Exception:
+                    logger.info("Suggested selector is not clickable")
+
+                # Check if "Add a note" button appeared
+                try:
+                    self.page.wait_for_selector(ADD_NOTE_SELECTOR, timeout=2000)
+                    logger.info("'Add a note' button detected, exiting loop")
+                    break
+                except Exception:
+                    logger.debug("'Add a note' not yet visible, continuing...")
+            else:
+                raise ValueError(f"Could not reach 'Add a note' after {MAX_CONNECT_ITERATIONS} iterations")
+
+            # Click "Add a note" to open the message modal
+            self.human.click(ADD_NOTE_SELECTOR)
 
             connection_message = None
 

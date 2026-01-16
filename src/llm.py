@@ -1,4 +1,5 @@
 import os
+import json
 import logging
 import httpx
 
@@ -26,11 +27,19 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 {profile_content}
 """
 
-BUTTON_SELECTOR_PROMPT = """
-Your task is to provide a selector for the connect button, do not output any extra text, just provide the css selector from this html
+CONNECT_ACTION_PROMPT = """Analyze this LinkedIn profile page screenshot and HTML.
 
+Goal: Identify which button to click NEXT to send a connection request.
+
+The button could be:
+- A visible "Connect" button
+- A "More" or "More actions" button that reveals a dropdown
+- A "Connect" option inside an open dropdown menu
+
+HTML of the profile card section:
 {section_html}
-"""
+
+Return the CSS selector that uniquely identifies the button to click."""
 
 def generate_connection_message(profile_content: str) -> str:
     """
@@ -83,10 +92,16 @@ def generate_connection_message(profile_content: str) -> str:
 
     return None
 
-def get_connect_button_selector(section_html: str) -> str:
+def get_next_connect_action(screenshot_base64: str, section_html: str) -> dict | None:
+    """
+    Uses vision + HTML analysis to determine which button to click next
+    in the connection request flow.
+
+    Returns a dict with 'selector' key, or None on failure.
+    """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        logger.warning("OPENROUTER_API_KEY is not set. Skipping message generation.")
+        logger.warning("OPENROUTER_API_KEY is not set. Skipping connect action detection.")
         return None
 
     url = "https://openrouter.ai/api/v1/chat/completions"
@@ -98,20 +113,43 @@ def get_connect_button_selector(section_html: str) -> str:
     }
 
     payload = {
-        "model": "anthropic/claude-haiku-4.5",
+        "model": "google/gemini-3-flash-preview",
         "messages": [
             {
-                "role": "system",
-                "content": "You must provide only response in one string without any formatting and other stuff"
-            },
-            {
                 "role": "user",
-                "content": BUTTON_SELECTOR_PROMPT.format(
-                    section_html=section_html
-                ),
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{screenshot_base64}"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": CONNECT_ACTION_PROMPT.format(section_html=section_html)
+                    }
+                ]
             }
         ],
         "temperature": 0,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "connect_action",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "selector": {
+                            "type": "string",
+                            "description": "CSS selector for the button to click"
+                        }
+                    },
+                    "required": ["selector"],
+                    "additionalProperties": False
+                }
+            }
+        }
     }
 
     try:
@@ -120,10 +158,10 @@ def get_connect_button_selector(section_html: str) -> str:
 
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
-            message = data["choices"][0]["message"]["content"].strip()
-            return message
+            content = data["choices"][0]["message"]["content"].strip()
+            return json.loads(content)
 
     except Exception as e:
-        logger.error(f"Failed to generate connection message: {e}")
+        logger.error(f"Failed to get connect action: {e}")
 
     return None
