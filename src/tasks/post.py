@@ -13,7 +13,10 @@ class PostTask(BaseTask):
         create_post_url = payload.get("create_post_url", None)
         if not create_post_url:
             raise ValueError("Create post URL is required for post task")
-    
+
+        # Validate session before starting work
+        self.validate_session()
+
         self.page.goto(
             create_post_url,
             timeout=60000,

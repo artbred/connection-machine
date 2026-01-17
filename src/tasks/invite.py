@@ -18,6 +18,9 @@ class InviteTask(BaseTask):
         if not url:
             raise ValueError("URL is required for invite task")
 
+        # Validate session before starting work
+        self.validate_session()
+
         try_personal_message = payload.get("try_personal_message", True)
         self.send_connection_request(url, try_personal_message)
 

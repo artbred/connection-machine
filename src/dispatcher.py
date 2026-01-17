@@ -6,14 +6,9 @@ from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
+from exceptions import SessionExpiredException
 
 logger = logging.getLogger(__name__)
-
-
-class SessionExpiredException(Exception):
-    """Raised when the LinkedIn session has expired."""
-
-    pass
 
 
 class TaskDispatcher:
@@ -30,6 +25,7 @@ class TaskDispatcher:
         self.next_execution_at: dict[TaskType, datetime] = {}
         self._previously_blocked: set[TaskType] = set()
         self._last_idle_log: datetime | None = None
+        self._logged_no_pending: bool = False
         self._init_spacing_from_db()
 
     def _init_spacing_from_db(self):
@@ -179,22 +175,28 @@ class TaskDispatcher:
             task_to_run = query.order_by(Task.created_at).first()
 
             if not task_to_run:
-                # Log idle status at most once per 5 minutes
                 now = datetime.utcnow()
-                should_log = (
-                    self._last_idle_log is None
-                    or (now - self._last_idle_log) > timedelta(minutes=5)
-                )
-                if should_log and (pending_types or blocked_types):
-                    if blocked_types:
+
+                # Log "no pending tasks" once when queue is empty
+                if not pending_types and not self._logged_no_pending:
+                    logger.info("Idle: no pending tasks")
+                    self._logged_no_pending = True
+
+                # Log rate-limited status periodically (every 5 minutes)
+                if blocked_types:
+                    should_log = (
+                        self._last_idle_log is None
+                        or (now - self._last_idle_log) > timedelta(minutes=5)
+                    )
+                    if should_log:
                         logger.info(f"Waiting: {len(blocked_types)} task type(s) rate-limited")
-                    elif not pending_types:
-                        logger.info("Idle: no pending tasks")
-                    self._last_idle_log = now
+                        self._last_idle_log = now
+
                 return
 
-            # Reset idle log when we have work to do
+            # Reset flags when we have work to do
             self._last_idle_log = None
+            self._logged_no_pending = False
             logger.info(f"Executing: {task_to_run}")
 
             task_to_run.status = TaskStatus.PROCESSING
@@ -217,6 +219,35 @@ class TaskDispatcher:
                 raise e
 
             except Exception as e:
+                error_str = str(e).lower()
+                # Check if this might be a session-related error
+                session_indicators = [
+                    "login",
+                    "sign in",
+                    "session",
+                    "unauthorized",
+                    "authentication",
+                    "net::err_aborted",  # Often happens on auth redirects
+                ]
+                is_session_error = any(indicator in error_str for indicator in session_indicators)
+
+                # Also check page state if we can
+                if not is_session_error:
+                    try:
+                        current_url = self.page.url
+                        if "/login" in current_url or "/checkpoint" in current_url:
+                            is_session_error = True
+                        elif self.page.locator("form.login__form").count() > 0:
+                            is_session_error = True
+                    except Exception:
+                        pass  # Page might be in bad state, continue with original error
+
+                if is_session_error:
+                    logger.warning(f"Detected session issue during task {task_to_run.id}: {e}")
+                    task_to_run.status = TaskStatus.PENDING
+                    db.commit()
+                    raise SessionExpiredException(f"Session issue detected: {e}")
+
                 logger.error(f"Task failed: {e}")
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = str(e)

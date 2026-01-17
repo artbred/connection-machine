@@ -11,7 +11,8 @@ import urllib
 from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
-from dispatcher import TaskDispatcher, SessionExpiredException
+from dispatcher import TaskDispatcher
+from exceptions import SessionExpiredException
 from tasks.invite import InviteTask
 
 # Global shutdown flag
@@ -37,13 +38,34 @@ def check_linkedin_auth(page):
     logger.info("Navigating to LinkedIn...")
     try:
         page.goto(
-            "https://www.linkedin.com/feed/"
+            "https://www.linkedin.com/feed/",
+            timeout=30000,
+            wait_until="domcontentloaded",
         )
 
-        if page.locator("form.login__form").count() > 0:
+        current_url = page.url
+
+        # Check for login-related URLs
+        if "/login" in current_url or "/checkpoint" in current_url:
+            logger.info(f"Detected auth redirect: {current_url}")
             return False
 
-        return True
+        # Check for login form
+        if page.locator("form.login__form").count() > 0:
+            logger.info("Login form detected")
+            return False
+
+        # Check for session expired message
+        if page.locator("text=session has expired").count() > 0:
+            logger.info("Session expired message detected")
+            return False
+
+        # Verify we have the authenticated nav/feed
+        if page.locator("nav").count() > 0:
+            return True
+
+        logger.info("Could not verify authenticated state")
+        return False
     except Exception as e:
         logger.error(f"Error checking auth: {e}")
         return False
@@ -71,7 +93,15 @@ def login(page):
         page.fill("#password", os.getenv("LINKEDIN_PASSWORD"))
         page.click("button[type='submit']")
 
-        shutdown_event.wait(100)
+        # Wait for navigation after login (feed or checkpoint)
+        try:
+            page.wait_for_url(
+                lambda url: "/feed" in url or "/checkpoint" in url or "/login" not in url,
+                timeout=30000,
+            )
+        except Exception:
+            # If URL wait times out, give a short delay for page to settle
+            shutdown_event.wait(5)
     except Exception as e:
         logger.error(f"Error logging in: {e}")
 
