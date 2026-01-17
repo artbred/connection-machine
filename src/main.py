@@ -152,7 +152,7 @@ def main():
                 user_data_dir,
                 headless=HEADLESS,
                 args=launch_args,
-                no_viewport=True
+                viewport={"height": 1080, "width": 1920}
             )
 
             page = context.new_page()
