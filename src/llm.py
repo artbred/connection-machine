@@ -10,6 +10,14 @@ logger = logging.getLogger(__name__)
 MAX_DOM_LENGTH = 50000
 
 MAX_MESSAGE_LENTGH = 300
+MAX_REFINEMENT_ATTEMPTS = 3
+
+REFINE_MESSAGE_PROMPT = """Your message is {current_length} characters but must be {max_length} characters or less.
+
+Shorten this message while preserving its core meaning and personal touch:
+"{message}"
+
+Return ONLY the shortened message, nothing else. Must be under {max_length} characters."""
 
 # Prompt for generating connection messages
 CONNECTION_MESSAGE_PROMPT = """
@@ -54,10 +62,44 @@ HTML section:
 
 Return selector (CSS selector relative to this section, or null), expected_text (exact button text), and reason."""
 
+def _refine_message_length(message: str, max_length: int, api_key: str) -> str | None:
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "LinkedIn Auto-Connector",
+    }
+    
+    payload = {
+        "model": "qwen/qwen3-next-80b-a3b-instruct",
+        "messages": [
+            {
+                "role": "user",
+                "content": REFINE_MESSAGE_PROMPT.format(
+                    message=message,
+                    current_length=len(message),
+                    max_length=max_length,
+                ),
+            }
+        ],
+        "temperature": 0.3,
+    }
+    
+    try:
+        response = httpx.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+        
+        data = response.json()
+        if "choices" in data and len(data["choices"]) > 0:
+            return data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"Failed to refine message: {e}")
+    
+    return None
+
+
 def generate_connection_message(profile_content: str) -> str:
-    """
-    Generates a personalized LinkedIn connection message using OpenRouter.
-    """
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping message generation.")
@@ -92,13 +134,29 @@ def generate_connection_message(profile_content: str) -> str:
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
             message = data["choices"][0]["message"]["content"].strip()
-            if len(message) > MAX_MESSAGE_LENTGH:
-                logger.warning("Generated message is too long, truncating...")
-                truncated = message[:MAX_MESSAGE_LENTGH]
-                if " " in truncated:
-                    truncated = truncated[:truncated.rfind(" ")]
-                message = truncated.rstrip()
-            return message
+            
+            if len(message) <= MAX_MESSAGE_LENTGH:
+                logger.info(f"Generated message ({len(message)} chars): {message}")
+                return message
+            
+            logger.info(f"Message too long ({len(message)} chars), attempting refinement...")
+            
+            for attempt in range(MAX_REFINEMENT_ATTEMPTS):
+                refined = _refine_message_length(message, MAX_MESSAGE_LENTGH, api_key)
+                if refined and len(refined) <= MAX_MESSAGE_LENTGH:
+                    logger.info(f"Refinement succeeded on attempt {attempt + 1} ({len(refined)} chars)")
+                    return refined
+                elif refined:
+                    logger.info(f"Refinement attempt {attempt + 1} still too long ({len(refined)} chars)")
+                    message = refined
+                else:
+                    logger.warning(f"Refinement attempt {attempt + 1} failed")
+            
+            logger.warning(f"All refinement attempts failed, truncating from {len(message)} to {MAX_MESSAGE_LENTGH} chars")
+            truncated = message[:MAX_MESSAGE_LENTGH]
+            if " " in truncated:
+                truncated = truncated[:truncated.rfind(" ")]
+            return truncated.rstrip()
 
     except Exception as e:
         logger.error(f"Failed to generate connection message: {e}")
