@@ -3,7 +3,11 @@ import json
 import logging
 import httpx
 
+from dom_minifier import minify_dom
+
 logger = logging.getLogger(__name__)
+
+MAX_DOM_LENGTH = 50000
 
 MAX_MESSAGE_LENTGH = 300
 
@@ -27,19 +31,24 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 {profile_content}
 """
 
-CONNECT_ACTION_PROMPT = """Analyze this LinkedIn profile page screenshot and HTML.
+CONNECT_ACTION_PROMPT = """Analyze this LinkedIn profile screenshot and the HTML section below.
 
-Goal: Identify which button to click NEXT to send a connection request.
+Return null selector if:
+- Already connected (primary action is "Message" with no Connect option)
+- Connection pending (button says "Pending" or "Withdraw")
+- No way to send connection request
 
-The button could be:
+If connection IS possible, return the CSS selector for the button to click:
 - A visible "Connect" button
-- A "More" or "More actions" button that reveals a dropdown
-- A "Connect" option inside an open dropdown menu
+- A "More" / "More actions" button (to reveal dropdown)
+- A "Connect" option inside an open dropdown
 
-HTML of the profile card section:
+The selector will be executed WITHIN this HTML section only (not the full page).
+
+HTML section:
 {section_html}
 
-Return the CSS selector that uniquely identifies the button to click."""
+Return selector (CSS selector relative to this section, or null) and reason."""
 
 def generate_connection_message(profile_content: str) -> str:
     """
@@ -92,17 +101,14 @@ def generate_connection_message(profile_content: str) -> str:
 
     return None
 
-def get_next_connect_action(screenshot_base64: str, section_html: str) -> dict | None:
-    """
-    Uses vision + HTML analysis to determine which button to click next
-    in the connection request flow.
-
-    Returns a dict with 'selector' key, or None on failure.
-    """
+def get_next_connect_action(screenshot_base64: str, raw_html: str) -> dict | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping connect action detection.")
         return None
+
+    minified_html = minify_dom(raw_html, max_length=MAX_DOM_LENGTH)
+    logger.debug(f"DOM minified: {len(raw_html)} -> {len(minified_html)} chars")
 
     url = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -126,7 +132,7 @@ def get_next_connect_action(screenshot_base64: str, section_html: str) -> dict |
                     },
                     {
                         "type": "text",
-                        "text": CONNECT_ACTION_PROMPT.format(section_html=section_html)
+                        "text": CONNECT_ACTION_PROMPT.format(section_html=minified_html)
                     }
                 ]
             }
@@ -141,11 +147,15 @@ def get_next_connect_action(screenshot_base64: str, section_html: str) -> dict |
                     "type": "object",
                     "properties": {
                         "selector": {
+                            "type": ["string", "null"],
+                            "description": "CSS selector for button to click, or null if connection not possible"
+                        },
+                        "reason": {
                             "type": "string",
-                            "description": "CSS selector for the button to click"
+                            "description": "Brief explanation (e.g., 'found Connect button', 'already connected')"
                         }
                     },
-                    "required": ["selector"],
+                    "required": ["selector", "reason"],
                     "additionalProperties": False
                 }
             }
