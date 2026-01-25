@@ -81,6 +81,36 @@ class InviteTask(BaseTask):
         
         return self.page.locator("body").first, "body"
 
+    def _check_invitation_error(self) -> Optional[str]:
+        try:
+            toast = self.page.locator("div.artdeco-toast-item").first
+            toast.wait_for(state="visible", timeout=3000)
+            text = toast.inner_text().lower()
+            logger.debug(f"Toast content: {text}")
+            
+            if "invitation not sent" in text or "withdrawing" in text:
+                return "withdrawal_cooldown"
+            if "weekly invitation limit" in text or "limit" in text:
+                return "weekly_limit_reached"
+            if "error" in text or "failed" in text:
+                return "unknown_error"
+        except Exception:
+            pass
+        
+        try:
+            alert = self.page.locator("div[role='alert']:visible").first
+            if alert.is_visible(timeout=500):
+                text = alert.inner_text().lower()
+                logger.debug(f"Alert content: {text}")
+                if "invitation not sent" in text or "withdrawing" in text:
+                    return "withdrawal_cooldown"
+                if "limit" in text:
+                    return "weekly_limit_reached"
+        except Exception:
+            pass
+            
+        return None
+
     def _complete_connection(self, try_personal_message: bool, url: str) -> dict:
         self.human.click(ADD_NOTE_SELECTOR)
 
@@ -101,7 +131,33 @@ class InviteTask(BaseTask):
         send_btn = self.page.locator("button[aria-label='Send invitation']")
         self.human.click(send_btn)
 
-        self.human.random_sleep(1.0, 3.0)
+        self.human.random_sleep(2.0, 4.0)
+        
+        error = self._check_invitation_error()
+        if error:
+            logger.warning(f"Invitation failed: {error}")
+            try:
+                close_btn = self.page.locator("button[aria-label='Dismiss']")
+                if close_btn.is_visible(timeout=500):
+                    close_btn.click()
+            except Exception:
+                pass
+            return {"status": "skipped", "reason": error}
+        
+        modal_still_open = False
+        try:
+            modal_still_open = self.page.locator("#custom-message").is_visible(timeout=500)
+        except Exception:
+            pass
+        
+        if modal_still_open:
+            logger.warning("Modal still open after send - invitation may have failed")
+            page_text = self.page.locator("body").inner_text().lower()
+            if "invitation not sent" in page_text or "withdrawing" in page_text:
+                return {"status": "skipped", "reason": "withdrawal_cooldown"}
+            if "limit" in page_text:
+                return {"status": "skipped", "reason": "weekly_limit_reached"}
+        
         logger.info("Connection request sent successfully")
 
         message_preview = (
@@ -133,7 +189,13 @@ class InviteTask(BaseTask):
 
             if try_heuristic_connect(self.page, self.human):
                 logger.info("Connected via heuristics (no LLM needed)")
-                self.human.random_sleep(0.5, 1.0)
+                self.human.random_sleep(1.0, 2.0)
+                
+                error = self._check_invitation_error()
+                if error:
+                    logger.warning(f"Invitation blocked after heuristic click: {error}")
+                    return {"status": "skipped", "reason": error}
+                
                 if self._wait_for_add_note():
                     return self._complete_connection(try_personal_message, url)
 
@@ -141,8 +203,17 @@ class InviteTask(BaseTask):
             if cached_selector:
                 logger.info(f"Using cached selector: {cached_selector}")
                 try:
-                    self.human.click(self.page.locator(cached_selector).first)
-                    self.human.random_sleep(0.5, 1.0)
+                    locator = self.page.locator(cached_selector).first
+                    locator.scroll_into_view_if_needed()
+                    self.human.random_sleep(0.3, 0.5)
+                    locator.click(delay=100)
+                    self.human.random_sleep(1.0, 2.0)
+                    
+                    error = self._check_invitation_error()
+                    if error:
+                        logger.warning(f"Invitation blocked after cached selector click: {error}")
+                        return {"status": "skipped", "reason": error}
+                    
                     if self._wait_for_add_note():
                         return self._complete_connection(try_personal_message, url)
                 except Exception:
@@ -214,8 +285,15 @@ class InviteTask(BaseTask):
                     
                     button_text = target_locator.inner_text().strip()
                     
-                    self.human.click(target_locator, timeout=5000)
-                    self.human.random_sleep(0.5, 1.5)
+                    target_locator.scroll_into_view_if_needed()
+                    self.human.random_sleep(0.3, 0.5)
+                    target_locator.click(delay=100)
+                    self.human.random_sleep(1.0, 2.0)
+                    
+                    error = self._check_invitation_error()
+                    if error:
+                        logger.warning(f"Invitation blocked after clicking Connect: {error}")
+                        return {"status": "skipped", "reason": error}
                     
                     save_selector_to_cache("profile_card", button_text, selector)
                     previous_feedback = None

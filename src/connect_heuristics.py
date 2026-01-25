@@ -121,15 +121,27 @@ def _find_connect_in_dropdown(page: Page) -> Optional[Locator]:
 def try_heuristic_connect(page: Page, human: HumanActions) -> bool:
     direct_btn = _find_direct_connect_button(page)
     if direct_btn:
-        human.click(direct_btn, timeout=3000)
-        logger.info("Clicked Connect via direct button heuristic")
-        return True
+        try:
+            direct_btn.scroll_into_view_if_needed()
+            human.random_sleep(0.3, 0.6)
+            direct_btn.click(delay=100)
+            human.random_sleep(0.5, 1.0)
+            logger.info("Clicked Connect via direct button heuristic")
+            return True
+        except Exception as e:
+            logger.debug(f"Direct button click failed: {e}")
     
     dropdown_btn = _find_connect_in_dropdown(page)
     if dropdown_btn:
-        human.click(dropdown_btn, timeout=3000)
-        logger.info("Clicked Connect in open dropdown via heuristic")
-        return True
+        try:
+            dropdown_btn.scroll_into_view_if_needed()
+            human.random_sleep(0.2, 0.4)
+            dropdown_btn.click(delay=100)
+            human.random_sleep(0.5, 1.0)
+            logger.info("Clicked Connect in open dropdown via heuristic")
+            return True
+        except Exception as e:
+            logger.debug(f"Dropdown button click failed: {e}")
     
     container = _get_main_container(page)
     for more_pattern in MORE_BUTTON_PATTERNS:
@@ -138,12 +150,15 @@ def try_heuristic_connect(page: Page, human: HumanActions) -> bool:
             if not more_btn.is_visible(timeout=500):
                 continue
             
-            human.click(more_btn, timeout=3000)
-            human.random_sleep(0.3, 0.8)
+            more_btn.scroll_into_view_if_needed()
+            human.random_sleep(0.2, 0.4)
+            more_btn.click(delay=100)
+            human.random_sleep(0.5, 1.0)
             
             dropdown_connect = _find_connect_in_dropdown(page)
             if dropdown_connect:
-                human.click(dropdown_connect, timeout=3000)
+                dropdown_connect.click(delay=100)
+                human.random_sleep(0.5, 1.0)
                 logger.info("Clicked Connect via More dropdown heuristic")
                 return True
             
