@@ -38,17 +38,21 @@ Return null selector if:
 - Connection pending (button says "Pending" or "Withdraw")
 - No way to send connection request
 
-If connection IS possible, return the CSS selector for the button to click:
-- A visible "Connect" button
-- A "More" / "More actions" button (to reveal dropdown)
-- A "Connect" option inside an open dropdown
+If connection IS possible, return the CSS selector for the NEXT button to click:
+- If there's a visible "Connect" button on the profile, return its selector
+- If Connect is hidden inside a dropdown menu (not visible in screenshot), return the "More" / "More actions" button selector to open the dropdown FIRST
+- If a dropdown menu IS currently open/visible in the screenshot, return the "Connect" option selector inside it
+
+CRITICAL: Only return selectors for elements that are CURRENTLY VISIBLE in the screenshot. 
+If Connect is inside a closed dropdown, you must return "More" button first - do NOT return the Connect selector until the dropdown is open.
 
 The selector will be executed WITHIN this HTML section only (not the full page).
+Return the exact visible text of the button you're targeting (e.g., "Connect", "More", "More actions").
 
 HTML section:
 {section_html}
 
-Return selector (CSS selector relative to this section, or null) and reason."""
+Return selector (CSS selector relative to this section, or null), expected_text (exact button text), and reason."""
 
 def generate_connection_message(profile_content: str) -> str:
     """
@@ -101,7 +105,7 @@ def generate_connection_message(profile_content: str) -> str:
 
     return None
 
-def get_next_connect_action(screenshot_base64: str, raw_html: str) -> dict | None:
+def get_next_connect_action(screenshot_base64: str, raw_html: str, previous_feedback: str | None = None) -> dict | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping connect action detection.")
@@ -109,6 +113,10 @@ def get_next_connect_action(screenshot_base64: str, raw_html: str) -> dict | Non
 
     minified_html = minify_dom(raw_html, max_length=MAX_DOM_LENGTH)
     logger.debug(f"DOM minified: {len(raw_html)} -> {len(minified_html)} chars")
+
+    prompt_text = CONNECT_ACTION_PROMPT.format(section_html=minified_html)
+    if previous_feedback:
+        prompt_text += f"\n\nPREVIOUS ATTEMPT FAILED: {previous_feedback}\nPlease try a different approach."
 
     url = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -132,7 +140,7 @@ def get_next_connect_action(screenshot_base64: str, raw_html: str) -> dict | Non
                     },
                     {
                         "type": "text",
-                        "text": CONNECT_ACTION_PROMPT.format(section_html=minified_html)
+                        "text": prompt_text
                     }
                 ]
             }
@@ -150,12 +158,16 @@ def get_next_connect_action(screenshot_base64: str, raw_html: str) -> dict | Non
                             "type": ["string", "null"],
                             "description": "CSS selector for button to click, or null if connection not possible"
                         },
+                        "expected_text": {
+                            "type": ["string", "null"],
+                            "description": "Exact visible text of the target button (e.g., 'Connect', 'More'). Null if selector is null."
+                        },
                         "reason": {
                             "type": "string",
                             "description": "Brief explanation (e.g., 'found Connect button', 'already connected')"
                         }
                     },
-                    "required": ["selector", "reason"],
+                    "required": ["selector", "expected_text", "reason"],
                     "additionalProperties": False
                 }
             }

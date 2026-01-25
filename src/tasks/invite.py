@@ -17,8 +17,9 @@ MAX_CONNECT_ITERATIONS = 5
 ADD_NOTE_SELECTOR = "button[aria-label='Add a note']"
 
 PROFILE_CONTAINER_SELECTORS = [
-    "section.artdeco-card:has(button)",
-    "main section:has(button)",
+    "div.pvs-profile-actions",
+    "section.pv-top-card",
+    "div.ph5:has(button[aria-label*='Connect'], button[aria-label*='More'])",
     "div.scaffold-layout__main",
     "main",
 ]
@@ -149,6 +150,8 @@ class InviteTask(BaseTask):
 
             logger.info("Falling back to LLM for selector detection")
             
+            previous_feedback = None
+            
             for iteration in range(MAX_CONNECT_ITERATIONS):
                 logger.info(f"LLM iteration {iteration + 1}/{MAX_CONNECT_ITERATIONS}")
 
@@ -159,30 +162,66 @@ class InviteTask(BaseTask):
                 container_html = container.inner_html()
                 logger.debug(f"Using container: {container_name}")
 
-                result = get_next_connect_action(screenshot_base64, container_html)
+                result = get_next_connect_action(screenshot_base64, container_html, previous_feedback)
 
                 if result is None:
                     raise ValueError("LLM returned invalid response")
 
                 selector = result.get("selector")
+                expected_text = result.get("expected_text")
                 reason = result.get("reason", "")
                 
-                logger.info(f"LLM response: selector={selector}, reason={reason}")
+                logger.info(f"LLM response: selector={selector}, expected_text={expected_text}, reason={reason}")
 
                 if selector is None:
                     logger.info(f"LLM says skip: {reason}")
                     return {"status": "skipped", "reason": reason}
 
                 try:
-                    locator = container.locator(selector).first
-                    button_text = locator.inner_text().strip()
+                    all_matches = container.locator(selector).all()
                     
-                    self.human.click(locator, timeout=5000)
+                    if not all_matches:
+                        previous_feedback = f"Selector '{selector}' found no elements. Try a different selector."
+                        logger.info(f"No elements found for selector: {selector}")
+                        continue
+                    
+                    target_locator = None
+                    
+                    if expected_text:
+                        for match in all_matches:
+                            try:
+                                if not match.is_visible(timeout=300):
+                                    continue
+                                text = match.inner_text().strip()
+                                if text and (expected_text.lower() in text.lower() or text.lower() in expected_text.lower()):
+                                    target_locator = match
+                                    logger.info(f"Found matching element with text: {text}")
+                                    break
+                            except Exception:
+                                continue
+                        
+                        if not target_locator:
+                            previous_feedback = f"Element '{selector}' with text '{expected_text}' is NOT VISIBLE - it's likely inside a closed dropdown. Click the 'More' button first to open the dropdown."
+                            logger.info(f"No visible element with expected text '{expected_text}' found among {len(all_matches)} matches (element may be in closed dropdown)")
+                            continue
+                    else:
+                        visible_matches = [m for m in all_matches if m.is_visible(timeout=300)]
+                        if not visible_matches:
+                            previous_feedback = f"Element '{selector}' is NOT VISIBLE - it may be inside a closed dropdown. Click the 'More' button first."
+                            logger.info(f"No visible elements found for selector: {selector}")
+                            continue
+                        target_locator = visible_matches[0]
+                    
+                    button_text = target_locator.inner_text().strip()
+                    
+                    self.human.click(target_locator, timeout=5000)
                     self.human.random_sleep(0.5, 1.5)
                     
                     save_selector_to_cache("profile_card", button_text, selector)
+                    previous_feedback = None
                         
                 except Exception as e:
+                    previous_feedback = f"Selector '{selector}' failed to click: {str(e)[:100]}"
                     logger.info(f"Suggested selector not clickable: {e}")
                     continue
 

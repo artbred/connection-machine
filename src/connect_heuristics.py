@@ -7,6 +7,8 @@ from human_actions import HumanActions
 
 logger = logging.getLogger(__name__)
 
+MAIN_PROFILE_CONTAINER = "div.scaffold-layout__main"
+
 CONNECT_IN_DROPDOWN_PATTERNS = [
     "div[role='menu'] button:has-text('Connect')",
     "div.artdeco-dropdown__content button:has-text('Connect')",
@@ -69,16 +71,32 @@ selector_cache = SelectorCache()
 
 def _is_valid_connect_button(locator: Locator) -> bool:
     try:
-        if not locator.is_visible(timeout=300):
+        if not locator.is_visible(timeout=500):
             return False
+        
+        box = locator.bounding_box(timeout=500)
+        if not box or box["width"] == 0 or box["height"] == 0:
+            return False
+        
+        if locator.is_disabled(timeout=300):
+            return False
+        
         text = locator.inner_text(timeout=300).strip()
         return text == "Connect"
     except Exception:
         return False
 
 
+def _get_main_container(page: Page) -> Locator:
+    container = page.locator(MAIN_PROFILE_CONTAINER)
+    if container.count() > 0:
+        return container.first
+    return page.locator("main").first
+
+
 def _find_direct_connect_button(page: Page) -> Optional[Locator]:
-    buttons = page.locator("button").filter(has_text="Connect")
+    container = _get_main_container(page)
+    buttons = container.locator("button").filter(has_text="Connect")
     for i in range(min(buttons.count(), 10)):
         try:
             btn = buttons.nth(i)
@@ -113,9 +131,10 @@ def try_heuristic_connect(page: Page, human: HumanActions) -> bool:
         logger.info("Clicked Connect in open dropdown via heuristic")
         return True
     
+    container = _get_main_container(page)
     for more_pattern in MORE_BUTTON_PATTERNS:
         try:
-            more_btn = page.locator(more_pattern).first
+            more_btn = container.locator(more_pattern).first
             if not more_btn.is_visible(timeout=500):
                 continue
             
