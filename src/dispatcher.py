@@ -6,7 +6,7 @@ from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
 from tasks.post import PostTask
-from exceptions import SessionExpiredException
+from exceptions import SessionExpiredException, TaskSkippedException
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +212,13 @@ class TaskDispatcher:
                 task_to_run.status = TaskStatus.COMPLETED
                 task_to_run.executed_at = datetime.utcnow()
                 self.schedule_next_execution(task_to_run.type)
+
+            except TaskSkippedException as e:
+                logger.info(f"Task {task_to_run.id} skipped: {e.reason}")
+                task_to_run.status = TaskStatus.FAILED
+                task_to_run.error = e.reason
+                task_to_run.executed_at = datetime.utcnow()
+                # No schedule_next_execution — skip doesn't count toward rate limits
 
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")

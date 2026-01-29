@@ -10,6 +10,7 @@ from markdownify import markdownify as md
 from notifications import send_notification
 from connection_state import detect_connection_state, ConnectionState
 from connect_heuristics import try_heuristic_connect, get_cached_selector, save_selector_to_cache
+from exceptions import TaskSkippedException
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class InviteTask(BaseTask):
                     close_btn.click()
             except Exception:
                 pass
-            return {"status": "skipped", "reason": error}
+            raise TaskSkippedException(error)
         
         modal_still_open = False
         try:
@@ -154,9 +155,9 @@ class InviteTask(BaseTask):
             logger.warning("Modal still open after send - invitation may have failed")
             page_text = self.page.locator("body").inner_text().lower()
             if "invitation not sent" in page_text or "withdrawing" in page_text:
-                return {"status": "skipped", "reason": "withdrawal_cooldown"}
+                raise TaskSkippedException("withdrawal_cooldown")
             if "limit" in page_text:
-                return {"status": "skipped", "reason": "weekly_limit_reached"}
+                raise TaskSkippedException("weekly_limit_reached")
         
         logger.info("Connection request sent successfully")
 
@@ -181,11 +182,11 @@ class InviteTask(BaseTask):
             
             if state == ConnectionState.PENDING:
                 logger.info("Connection already pending, skipping")
-                return {"status": "skipped", "reason": "already_pending"}
+                raise TaskSkippedException("already_pending")
             
             if state == ConnectionState.CONNECTED:
                 logger.info("Already connected, skipping")
-                return {"status": "skipped", "reason": "already_connected"}
+                raise TaskSkippedException("already_connected")
 
             if try_heuristic_connect(self.page, self.human):
                 logger.info("Connected via heuristics (no LLM needed)")
@@ -194,7 +195,7 @@ class InviteTask(BaseTask):
                 error = self._check_invitation_error()
                 if error:
                     logger.warning(f"Invitation blocked after heuristic click: {error}")
-                    return {"status": "skipped", "reason": error}
+                    raise TaskSkippedException(error)
                 
                 if self._wait_for_add_note():
                     return self._complete_connection(try_personal_message, url)
@@ -212,7 +213,7 @@ class InviteTask(BaseTask):
                     error = self._check_invitation_error()
                     if error:
                         logger.warning(f"Invitation blocked after cached selector click: {error}")
-                        return {"status": "skipped", "reason": error}
+                        raise TaskSkippedException(error)
                     
                     if self._wait_for_add_note():
                         return self._complete_connection(try_personal_message, url)
@@ -246,7 +247,7 @@ class InviteTask(BaseTask):
 
                 if selector is None:
                     logger.info(f"LLM says skip: {reason}")
-                    return {"status": "skipped", "reason": reason}
+                    raise TaskSkippedException(reason)
 
                 try:
                     all_matches = container.locator(selector).all()
@@ -293,7 +294,7 @@ class InviteTask(BaseTask):
                     error = self._check_invitation_error()
                     if error:
                         logger.warning(f"Invitation blocked after clicking Connect: {error}")
-                        return {"status": "skipped", "reason": error}
+                        raise TaskSkippedException(error)
                     
                     save_selector_to_cache("profile_card", button_text, selector)
                     previous_feedback = None
