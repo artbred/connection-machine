@@ -82,7 +82,7 @@ def _refine_message_length(message: str, max_length: int, api_key: str) -> str |
     }
     
     payload = {
-        "model": "anthropic/claude-3.5-haiku",
+        "model": "anthropic/claude-haiku-4.5-latest",
         "messages": [
             {
                 "role": "user",
@@ -124,7 +124,7 @@ def generate_connection_message(profile_content: str) -> str:
     }
 
     payload = {
-        "model": "anthropic/claude-3.5-haiku",
+        "model": "anthropic/claude-haiku-4.5-latest",
         "messages": [
             {
                 "role": "user",
