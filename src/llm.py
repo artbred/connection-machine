@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import httpx
@@ -9,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 MAX_DOM_LENGTH = 50000
 
-MAX_MESSAGE_LENTGH = 300
+MAX_MESSAGE_LENGTH = 200
 MAX_REFINEMENT_ATTEMPTS = 3
 
 REFINE_MESSAGE_PROMPT = """Your message is {current_length} characters but must be {max_length} characters or less.
@@ -17,7 +18,7 @@ REFINE_MESSAGE_PROMPT = """Your message is {current_length} characters but must 
 Shorten this message while preserving its core meaning and personal touch:
 "{message}"
 
-Return ONLY the shortened message, nothing else. Must be under {max_length} characters."""
+Return ONLY the shortened message, nothing else. No quotes, no explanation. Must be under {max_length} characters."""
 
 # Prompt for generating connection messages
 CONNECTION_MESSAGE_PROMPT = """
@@ -62,6 +63,15 @@ HTML section:
 
 Return selector (CSS selector relative to this section, or null), expected_text (exact button text), and reason."""
 
+def _clean_llm_output(text: str) -> str:
+    """Strip thinking tags, wrapping quotes, and extra whitespace from LLM output."""
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    # Strip wrapping quotes
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
+        text = text[1:-1].strip()
+    return text
+
+
 def _refine_message_length(message: str, max_length: int, api_key: str) -> str | None:
     url = "https://openrouter.ai/api/v1/chat/completions"
     
@@ -72,7 +82,7 @@ def _refine_message_length(message: str, max_length: int, api_key: str) -> str |
     }
     
     payload = {
-        "model": "qwen/qwen3-next-80b-a3b-instruct",
+        "model": "anthropic/claude-3.5-haiku",
         "messages": [
             {
                 "role": "user",
@@ -92,7 +102,7 @@ def _refine_message_length(message: str, max_length: int, api_key: str) -> str |
         
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
-            return data["choices"][0]["message"]["content"].strip()
+            return _clean_llm_output(data["choices"][0]["message"]["content"])
     except Exception as e:
         logger.error(f"Failed to refine message: {e}")
     
@@ -114,13 +124,13 @@ def generate_connection_message(profile_content: str) -> str:
     }
 
     payload = {
-        "model": "qwen/qwen3-next-80b-a3b-instruct",
+        "model": "anthropic/claude-3.5-haiku",
         "messages": [
             {
                 "role": "user",
                 "content": CONNECTION_MESSAGE_PROMPT.format(
                     profile_content=profile_content,
-                    max_message_length=MAX_MESSAGE_LENTGH - 50,
+                    max_message_length=MAX_MESSAGE_LENGTH,
                 ),
             }
         ],
@@ -133,17 +143,17 @@ def generate_connection_message(profile_content: str) -> str:
 
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
-            message = data["choices"][0]["message"]["content"].strip()
+            message = _clean_llm_output(data["choices"][0]["message"]["content"])
             
-            if len(message) <= MAX_MESSAGE_LENTGH:
+            if len(message) <= MAX_MESSAGE_LENGTH:
                 logger.info(f"Generated message ({len(message)} chars): {message}")
                 return message
             
             logger.info(f"Message too long ({len(message)} chars), attempting refinement...")
             
             for attempt in range(MAX_REFINEMENT_ATTEMPTS):
-                refined = _refine_message_length(message, MAX_MESSAGE_LENTGH, api_key)
-                if refined and len(refined) <= MAX_MESSAGE_LENTGH:
+                refined = _refine_message_length(message, MAX_MESSAGE_LENGTH, api_key)
+                if refined and len(refined) <= MAX_MESSAGE_LENGTH:
                     logger.info(f"Refinement succeeded on attempt {attempt + 1} ({len(refined)} chars)")
                     return refined
                 elif refined:
@@ -152,8 +162,8 @@ def generate_connection_message(profile_content: str) -> str:
                 else:
                     logger.warning(f"Refinement attempt {attempt + 1} failed")
             
-            logger.warning(f"All refinement attempts failed, truncating from {len(message)} to {MAX_MESSAGE_LENTGH} chars")
-            truncated = message[:MAX_MESSAGE_LENTGH]
+            logger.warning(f"All refinement attempts failed, truncating from {len(message)} to {MAX_MESSAGE_LENGTH} chars")
+            truncated = message[:MAX_MESSAGE_LENGTH]
             if " " in truncated:
                 truncated = truncated[:truncated.rfind(" ")]
             return truncated.rstrip()
