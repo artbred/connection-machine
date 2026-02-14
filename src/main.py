@@ -96,7 +96,9 @@ def login(page):
         # Wait for navigation after login (feed or checkpoint)
         try:
             page.wait_for_url(
-                lambda url: "/feed" in url or "/checkpoint" in url or "/login" not in url,
+                lambda url: "/feed" in url
+                or "/checkpoint" in url
+                or "/login" not in url,
                 timeout=30000,
             )
         except Exception:
@@ -166,7 +168,7 @@ def main():
     try:
         launch_args = [
             f"--remote-debugging-port={INTERNAL_DEBUG_PORT}",
-            "--remote-debugging-address=127.0.0.1"
+            "--remote-debugging-address=127.0.0.1",
         ]
 
         if SOCKS_PROXY and len(SOCKS_PROXY) > 0:
@@ -174,7 +176,7 @@ def main():
 
         logger.info(f"Launching browser with args: {launch_args}")
 
-        user_data_dir = os.path.join(os.getcwd(), "data", "trel-chrome")
+        user_data_dir = os.path.join(os.getcwd(), "data", "connection-machine-chrome")
         logger.info(f"Using user data dir: {user_data_dir}")
 
         with sync_playwright() as p:
@@ -182,7 +184,7 @@ def main():
                 user_data_dir,
                 headless=HEADLESS,
                 args=launch_args,
-                viewport={"height": 1080, "width": 1920}
+                viewport={"height": 1080, "width": 1920},
             )
 
             page = context.new_page()
@@ -212,10 +214,12 @@ def main():
             if args.debug_invite:
                 logger.info(f"Debug mode: sending invite to {args.debug_invite}")
                 invite_task = InviteTask(page)
-                invite_task.run({
-                    "url": args.debug_invite,
-                    "try_personal_message": not args.no_message,
-                })
+                invite_task.run(
+                    {
+                        "url": args.debug_invite,
+                        "try_personal_message": not args.no_message,
+                    }
+                )
                 logger.info("Debug invite completed.")
                 return
 

@@ -1,6 +1,6 @@
 services:
-  trel:
-    container_name: trel
+  connection-machine:
+    container_name: connection-machine
     build:
       context: .
     env_file:
@@ -16,7 +16,7 @@ services:
         max-size: "500m"
         max-file: "3"
     volumes:
-      - ./data/trel-chrome:/app/data/trel-chrome
+      - ./data:/app/data
 
   xray:
     image: teddysun/xray:25.10.15

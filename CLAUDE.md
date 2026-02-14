@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TREL is a LinkedIn automation tool that sends connection requests with AI-personalized messages and creates posts. It uses Playwright for browser automation with anti-detection measures, PostgreSQL for task queueing, and OpenRouter API for message generation.
+Connection Machine is a LinkedIn automation tool that sends connection requests with AI-personalized messages and creates posts. It uses Playwright for browser automation with anti-detection measures, SQLite for task queueing, and OpenRouter API for message generation.
 
 ## Development Commands
 
@@ -24,7 +24,7 @@ python utils/populate_db.py
 
 # Docker
 docker-compose up -d
-docker-compose logs -f trel
+docker-compose logs -f connection-machine
 ```
 
 ## Architecture
@@ -36,7 +36,7 @@ TaskDispatcher (Polling loop, rate limiting)
     ├── InviteTask → Sends connection requests
     └── PostTask → Creates LinkedIn posts
     ↓
-Database (PostgreSQL via SQLAlchemy)
+Database (SQLite via SQLAlchemy)
 LLM (OpenRouter API for message generation)
 HumanActions (Bot evasion via simulated human behavior)
 ```
@@ -63,7 +63,7 @@ HumanActions (Bot evasion via simulated human behavior)
 
 Required in `.env`:
 - `LINKEDIN_USERNAME`, `LINKEDIN_PASSWORD` - LinkedIn credentials
-- `DATABASE_URL` - PostgreSQL connection string
+- `DATABASE_URL` - SQLite database path
 - `OPENROUTER_API_KEY` - For AI message generation
 - `HEADLESS` - Browser visibility (true/false)
 - `SOCKS_PROXY` - Optional proxy (socks5://host:port)
