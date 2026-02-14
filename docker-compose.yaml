@@ -19,7 +19,7 @@ services:
       - ./data:/app/data
 
   xray:
-    image: teddysun/xray:25.10.15
+    image: ghcr.io/xtls/xray-core:latest
     container_name: xray
     restart: always
     ports:
