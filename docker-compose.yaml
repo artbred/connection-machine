@@ -17,12 +17,3 @@ services:
         max-file: "3"
     volumes:
       - ./data:/app/data
-
-  xray:
-    image: ghcr.io/xtls/xray-core:latest
-    container_name: xray
-    restart: always
-    ports:
-      - "127.0.0.1:10808:10808"
-    volumes:
-      - ./data/xray:/usr/local/etc/xray/
