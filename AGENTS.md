@@ -6,6 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Connection Machine is a LinkedIn automation tool that sends connection requests with AI-personalized messages and creates posts. It uses Playwright for browser automation with anti-detection measures, SQLite for task queueing, and OpenRouter API for message generation.
 
+
 ## Development Commands
 
 ```bash
