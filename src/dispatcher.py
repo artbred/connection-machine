@@ -21,7 +21,7 @@ class TaskDispatcher:
             TaskType.COMMENT_FEED_POST: FeedCommentTask(page),
         }
         self.rate_limits = {
-            TaskType.SEND_INVITE: 15,
+            TaskType.SEND_INVITE: 10,
             TaskType.CREATE_POST: 50,
             TaskType.COMMENT_FEED_POST: 12,
         }
