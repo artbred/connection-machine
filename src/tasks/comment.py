@@ -349,6 +349,24 @@ el => {
 
         return pruned
 
+    def get_comment_timestamps(self) -> list[datetime]:
+        timestamps: list[datetime] = []
+        for value in self._load_comment_history().values():
+            if not isinstance(value, dict):
+                continue
+
+            commented_at = value.get("commented_at")
+            if not commented_at:
+                continue
+
+            try:
+                timestamps.append(datetime.fromisoformat(commented_at))
+            except ValueError:
+                continue
+
+        timestamps.sort()
+        return timestamps
+
     def _mark_post_commented(self, candidate: dict[str, Any]):
         history = self._load_comment_history()
         history[candidate["post_key"]] = {

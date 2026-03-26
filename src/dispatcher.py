@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 import random
 
 from datetime import datetime, timedelta
@@ -14,20 +15,24 @@ logger = logging.getLogger(__name__)
 SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
     (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(hours=12),
     (TaskType.SEND_INVITE, "withdrawal_cooldown"): timedelta(hours=6),
+    (TaskType.COMMENT_FEED_POST, "no_safe_commentable_posts"): timedelta(minutes=30),
 }
+AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
 
 
 class TaskDispatcher:
     def __init__(self, page):
         self.page = page
+        self.feed_comment_handler = FeedCommentTask(page)
         self.handlers = {
             TaskType.SEND_INVITE: InviteTask(page),
             TaskType.CREATE_POST: PostTask(page),
-            TaskType.COMMENT_FEED_POST: FeedCommentTask(page),
         }
         self.rate_limits = {
             TaskType.SEND_INVITE: 10,
             TaskType.CREATE_POST: 50,
+        }
+        self.autonomous_rate_limits = {
             TaskType.COMMENT_FEED_POST: 12,
         }
         self.next_execution_at: dict[TaskType, datetime] = {}
@@ -35,6 +40,7 @@ class TaskDispatcher:
         self._last_idle_log: datetime | None = None
         self._logged_no_pending: bool = False
         self._init_spacing_from_db()
+        self._init_autonomous_spacing()
 
     def _init_spacing_from_db(self):
         """Initialize next execution times from last executed tasks in DB."""
@@ -69,6 +75,20 @@ class TaskDispatcher:
                         logger.info(
                             f"Restored cooldown for {task_type}: ~{wait_min} min remaining"
                         )
+
+    def _init_autonomous_spacing(self):
+        """Initialize spacing for non-DB autonomous actions from local history."""
+        for task_type in self.autonomous_rate_limits.keys():
+            last_action_at = self._get_last_autonomous_execution(task_type)
+            if last_action_at:
+                interval = self.get_spacing_interval(task_type)
+                next_allowed = last_action_at + interval
+                if next_allowed > datetime.utcnow():
+                    self.next_execution_at[task_type] = next_allowed
+                    wait_min = (next_allowed - datetime.utcnow()).seconds // 60
+                    logger.info(
+                        f"Restored spacing for {task_type}: ~{wait_min} min remaining"
+                    )
 
     def _get_restored_cooldown(
         self,
@@ -106,10 +126,19 @@ class TaskDispatcher:
 
     def get_spacing_interval(self, task_type: TaskType) -> timedelta:
         """Calculate randomized spacing between tasks based on rate limit."""
-        limit = self.rate_limits.get(task_type, 100)
+        limit = self.rate_limits.get(
+            task_type,
+            self.autonomous_rate_limits.get(task_type, 100),
+        )
         base_seconds = (24 * 60 * 60) / limit  # seconds per task
         randomized = base_seconds * random.uniform(0.7, 1.3)
         return timedelta(seconds=randomized)
+
+    def _get_last_autonomous_execution(self, task_type: TaskType) -> datetime | None:
+        if task_type == TaskType.COMMENT_FEED_POST:
+            timestamps = self.feed_comment_handler.get_comment_timestamps()
+            return timestamps[-1] if timestamps else None
+        return None
 
     def cleanup_zombie_tasks(self):
         """Reset tasks that were stuck in PROCESSING state (e.g. due to crash)."""
@@ -144,6 +173,24 @@ class TaskDispatcher:
                     db.delete(task)
                 db.commit()
 
+    def cleanup_db_backed_feed_comment_tasks(self):
+        """Remove legacy DB-backed feed comment tasks. Feed comments now run autonomously."""
+        with SessionLocal() as db:
+            comment_tasks = (
+                db.query(Task)
+                .filter(Task.type == TaskType.COMMENT_FEED_POST)
+                .all()
+            )
+            if not comment_tasks:
+                return
+
+            logger.warning(
+                f"Deleting {len(comment_tasks)} legacy COMMENT_FEED_POST tasks from the database."
+            )
+            for task in comment_tasks:
+                db.delete(task)
+            db.commit()
+
     def schedule_next_execution(self, task_type: TaskType):
         """Set the next allowed execution time for a task type after completion."""
         interval = self.get_spacing_interval(task_type)
@@ -165,6 +212,45 @@ class TaskDispatcher:
         logger.warning(
             f"{task_type} cooling down for {cooldown} due to skip reason: {reason}"
         )
+
+    def can_run_autonomous_comment(self) -> bool:
+        """Return whether an autonomous feed comment action is currently allowed."""
+        if not os.getenv("OPENROUTER_API_KEY"):
+            return False
+
+        task_type = TaskType.COMMENT_FEED_POST
+        next_allowed = self.next_execution_at.get(task_type)
+        if next_allowed and datetime.utcnow() < next_allowed:
+            return False
+
+        last_24h = datetime.utcnow() - timedelta(hours=24)
+        timestamps = self.feed_comment_handler.get_comment_timestamps()
+        recent = [ts for ts in timestamps if ts >= last_24h]
+        limit = self.autonomous_rate_limits[task_type]
+        if len(recent) >= limit:
+            self.next_execution_at[task_type] = min(recent) + timedelta(hours=24)
+            return False
+
+        return True
+
+    def maybe_run_autonomous_comment(self) -> bool:
+        """Run a feed comment action directly when no DB-backed task is runnable."""
+        if not self.can_run_autonomous_comment():
+            return False
+
+        logger.info("Executing autonomous feed comment action")
+        try:
+            self.feed_comment_handler.run({})
+            self.schedule_next_execution(TaskType.COMMENT_FEED_POST)
+        except TaskSkippedException as e:
+            logger.info(f"Autonomous feed comment skipped: {e.reason}")
+            self.schedule_skip_cooldown(TaskType.COMMENT_FEED_POST, e.reason)
+        except Exception as e:
+            logger.error(f"Autonomous feed comment failed: {e}")
+            self.next_execution_at[TaskType.COMMENT_FEED_POST] = (
+                datetime.utcnow() + AUTONOMOUS_COMMENT_FAILURE_COOLDOWN
+            )
+        return True
 
     def get_rate_limited_types(self, pending_types: set[TaskType]) -> list[TaskType]:
         """Return list of task types currently blocked by rate limits or spacing delays.
@@ -228,7 +314,10 @@ class TaskDispatcher:
             pending_types = set(
                 row[0]
                 for row in db.query(Task.type)
-                .filter(Task.status == TaskStatus.PENDING)
+                .filter(
+                    Task.status == TaskStatus.PENDING,
+                    Task.type.in_(tuple(self.handlers.keys())),
+                )
                 .distinct()
                 .all()
             )
@@ -236,13 +325,21 @@ class TaskDispatcher:
         blocked_types = self.get_rate_limited_types(pending_types)
 
         with SessionLocal() as db:
-            query = db.query(Task).filter(Task.status == TaskStatus.PENDING)
+            query = db.query(Task).filter(
+                Task.status == TaskStatus.PENDING,
+                Task.type.in_(tuple(self.handlers.keys())),
+            )
             if blocked_types:
                 query = query.filter(Task.type.notin_(blocked_types))
 
             task_to_run = query.order_by(Task.created_at).first()
 
             if not task_to_run:
+                if self.maybe_run_autonomous_comment():
+                    self._last_idle_log = None
+                    self._logged_no_pending = False
+                    return
+
                 now = datetime.utcnow()
 
                 # Log "no pending tasks" once when queue is empty
