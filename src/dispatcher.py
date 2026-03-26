@@ -11,6 +11,11 @@ from exceptions import SessionExpiredException, TaskSkippedException
 
 logger = logging.getLogger(__name__)
 
+SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
+    (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(hours=12),
+    (TaskType.SEND_INVITE, "withdrawal_cooldown"): timedelta(hours=6),
+}
+
 
 class TaskDispatcher:
     def __init__(self, page):
@@ -54,6 +59,50 @@ class TaskDispatcher:
                         logger.info(
                             f"Restored spacing for {task_type}: ~{wait_min} min remaining"
                         )
+
+                cooldown_until = self._get_restored_cooldown(db, task_type)
+                if cooldown_until:
+                    restored_until = self.next_execution_at.get(task_type)
+                    if not restored_until or cooldown_until > restored_until:
+                        self.next_execution_at[task_type] = cooldown_until
+                        wait_min = (cooldown_until - datetime.utcnow()).seconds // 60
+                        logger.info(
+                            f"Restored cooldown for {task_type}: ~{wait_min} min remaining"
+                        )
+
+    def _get_restored_cooldown(
+        self,
+        db,
+        task_type: TaskType,
+    ) -> datetime | None:
+        latest_cooldown_end: datetime | None = None
+
+        for (cooldown_task_type, reason), cooldown in SKIP_COOLDOWNS.items():
+            if cooldown_task_type != task_type:
+                continue
+
+            last_skipped = (
+                db.query(Task)
+                .filter(
+                    Task.type == task_type,
+                    Task.status == TaskStatus.FAILED,
+                    Task.error == reason,
+                    Task.executed_at.isnot(None),
+                )
+                .order_by(Task.executed_at.desc())
+                .first()
+            )
+            if not last_skipped or not last_skipped.executed_at:
+                continue
+
+            cooldown_end = last_skipped.executed_at + cooldown
+            if cooldown_end <= datetime.utcnow():
+                continue
+
+            if not latest_cooldown_end or cooldown_end > latest_cooldown_end:
+                latest_cooldown_end = cooldown_end
+
+        return latest_cooldown_end
 
     def get_spacing_interval(self, task_type: TaskType) -> timedelta:
         """Calculate randomized spacing between tasks based on rate limit."""
@@ -100,6 +149,22 @@ class TaskDispatcher:
         interval = self.get_spacing_interval(task_type)
         self.next_execution_at[task_type] = datetime.utcnow() + interval
         logger.info(f"Next {task_type} scheduled in ~{interval.seconds // 60} minutes")
+
+    def schedule_skip_cooldown(self, task_type: TaskType, reason: str):
+        """Apply a temporary task-type cooldown for skip reasons that indicate platform limits."""
+        cooldown = SKIP_COOLDOWNS.get((task_type, reason))
+        if not cooldown:
+            return
+
+        next_allowed = datetime.utcnow() + cooldown
+        existing = self.next_execution_at.get(task_type)
+        if existing and existing > next_allowed:
+            return
+
+        self.next_execution_at[task_type] = next_allowed
+        logger.warning(
+            f"{task_type} cooling down for {cooldown} due to skip reason: {reason}"
+        )
 
     def get_rate_limited_types(self, pending_types: set[TaskType]) -> list[TaskType]:
         """Return list of task types currently blocked by rate limits or spacing delays.
@@ -221,7 +286,8 @@ class TaskDispatcher:
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = e.reason
                 task_to_run.executed_at = datetime.utcnow()
-                # No schedule_next_execution — skip doesn't count toward rate limits
+                self.schedule_skip_cooldown(task_to_run.type, e.reason)
+                # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
 
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")
