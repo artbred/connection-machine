@@ -20,6 +20,16 @@ logger = logging.getLogger(__name__)
 FEED_URL = "https://www.linkedin.com/feed/"
 COMMENT_BUTTON_SELECTOR = "button:has-text('Comment')"
 COMMENT_EDITOR_SELECTOR = "div[role='textbox'][aria-label='Text editor for creating comment']"
+COMMENT_EDITOR_RELATIVE_XPATH = (
+    "xpath=ancestor::*[.//div[@role='textbox' and "
+    "@aria-label='Text editor for creating comment']][1]"
+    "//div[@role='textbox' and @aria-label='Text editor for creating comment']"
+)
+COMMENT_SUBMIT_RELATIVE_XPATH = (
+    "xpath=ancestor::*[.//div[@role='textbox' and "
+    "@aria-label='Text editor for creating comment']][1]"
+    "//button[normalize-space()='Comment']"
+)
 COMMENT_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "feed_comment_history.json"
 )
@@ -69,8 +79,8 @@ class FeedCommentTask(BaseTask):
         feed_url = payload.get("feed_url") or FEED_URL
         max_candidates = int(payload.get("max_candidates", MAX_CANDIDATES_PER_RUN))
 
-        candidate_button, candidate = self._find_candidate(feed_url, max_candidates)
-        if not candidate_button or not candidate:
+        _, candidate = self._find_candidate(feed_url, max_candidates)
+        if not candidate:
             raise TaskSkippedException("no_safe_commentable_posts")
 
         logger.info(
@@ -89,7 +99,7 @@ class FeedCommentTask(BaseTask):
             )
             return candidate
 
-        self._post_comment(candidate_button, candidate["comment"])
+        self._post_comment(candidate)
         self._mark_post_commented(candidate)
         send_notification(
             self._build_notification_message(
@@ -241,6 +251,34 @@ el => {
             "post_key": post_key,
         }
 
+    def _find_button_for_post_key(self, post_key: str):
+        buttons = self.page.locator(COMMENT_BUTTON_SELECTOR)
+        count = buttons.count()
+        for index in range(count):
+            button = buttons.nth(index)
+            try:
+                if not button.is_visible(timeout=500):
+                    continue
+            except Exception:
+                continue
+
+            candidate = self._extract_candidate(button)
+            if candidate and candidate["post_key"] == post_key:
+                return button
+
+        return None
+
+    def _get_post_editor(self, button):
+        return button.locator(COMMENT_EDITOR_RELATIVE_XPATH).first
+
+    def _wait_for_post_editor(self, button, timeout: int = 5000):
+        editor = self._get_post_editor(button)
+        editor.wait_for(state="visible", timeout=timeout)
+        return editor
+
+    def _get_post_submit_button(self, button):
+        return button.locator(COMMENT_SUBMIT_RELATIVE_XPATH).last
+
     def _clean_post_lines(self, raw_text: str) -> list[str]:
         cleaned_lines: list[str] = []
         for raw_line in raw_text.splitlines():
@@ -294,19 +332,30 @@ el => {
 
         return None
 
-    def _post_comment(self, button, comment_text: str):
+    def _post_comment(self, candidate: dict[str, Any]):
+        button = self._find_button_for_post_key(candidate["post_key"])
+        if not button:
+            raise ValueError(f"Could not re-find comment button for post {candidate['post_key']}")
+
+        comment_text = candidate["comment"]
         button.scroll_into_view_if_needed()
         self.human.random_sleep(0.8, 1.6)
         self.human.click(button)
 
-        editor = self.page.locator(COMMENT_EDITOR_SELECTOR).first
-        editor.wait_for(state="visible", timeout=10000)
+        try:
+            editor = self._wait_for_post_editor(button, timeout=4000)
+        except Exception:
+            logger.warning(
+                "Human click did not open comment editor for post %s, retrying with direct click",
+                candidate["post_key"],
+            )
+            button.click(timeout=5000)
+            editor = self._wait_for_post_editor(button, timeout=10000)
+
         self.human.type(editor, comment_text)
         self.human.random_sleep(0.8, 1.6)
 
-        submit_button = button.locator(
-            "xpath=ancestor::div[.//div[@role='textbox' and @aria-label='Text editor for creating comment']][1]//button[normalize-space()='Comment']"
-        ).last
+        submit_button = self._get_post_submit_button(button)
         submit_button.wait_for(state="visible", timeout=10000)
         self.human.click(submit_button)
         self.human.random_sleep(2.5, 4.5)
