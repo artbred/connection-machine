@@ -11,14 +11,15 @@ logger = logging.getLogger(__name__)
 MAX_DOM_LENGTH = 50000
 
 MAX_MESSAGE_LENGTH = 200
+MAX_COMMENT_LENGTH = 180
 MAX_REFINEMENT_ATTEMPTS = 3
 
-REFINE_MESSAGE_PROMPT = """Your message is {current_length} characters but must be {max_length} characters or less.
+REFINE_TEXT_PROMPT = """Your {content_label} is {current_length} characters but must be {max_length} characters or less.
 
-Shorten this message while preserving its core meaning and personal touch:
-"{message}"
+Shorten this text while preserving its core meaning and human tone:
+"{text}"
 
-Return ONLY the shortened message, nothing else. No quotes, no explanation. Must be under {max_length} characters."""
+Return ONLY the shortened {content_label}, nothing else. No quotes, no explanation. Must be under {max_length} characters."""
 
 # Prompt for generating connection messages
 CONNECTION_MESSAGE_PROMPT = """
@@ -64,6 +65,45 @@ HTML section:
 
 Return selector (CSS selector relative to this section, or null), expected_text (exact button text), and reason."""
 
+FEED_COMMENT_PROMPT = """
+You are deciding whether to leave a short LinkedIn feed comment.
+
+Return strict JSON with exactly these fields:
+- isProhibit: boolean
+- reason: string
+- comment: string or null
+
+Set isProhibit=true if the post is about, significantly mentions, or is entangled with:
+- politics, elections, or public policy
+- religion or faith
+- war, military conflict, or geopolitics
+- guns, weapons, or violence
+- drugs or controlled substances
+- tragedy, grief, crime, medical crises, legal disputes, activism, or other divisive/high-risk topics
+- unclear or too-thin content that cannot support a specific, believable comment
+
+If isProhibit=true:
+- reason should briefly explain why the post should be skipped
+- comment must be null
+
+If isProhibit=false, write one short comment that follows all rules:
+1. Maximum {max_comment_length} characters.
+2. Positive, warm, and believable.
+3. Grounded in a specific idea or detail from the post.
+4. Natural LinkedIn tone, not salesy and not obviously AI-written.
+5. No emojis, hashtags, bullet points, quotes, or marketing fluff.
+6. No politics, religion, war, guns, drugs, or adjacent risky topics.
+7. Avoid generic filler like "great post" unless it is paired with a concrete detail.
+8. Prefer one sentence. No question unless it feels essential.
+
+If isProhibit=false:
+- reason should briefly explain why the post is safe to comment on
+- comment must contain the final comment text
+
+Post content:
+{post_content}
+"""
+
 def _clean_llm_output(text: str) -> str:
     """Strip thinking tags, wrapping quotes, and extra whitespace from LLM output."""
     text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
@@ -73,7 +113,12 @@ def _clean_llm_output(text: str) -> str:
     return text
 
 
-def _refine_message_length(message: str, max_length: int, api_key: str) -> str | None:
+def _refine_text_length(
+    text: str,
+    max_length: int,
+    api_key: str,
+    content_label: str,
+) -> str | None:
     url = "https://openrouter.ai/api/v1/chat/completions"
     
     headers = {
@@ -87,10 +132,11 @@ def _refine_message_length(message: str, max_length: int, api_key: str) -> str |
         "messages": [
             {
                 "role": "user",
-                "content": REFINE_MESSAGE_PROMPT.format(
-                    message=message,
-                    current_length=len(message),
+                "content": REFINE_TEXT_PROMPT.format(
+                    text=text,
+                    current_length=len(text),
                     max_length=max_length,
+                    content_label=content_label,
                 ),
             }
         ],
@@ -153,7 +199,12 @@ def generate_connection_message(profile_content: str) -> str:
             logger.info(f"Message too long ({len(message)} chars), attempting refinement...")
             
             for attempt in range(MAX_REFINEMENT_ATTEMPTS):
-                refined = _refine_message_length(message, MAX_MESSAGE_LENGTH, api_key)
+                refined = _refine_text_length(
+                    message,
+                    MAX_MESSAGE_LENGTH,
+                    api_key,
+                    "message",
+                )
                 if refined and len(refined) <= MAX_MESSAGE_LENGTH:
                     logger.info(f"Refinement succeeded on attempt {attempt + 1} ({len(refined)} chars)")
                     return refined
@@ -171,6 +222,102 @@ def generate_connection_message(profile_content: str) -> str:
 
     except Exception as e:
         logger.error(f"Failed to generate connection message: {e}")
+
+    return None
+
+
+def generate_feed_comment(post_content: str) -> dict | None:
+    api_key = os.getenv("OPENROUTER_API_KEY")
+    if not api_key:
+        logger.warning("OPENROUTER_API_KEY is not set. Skipping comment generation.")
+        return None
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "X-Title": "LinkedIn Auto-Connector",
+    }
+
+    payload = {
+        "model": "google/gemini-3-flash-preview",
+        "messages": [
+            {
+                "role": "user",
+                "content": FEED_COMMENT_PROMPT.format(
+                    post_content=post_content,
+                    max_comment_length=MAX_COMMENT_LENGTH,
+                ),
+            }
+        ],
+        "temperature": 0.4,
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "feed_comment_decision",
+                "strict": True,
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "isProhibit": {
+                            "type": "boolean",
+                            "description": "Whether the post should be prohibited from commenting."
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Short explanation for the decision."
+                        },
+                        "comment": {
+                            "type": ["string", "null"],
+                            "description": "Positive LinkedIn comment, or null when commenting is prohibited."
+                        }
+                    },
+                    "required": ["isProhibit", "reason", "comment"],
+                    "additionalProperties": False
+                }
+            }
+        }
+    }
+
+    try:
+        response = httpx.post(url, headers=headers, json=payload, timeout=30)
+        response.raise_for_status()
+
+        data = response.json()
+        if "choices" not in data or len(data["choices"]) == 0:
+            return None
+
+        content = data["choices"][0]["message"]["content"].strip()
+        decision = json.loads(content)
+
+        comment = decision.get("comment")
+        if isinstance(comment, str):
+            comment = _clean_llm_output(comment)
+            if len(comment) > MAX_COMMENT_LENGTH:
+                refined = _refine_text_length(
+                    comment,
+                    MAX_COMMENT_LENGTH,
+                    api_key,
+                    "comment",
+                )
+                if refined:
+                    comment = refined
+                else:
+                    truncated = comment[:MAX_COMMENT_LENGTH]
+                    if " " in truncated:
+                        truncated = truncated[:truncated.rfind(" ")]
+                    comment = truncated.rstrip()
+            decision["comment"] = comment
+
+        return decision
+
+    except httpx.HTTPStatusError as e:
+        if e.response.status_code == 401:
+            raise ValueError("OpenRouter rejected the feed comment request with 401 Unauthorized") from e
+        logger.error(f"Failed to generate feed comment: {e}")
+    except Exception as e:
+        logger.error(f"Failed to generate feed comment: {e}")
 
     return None
 

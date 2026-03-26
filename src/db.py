@@ -36,6 +36,7 @@ Base = declarative_base()
 class TaskType(str, enum.Enum):
     SEND_INVITE = "send_invite"
     CREATE_POST = "create_post"
+    COMMENT_FEED_POST = "comment_feed_post"
 
 
 class TaskStatus(str, enum.Enum):

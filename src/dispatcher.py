@@ -5,6 +5,7 @@ import random
 from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
 from tasks.invite import InviteTask
+from tasks.comment import FeedCommentTask
 from tasks.post import PostTask
 from exceptions import SessionExpiredException, TaskSkippedException
 
@@ -17,10 +18,12 @@ class TaskDispatcher:
         self.handlers = {
             TaskType.SEND_INVITE: InviteTask(page),
             TaskType.CREATE_POST: PostTask(page),
+            TaskType.COMMENT_FEED_POST: FeedCommentTask(page),
         }
         self.rate_limits = {
             TaskType.SEND_INVITE: 15,
             TaskType.CREATE_POST: 50,
+            TaskType.COMMENT_FEED_POST: 12,
         }
         self.next_execution_at: dict[TaskType, datetime] = {}
         self._previously_blocked: set[TaskType] = set()

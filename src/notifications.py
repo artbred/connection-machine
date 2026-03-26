@@ -3,16 +3,16 @@ import logging
 import httpx
 from dotenv import load_dotenv
 
+load_dotenv()
+
 NOTIFICATIONS_URL = os.getenv("TELEGRAM_NOTIFICATIONS_URL")
 CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 API_KEY = os.getenv("TELEGRAM_API_KEY")
 
-load_dotenv()
-
 logger = logging.getLogger(__name__)
 
 def send_notification(message: str):
-    if len(NOTIFICATIONS_URL) == 0 or len(CHAT_ID) == 0 or len(API_KEY) == 0:
+    if not NOTIFICATIONS_URL or not CHAT_ID or not API_KEY:
         return
 
     url = f"{NOTIFICATIONS_URL}"

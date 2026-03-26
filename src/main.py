@@ -11,9 +11,12 @@ import urllib
 from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
+load_dotenv()
+
 from dispatcher import TaskDispatcher
 from exceptions import SessionExpiredException
 from tasks.invite import InviteTask
+from tasks.comment import FeedCommentTask
 
 # Global shutdown flag
 shutdown_event = threading.Event()
@@ -22,8 +25,6 @@ shutdown_event = threading.Event()
 INTERNAL_DEBUG_PORT = 9224
 SOCKS_PROXY = os.getenv("SOCKS_PROXY")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-
-load_dotenv()
 
 
 logging.basicConfig(
@@ -145,17 +146,54 @@ def signal_handler(signum, frame):
 
 def parse_args():
     parser = argparse.ArgumentParser(description="LinkedIn task automation")
-    parser.add_argument(
+    debug_group = parser.add_mutually_exclusive_group()
+    debug_group.add_argument(
         "--debug-invite",
         metavar="URL",
         help="Debug mode: send invite to a specific profile URL and exit",
+    )
+    debug_group.add_argument(
+        "--debug-feed-comment",
+        action="store_true",
+        help="Debug mode: generate one feed comment and exit",
     )
     parser.add_argument(
         "--no-message",
         action="store_true",
         help="Skip generating personal message (use with --debug-invite)",
     )
+    parser.add_argument(
+        "--submit-comment",
+        action="store_true",
+        help="Actually submit the generated comment when used with --debug-feed-comment",
+    )
     return parser.parse_args()
+
+
+def launch_browser_context(playwright, user_data_dir: str, launch_args: list[str]):
+    context_kwargs = {
+        "headless": HEADLESS,
+        "args": launch_args,
+        "viewport": {"height": 1080, "width": 1920},
+    }
+
+    try:
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir,
+            **context_kwargs,
+        )
+    except Exception as exc:
+        if "Executable doesn't exist" not in str(exc):
+            raise
+
+        logger.warning(
+            "Bundled Chromium is unavailable. Falling back to the local Google Chrome channel."
+        )
+        return playwright.chromium.launch_persistent_context(
+            user_data_dir,
+            channel="chrome",
+            **context_kwargs,
+        )
 
 
 def main():
@@ -180,12 +218,7 @@ def main():
         logger.info(f"Using user data dir: {user_data_dir}")
 
         with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir,
-                headless=HEADLESS,
-                args=launch_args,
-                viewport={"height": 1080, "width": 1920},
-            )
+            context = launch_browser_context(p, user_data_dir, launch_args)
 
             page = context.new_page()
             check_ip(page)
@@ -221,6 +254,16 @@ def main():
                     }
                 )
                 logger.info("Debug invite completed.")
+                return
+
+            if args.debug_feed_comment:
+                logger.info(
+                    "Debug mode: generating one feed comment (%s)",
+                    "submit" if args.submit_comment else "dry run",
+                )
+                comment_task = FeedCommentTask(page)
+                comment_task.run({"dry_run": not args.submit_comment})
+                logger.info("Debug feed comment completed.")
                 return
 
             dispatcher = TaskDispatcher(page)
