@@ -1,6 +1,7 @@
 import base64
 import logging
 from typing import Optional, Tuple
+from urllib.parse import urlparse
 
 from playwright.sync_api import Locator
 
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 MAX_CONNECT_ITERATIONS = 5
 ADD_NOTE_SELECTOR = "button[aria-label='Add a note']"
+SEND_INVITATION_SELECTOR = "button[aria-label='Send invitation']"
 
 PROFILE_CONTAINER_SELECTORS = [
     "div.pvs-profile-actions",
@@ -112,6 +114,53 @@ class InviteTask(BaseTask):
             
         return None
 
+    def _check_invitation_success(self) -> bool:
+        try:
+            toast = self.page.locator("div.artdeco-toast-item").first
+            toast.wait_for(state="visible", timeout=3000)
+            text = toast.inner_text().lower()
+            logger.debug(f"Success toast content: {text}")
+            return (
+                "invitation sent" in text
+                or "invite sent" in text
+                or "invitation pending" in text
+            )
+        except Exception:
+            return False
+
+    def _is_send_modal_open(self) -> bool:
+        selectors = [
+            "#custom-message",
+            SEND_INVITATION_SELECTOR,
+            ADD_NOTE_SELECTOR,
+        ]
+        for selector in selectors:
+            try:
+                if self.page.locator(selector).first.is_visible(timeout=500):
+                    return True
+            except Exception:
+                continue
+        return False
+
+    def _normalize_profile_url(self, url: str) -> str:
+        parsed = urlparse(url)
+        path = parsed.path.rstrip("/")
+        return f"{parsed.scheme}://{parsed.netloc}{path}/"
+
+    def _confirm_invitation_sent(self, url: str) -> ConnectionState:
+        for _ in range(5):
+            state = detect_connection_state(self.page)
+            if state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+                return state
+            self.human.random_sleep(0.8, 1.4)
+
+        normalized_url = self._normalize_profile_url(url)
+        self.page.goto(normalized_url, timeout=60000, wait_until="domcontentloaded")
+        self.page.wait_for_selector("main", timeout=15000)
+        self.human.random_sleep(1.0, 2.0)
+
+        return detect_connection_state(self.page)
+
     def _complete_connection(self, try_personal_message: bool, url: str) -> dict:
         self.human.click(ADD_NOTE_SELECTOR)
 
@@ -129,7 +178,12 @@ class InviteTask(BaseTask):
         if connection_message:
             self.human.type("#custom-message", connection_message)
 
-        send_btn = self.page.locator("button[aria-label='Send invitation']")
+        send_btn = self.page.locator(SEND_INVITATION_SELECTOR).first
+        if not send_btn.is_visible(timeout=1000):
+            raise TaskSkippedException("invite_not_confirmed")
+        if send_btn.is_disabled(timeout=1000):
+            raise TaskSkippedException("invite_not_confirmed")
+
         self.human.click(send_btn)
 
         self.human.random_sleep(2.0, 4.0)
@@ -145,30 +199,40 @@ class InviteTask(BaseTask):
                 pass
             raise TaskSkippedException(error)
         
-        modal_still_open = False
-        try:
-            modal_still_open = self.page.locator("#custom-message").is_visible(timeout=500)
-        except Exception:
-            pass
-        
-        if modal_still_open:
-            logger.warning("Modal still open after send - invitation may have failed")
+        success_toast_detected = self._check_invitation_success()
+        if self._is_send_modal_open():
+            logger.warning("Invite modal still open after send click; treating invite as unconfirmed")
             page_text = self.page.locator("body").inner_text().lower()
             if "invitation not sent" in page_text or "withdrawing" in page_text:
                 raise TaskSkippedException("withdrawal_cooldown")
             if "limit" in page_text:
                 raise TaskSkippedException("weekly_limit_reached")
-        
-        logger.info("Connection request sent successfully")
+            raise TaskSkippedException("invite_not_confirmed")
+
+        final_state = self._confirm_invitation_sent(url)
+        if final_state not in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+            logger.warning(
+                "Invite not confirmed after send. success_toast=%s final_state=%s",
+                success_toast_detected,
+                final_state,
+            )
+            raise TaskSkippedException("invite_not_confirmed")
+
+        logger.info("Connection request confirmed with state: %s", final_state.value)
 
         message_preview = (
             f'"{connection_message[:50]}..."'
             if connection_message and len(connection_message) > 50
             else (f'"{connection_message}"' if connection_message else "None")
         )
-        send_notification(f"Send Invite to {url}\nMessage: {message_preview}")
+        send_notification(
+            f"Invite Confirmed to {url}\nState: {final_state.value}\nMessage: {message_preview}"
+        )
 
-        return {"status": "sent", "message": connection_message}
+        return {
+            "status": final_state.value,
+            "message": connection_message,
+        }
 
     def send_connection_request(self, url: str, try_personal_message: bool = True) -> dict:
         logger.info(f"Sending connection request to {url}...")
@@ -189,7 +253,7 @@ class InviteTask(BaseTask):
                 raise TaskSkippedException("already_connected")
 
             if try_heuristic_connect(self.page, self.human):
-                logger.info("Connected via heuristics (no LLM needed)")
+                logger.info("Clicked Connect via heuristics (no LLM needed)")
                 self.human.random_sleep(1.0, 2.0)
                 
                 error = self._check_invitation_error()
@@ -198,6 +262,7 @@ class InviteTask(BaseTask):
                     raise TaskSkippedException(error)
                 
                 if self._wait_for_add_note():
+                    logger.info("Invite modal opened via heuristics")
                     return self._complete_connection(try_personal_message, url)
 
             cached_selector = get_cached_selector(self.page, "profile_card", "Connect")
@@ -216,6 +281,7 @@ class InviteTask(BaseTask):
                         raise TaskSkippedException(error)
                     
                     if self._wait_for_add_note():
+                        logger.info("Invite modal opened via cached selector")
                         return self._complete_connection(try_personal_message, url)
                 except Exception:
                     logger.debug("Cached selector failed")
@@ -305,6 +371,7 @@ class InviteTask(BaseTask):
                     continue
 
                 if self._wait_for_add_note():
+                    logger.info("Invite modal opened via LLM-selected action")
                     return self._complete_connection(try_personal_message, url)
 
             raise ValueError(f"Could not reach 'Add a note' after {MAX_CONNECT_ITERATIONS} iterations")
