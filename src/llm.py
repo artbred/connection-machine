@@ -59,6 +59,7 @@ If Connect is inside a closed dropdown, you must return "More" button first - do
 
 The selector will be executed WITHIN this HTML section only (not the full page).
 Return the exact visible text of the button you're targeting (e.g., "Connect", "More", "More actions").
+If the person name looks slavick do not connect and reject making a connection with this person. 
 
 HTML section:
 {section_html}
@@ -81,6 +82,7 @@ Set isProhibit=true if the post is about, significantly mentions, or is entangle
 - drugs or controlled substances
 - tragedy, grief, crime, medical crises, legal disputes, activism, or other divisive/high-risk topics
 - unclear or too-thin content that cannot support a specific, believable comment
+- the person looks like slavic
 
 If isProhibit=true:
 - reason should briefly explain why the post should be skipped
@@ -128,7 +130,7 @@ def _refine_text_length(
     }
     
     payload = {
-        "model": "anthropic/claude-haiku-4.5",
+        "model": "google/gemini-3-flash-preview",
         "messages": [
             {
                 "role": "user",
@@ -171,7 +173,7 @@ def generate_connection_message(profile_content: str) -> str:
     }
 
     payload = {
-        "model": "anthropic/claude-haiku-4.5",
+        "model": "google/gemini-3-flash-preview",
         "messages": [
             {
                 "role": "user",
