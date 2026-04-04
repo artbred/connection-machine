@@ -30,6 +30,35 @@ PROFILE_CONTAINER_SELECTORS = [
 DROPDOWN_SELECTOR = "div.artdeco-dropdown__content:visible, div[role='menu']:visible"
 
 
+def _normalize_feedback_text(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def classify_invitation_feedback(text: str) -> Optional[str]:
+    normalized = _normalize_feedback_text(text)
+    if not normalized:
+        return None
+
+    weekly_limit_markers = (
+        "weekly invitation limit",
+        "reached the weekly invitation limit",
+        "reached your weekly invitation limit",
+    )
+    if any(marker in normalized for marker in weekly_limit_markers):
+        return "weekly_limit_reached"
+
+    if "invitation limit" in normalized and ("reached" in normalized or "weekly" in normalized):
+        return "weekly_limit_reached"
+
+    if "withdrawing" in normalized or "withdraw" in normalized:
+        return "withdrawal_cooldown"
+
+    if "error" in normalized or "failed" in normalized:
+        return "unknown_error"
+
+    return None
+
+
 class InviteTask(BaseTask):
     def run(self, payload: dict):
         url = payload.get("url")
@@ -90,28 +119,24 @@ class InviteTask(BaseTask):
             toast.wait_for(state="visible", timeout=3000)
             text = toast.inner_text().lower()
             logger.debug(f"Toast content: {text}")
-            
-            if "invitation not sent" in text or "withdrawing" in text:
-                return "withdrawal_cooldown"
-            if "weekly invitation limit" in text or "limit" in text:
-                return "weekly_limit_reached"
-            if "error" in text or "failed" in text:
-                return "unknown_error"
+
+            reason = classify_invitation_feedback(text)
+            if reason:
+                return reason
         except Exception:
             pass
-        
+
         try:
             alert = self.page.locator("div[role='alert']:visible").first
             if alert.is_visible(timeout=500):
                 text = alert.inner_text().lower()
                 logger.debug(f"Alert content: {text}")
-                if "invitation not sent" in text or "withdrawing" in text:
-                    return "withdrawal_cooldown"
-                if "limit" in text:
-                    return "weekly_limit_reached"
+                reason = classify_invitation_feedback(text)
+                if reason:
+                    return reason
         except Exception:
             pass
-            
+
         return None
 
     def _check_invitation_success(self) -> bool:
@@ -184,7 +209,12 @@ class InviteTask(BaseTask):
         if send_btn.is_disabled(timeout=1000):
             raise TaskSkippedException("invite_not_confirmed")
 
-        self.human.click(send_btn)
+        # Use a precise click here. Missing the modal action button looks like a silent invite failure.
+        try:
+            send_btn.click(delay=100, timeout=5000)
+        except Exception as exc:
+            logger.warning("Direct send click failed, retrying with human click: %s", exc)
+            self.human.click(send_btn)
 
         self.human.random_sleep(2.0, 4.0)
         
@@ -203,10 +233,9 @@ class InviteTask(BaseTask):
         if self._is_send_modal_open():
             logger.warning("Invite modal still open after send click; treating invite as unconfirmed")
             page_text = self.page.locator("body").inner_text().lower()
-            if "invitation not sent" in page_text or "withdrawing" in page_text:
-                raise TaskSkippedException("withdrawal_cooldown")
-            if "limit" in page_text:
-                raise TaskSkippedException("weekly_limit_reached")
+            reason = classify_invitation_feedback(page_text)
+            if reason:
+                raise TaskSkippedException(reason)
             raise TaskSkippedException("invite_not_confirmed")
 
         final_state = self._confirm_invitation_sent(url)

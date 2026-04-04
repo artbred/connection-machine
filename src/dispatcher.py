@@ -9,15 +9,33 @@ from tasks.invite import InviteTask
 from tasks.comment import FeedCommentTask
 from tasks.post import PostTask
 from exceptions import SessionExpiredException, TaskSkippedException
+from notifications import send_notification
 
 logger = logging.getLogger(__name__)
 
 SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
-    (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(hours=12),
+    (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(hours=24),
     (TaskType.SEND_INVITE, "withdrawal_cooldown"): timedelta(hours=6),
     (TaskType.COMMENT_FEED_POST, "no_safe_commentable_posts"): timedelta(minutes=30),
 }
 AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
+
+
+def build_cooldown_notification(
+    task_type: TaskType,
+    reason: str,
+    next_allowed: datetime,
+) -> str | None:
+    if task_type == TaskType.SEND_INVITE and reason == "weekly_limit_reached":
+        until_text = next_allowed.strftime("%Y-%m-%d %H:%M UTC")
+        return (
+            "<b>Invite limit reached</b>\n"
+            "Reason: LinkedIn weekly invitation limit\n"
+            "Cooldown: 24 hours\n"
+            f"Resume after: {until_text}"
+        )
+
+    return None
 
 
 class TaskDispatcher:
@@ -212,6 +230,10 @@ class TaskDispatcher:
         logger.warning(
             f"{task_type} cooling down for {cooldown} due to skip reason: {reason}"
         )
+
+        notification = build_cooldown_notification(task_type, reason, next_allowed)
+        if notification:
+            send_notification(notification)
 
     def can_run_autonomous_comment(self) -> bool:
         """Return whether an autonomous feed comment action is currently allowed."""
