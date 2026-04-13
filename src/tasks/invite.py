@@ -39,15 +39,46 @@ def classify_invitation_feedback(text: str) -> Optional[str]:
     if not normalized:
         return None
 
+    if normalized in {"weekly_limit_reached", "withdrawal_cooldown"}:
+        return normalized
+
     weekly_limit_markers = (
         "weekly invitation limit",
         "reached the weekly invitation limit",
         "reached your weekly invitation limit",
+        "weekly limit for connection invitation",
+        "weekly limit for connection invitations",
+        "weekly connection limit",
     )
     if any(marker in normalized for marker in weekly_limit_markers):
         return "weekly_limit_reached"
 
-    if "invitation limit" in normalized and ("reached" in normalized or "weekly" in normalized):
+    if (
+        "weekly limit" in normalized
+        and any(
+            marker in normalized
+            for marker in (
+                "invitation",
+                "connection invitation",
+                "connection invitations",
+                "connection request",
+                "connection requests",
+                "connect",
+            )
+        )
+    ):
+        return "weekly_limit_reached"
+
+    if "try again next week" in normalized and any(
+        marker in normalized
+        for marker in ("invitation", "connection", "connect")
+    ):
+        return "weekly_limit_reached"
+
+    if (
+        "invitation limit" in normalized
+        and ("reached" in normalized or "weekly" in normalized)
+    ):
         return "weekly_limit_reached"
 
     if "withdrawing" in normalized or "withdraw" in normalized:
@@ -57,6 +88,124 @@ def classify_invitation_feedback(text: str) -> Optional[str]:
         return "unknown_error"
 
     return None
+
+
+def normalize_invite_skip_reason(reason: str) -> str:
+    normalized = _normalize_feedback_text(reason)
+    if not normalized:
+        return reason
+
+    if normalized in {
+        "already_pending",
+        "already_connected",
+        "connect_unavailable",
+        "invite_not_confirmed",
+        "llm_invalid_response",
+        "add_note_unreachable",
+        "send_button_timeout",
+        "navigation_timeout",
+        "navigation_error",
+        "screenshot_timeout",
+        "selector_timeout",
+        "profile_not_found",
+        "policy_skip",
+        "memorialized_account",
+        "security_checkpoint",
+        "profile_unavailable",
+        "weekly_limit_reached",
+        "withdrawal_cooldown",
+    }:
+        return normalized
+
+    classified = classify_invitation_feedback(reason)
+    if classified in {"weekly_limit_reached", "withdrawal_cooldown"}:
+        return classified
+
+    if (
+        "already connected" in normalized
+        or "already a 1st-degree connection" in normalized
+        or "1st-degree connection" in normalized
+        or "1st degree connection" in normalized
+        or ("primary action is message" in normalized and "connect" in normalized)
+    ):
+        return "already_connected"
+
+    if (
+        "already pending" in normalized
+        or "connection pending" in normalized
+        or "invitation pending" in normalized
+        or "invitation sent" in normalized
+        or ("pending" in normalized and "button" in normalized)
+    ):
+        return "already_pending"
+
+    if (
+        "does not contain a connect option" in normalized
+        or "does not contain a 'connect' option" in normalized
+        or "does not contain a \"connect\" option" in normalized
+        or "connect option is not present" in normalized
+        or ("option is not present" in normalized and "connect" in normalized)
+        or "connect is not possible" in normalized
+        or "no way to send connection request" in normalized
+    ):
+        return "connect_unavailable"
+
+    if (
+        "404" in normalized
+        or "this page doesn’t exist" in normalized
+        or "this page doesn't exist" in normalized
+        or "profile does not exist" in normalized
+        or "page does not exist" in normalized
+        or "page indicates it does not exist" in normalized
+        or "page indicates that it does not exist" in normalized
+    ):
+        return "profile_not_found"
+
+    if "slavic" in normalized:
+        return "policy_skip"
+
+    if "memorialized" in normalized or "in remembrance" in normalized:
+        return "memorialized_account"
+
+    if (
+        "cloudflare" in normalized
+        or "captcha" in normalized
+        or "security verification" in normalized
+    ):
+        return "security_checkpoint"
+
+    if (
+        "something went wrong" in normalized
+        or "skeleton-loading" in normalized
+        or "skeleton loading" in normalized
+    ):
+        return "profile_unavailable"
+
+    if normalized == "llm returned invalid response":
+        return "llm_invalid_response"
+
+    if "could not reach" in normalized and "add a note" in normalized:
+        return "add_note_unreachable"
+
+    if (
+        normalized.startswith("locator.click: timeout")
+        and "send invitation" in normalized
+    ):
+        return "send_button_timeout"
+
+    if normalized.startswith("page.goto: timeout"):
+        return "navigation_timeout"
+
+    if normalized.startswith("page.goto: net::"):
+        return "navigation_error"
+
+    if normalized.startswith("page.screenshot: timeout"):
+        return "screenshot_timeout"
+
+    if normalized.startswith("page.wait_for_selector: timeout"):
+        return "selector_timeout"
+
+    return reason
 
 
 class InviteTask(BaseTask):
@@ -137,6 +286,14 @@ class InviteTask(BaseTask):
         except Exception:
             pass
 
+        try:
+            page_text = self.page.locator("body").inner_text(timeout=1500).lower()
+            reason = classify_invitation_feedback(page_text)
+            if reason:
+                return reason
+        except Exception:
+            pass
+
         return None
 
     def _check_invitation_success(self) -> bool:
@@ -185,6 +342,28 @@ class InviteTask(BaseTask):
         self.human.random_sleep(1.0, 2.0)
 
         return detect_connection_state(self.page)
+
+    def _after_connect_click(
+        self,
+        try_personal_message: bool,
+        url: str,
+        source: str,
+    ) -> Optional[dict]:
+        error = self._check_invitation_error()
+        if error:
+            logger.warning(f"Invitation blocked after {source} click: {error}")
+            raise TaskSkippedException(error)
+
+        if self._wait_for_add_note():
+            logger.info("Invite modal opened via %s", source)
+            return self._complete_connection(try_personal_message, url)
+
+        error = self._check_invitation_error()
+        if error:
+            logger.warning(f"Invitation blocked after {source} click: {error}")
+            raise TaskSkippedException(error)
+
+        return None
 
     def _complete_connection(self, try_personal_message: bool, url: str) -> dict:
         self.human.click(ADD_NOTE_SELECTOR)
@@ -284,15 +463,14 @@ class InviteTask(BaseTask):
             if try_heuristic_connect(self.page, self.human):
                 logger.info("Clicked Connect via heuristics (no LLM needed)")
                 self.human.random_sleep(1.0, 2.0)
-                
-                error = self._check_invitation_error()
-                if error:
-                    logger.warning(f"Invitation blocked after heuristic click: {error}")
-                    raise TaskSkippedException(error)
-                
-                if self._wait_for_add_note():
-                    logger.info("Invite modal opened via heuristics")
-                    return self._complete_connection(try_personal_message, url)
+
+                result = self._after_connect_click(
+                    try_personal_message,
+                    url,
+                    "heuristic",
+                )
+                if result:
+                    return result
 
             cached_selector = get_cached_selector(self.page, "profile_card", "Connect")
             if cached_selector:
@@ -303,15 +481,14 @@ class InviteTask(BaseTask):
                     self.human.random_sleep(0.3, 0.5)
                     locator.click(delay=100)
                     self.human.random_sleep(1.0, 2.0)
-                    
-                    error = self._check_invitation_error()
-                    if error:
-                        logger.warning(f"Invitation blocked after cached selector click: {error}")
-                        raise TaskSkippedException(error)
-                    
-                    if self._wait_for_add_note():
-                        logger.info("Invite modal opened via cached selector")
-                        return self._complete_connection(try_personal_message, url)
+
+                    result = self._after_connect_click(
+                        try_personal_message,
+                        url,
+                        "cached selector",
+                    )
+                    if result:
+                        return result
                 except Exception:
                     logger.debug("Cached selector failed")
 
@@ -385,23 +562,22 @@ class InviteTask(BaseTask):
                     self.human.random_sleep(0.3, 0.5)
                     target_locator.click(delay=100)
                     self.human.random_sleep(1.0, 2.0)
-                    
-                    error = self._check_invitation_error()
-                    if error:
-                        logger.warning(f"Invitation blocked after clicking Connect: {error}")
-                        raise TaskSkippedException(error)
-                    
+
                     save_selector_to_cache("profile_card", button_text, selector)
                     previous_feedback = None
-                        
+
                 except Exception as e:
                     previous_feedback = f"Selector '{selector}' failed to click: {str(e)[:100]}"
                     logger.info(f"Suggested selector not clickable: {e}")
                     continue
 
-                if self._wait_for_add_note():
-                    logger.info("Invite modal opened via LLM-selected action")
-                    return self._complete_connection(try_personal_message, url)
+                result = self._after_connect_click(
+                    try_personal_message,
+                    url,
+                    "LLM-selected action",
+                )
+                if result:
+                    return result
 
             raise ValueError(f"Could not reach 'Add a note' after {MAX_CONNECT_ITERATIONS} iterations")
 

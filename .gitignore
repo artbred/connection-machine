@@ -19,3 +19,4 @@ data
 *.csv
 .sisyphus
 .ruff_cache
+.omx/

@@ -5,7 +5,7 @@ import random
 
 from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
-from tasks.invite import InviteTask
+from tasks.invite import InviteTask, normalize_invite_skip_reason
 from tasks.comment import FeedCommentTask
 from tasks.post import PostTask
 from exceptions import SessionExpiredException, TaskSkippedException
@@ -14,11 +14,21 @@ from notifications import send_notification
 logger = logging.getLogger(__name__)
 
 SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
-    (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(hours=24),
+    (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(days=7),
     (TaskType.SEND_INVITE, "withdrawal_cooldown"): timedelta(hours=6),
     (TaskType.COMMENT_FEED_POST, "no_safe_commentable_posts"): timedelta(minutes=30),
 }
 AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
+
+
+def normalize_skip_reason(task_type: TaskType, reason: str) -> str:
+    if task_type == TaskType.SEND_INVITE:
+        return normalize_invite_skip_reason(reason)
+    return reason
+
+
+def remaining_minutes(delta: timedelta) -> int:
+    return max(0, int(delta.total_seconds() // 60))
 
 
 def build_cooldown_notification(
@@ -26,12 +36,14 @@ def build_cooldown_notification(
     reason: str,
     next_allowed: datetime,
 ) -> str | None:
+    reason = normalize_skip_reason(task_type, reason)
+
     if task_type == TaskType.SEND_INVITE and reason == "weekly_limit_reached":
         until_text = next_allowed.strftime("%Y-%m-%d %H:%M UTC")
         return (
             "<b>Invite limit reached</b>\n"
             "Reason: LinkedIn weekly invitation limit\n"
-            "Cooldown: 24 hours\n"
+            "Cooldown: 7 days\n"
             f"Resume after: {until_text}"
         )
 
@@ -79,7 +91,7 @@ class TaskDispatcher:
                     next_allowed = last_task.executed_at + interval
                     if next_allowed > datetime.utcnow():
                         self.next_execution_at[task_type] = next_allowed
-                        wait_min = (next_allowed - datetime.utcnow()).seconds // 60
+                        wait_min = remaining_minutes(next_allowed - datetime.utcnow())
                         logger.info(
                             f"Restored spacing for {task_type}: ~{wait_min} min remaining"
                         )
@@ -89,7 +101,7 @@ class TaskDispatcher:
                     restored_until = self.next_execution_at.get(task_type)
                     if not restored_until or cooldown_until > restored_until:
                         self.next_execution_at[task_type] = cooldown_until
-                        wait_min = (cooldown_until - datetime.utcnow()).seconds // 60
+                        wait_min = remaining_minutes(cooldown_until - datetime.utcnow())
                         logger.info(
                             f"Restored cooldown for {task_type}: ~{wait_min} min remaining"
                         )
@@ -103,7 +115,7 @@ class TaskDispatcher:
                 next_allowed = last_action_at + interval
                 if next_allowed > datetime.utcnow():
                     self.next_execution_at[task_type] = next_allowed
-                    wait_min = (next_allowed - datetime.utcnow()).seconds // 60
+                    wait_min = remaining_minutes(next_allowed - datetime.utcnow())
                     logger.info(
                         f"Restored spacing for {task_type}: ~{wait_min} min remaining"
                     )
@@ -115,25 +127,38 @@ class TaskDispatcher:
     ) -> datetime | None:
         latest_cooldown_end: datetime | None = None
 
-        for (cooldown_task_type, reason), cooldown in SKIP_COOLDOWNS.items():
-            if cooldown_task_type != task_type:
-                continue
+        cooldowns_for_type = {
+            reason: cooldown
+            for (cooldown_task_type, reason), cooldown in SKIP_COOLDOWNS.items()
+            if cooldown_task_type == task_type
+        }
+        if not cooldowns_for_type:
+            return None
 
-            last_skipped = (
-                db.query(Task)
-                .filter(
-                    Task.type == task_type,
-                    Task.status == TaskStatus.FAILED,
-                    Task.error == reason,
-                    Task.executed_at.isnot(None),
-                )
-                .order_by(Task.executed_at.desc())
-                .first()
+        max_cooldown = max(cooldowns_for_type.values())
+        lookback_start = datetime.utcnow() - max_cooldown
+        recent_skips = (
+            db.query(Task)
+            .filter(
+                Task.type == task_type,
+                Task.status == TaskStatus.FAILED,
+                Task.executed_at.isnot(None),
+                Task.executed_at >= lookback_start,
             )
-            if not last_skipped or not last_skipped.executed_at:
+            .order_by(Task.executed_at.desc())
+            .all()
+        )
+
+        for skipped_task in recent_skips:
+            if not skipped_task.executed_at or not skipped_task.error:
                 continue
 
-            cooldown_end = last_skipped.executed_at + cooldown
+            normalized_reason = normalize_skip_reason(task_type, skipped_task.error)
+            cooldown = cooldowns_for_type.get(normalized_reason)
+            if not cooldown:
+                continue
+
+            cooldown_end = skipped_task.executed_at + cooldown
             if cooldown_end <= datetime.utcnow():
                 continue
 
@@ -213,10 +238,13 @@ class TaskDispatcher:
         """Set the next allowed execution time for a task type after completion."""
         interval = self.get_spacing_interval(task_type)
         self.next_execution_at[task_type] = datetime.utcnow() + interval
-        logger.info(f"Next {task_type} scheduled in ~{interval.seconds // 60} minutes")
+        logger.info(
+            f"Next {task_type} scheduled in ~{remaining_minutes(interval)} minutes"
+        )
 
     def schedule_skip_cooldown(self, task_type: TaskType, reason: str):
         """Apply a temporary task-type cooldown for skip reasons that indicate platform limits."""
+        reason = normalize_skip_reason(task_type, reason)
         cooldown = SKIP_COOLDOWNS.get((task_type, reason))
         if not cooldown:
             return
@@ -318,7 +346,7 @@ class TaskDispatcher:
         for task_type in newly_blocked:
             next_allowed = self.next_execution_at.get(task_type)
             if next_allowed:
-                wait_min = (next_allowed - datetime.utcnow()).seconds // 60
+                wait_min = remaining_minutes(next_allowed - datetime.utcnow())
                 logger.info(f"{task_type} blocked (next in ~{wait_min} min)")
             else:
                 logger.info(f"{task_type} blocked (rate limit reached)")
@@ -401,11 +429,20 @@ class TaskDispatcher:
                 self.schedule_next_execution(task_to_run.type)
 
             except TaskSkippedException as e:
-                logger.info(f"Task {task_to_run.id} skipped: {e.reason}")
+                normalized_reason = normalize_skip_reason(task_to_run.type, e.reason)
+                if normalized_reason != e.reason:
+                    logger.info(
+                        "Task %s skipped: %s (normalized to %s)",
+                        task_to_run.id,
+                        e.reason,
+                        normalized_reason,
+                    )
+                else:
+                    logger.info(f"Task {task_to_run.id} skipped: {e.reason}")
                 task_to_run.status = TaskStatus.FAILED
-                task_to_run.error = e.reason
+                task_to_run.error = normalized_reason
                 task_to_run.executed_at = datetime.utcnow()
-                self.schedule_skip_cooldown(task_to_run.type, e.reason)
+                self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
                 # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
 
             except SessionExpiredException as e:
@@ -445,7 +482,7 @@ class TaskDispatcher:
 
                 logger.error(f"Task failed: {e}")
                 task_to_run.status = TaskStatus.FAILED
-                task_to_run.error = str(e)
+                task_to_run.error = normalize_skip_reason(task_to_run.type, str(e))
                 task_to_run.executed_at = datetime.utcnow()
 
             finally:

@@ -86,7 +86,7 @@ Spacing between actions is derived from the daily cap, then randomized in the `0
 
 Additional cooldowns are applied for known LinkedIn skip reasons:
 
-- invite weekly limit: 24 hours
+- invite weekly limit: 7 days
 - invite withdrawal cooldown: 6 hours
 - no safe commentable feed posts: 30 minutes
 - autonomous comment hard failure: 30 minutes
