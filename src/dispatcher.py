@@ -2,14 +2,17 @@ import json
 import logging
 import os
 import random
+import time
 
 from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
+from metrics import NoopMetrics
 from tasks.invite import InviteTask, normalize_invite_skip_reason
 from tasks.comment import FeedCommentTask
 from tasks.post import PostTask
 from exceptions import SessionExpiredException, TaskSkippedException
 from notifications import send_notification
+from sqlalchemy import func
 
 logger = logging.getLogger(__name__)
 
@@ -51,8 +54,9 @@ def build_cooldown_notification(
 
 
 class TaskDispatcher:
-    def __init__(self, page):
+    def __init__(self, page, metrics=None):
         self.page = page
+        self.metrics = metrics or NoopMetrics()
         self.feed_comment_handler = FeedCommentTask(page)
         self.handlers = {
             TaskType.SEND_INVITE: InviteTask(page),
@@ -71,6 +75,32 @@ class TaskDispatcher:
         self._logged_no_pending: bool = False
         self._init_spacing_from_db()
         self._init_autonomous_spacing()
+        self._sync_next_execution_metrics()
+
+    def _sync_next_execution_metrics(self):
+        now = datetime.utcnow().timestamp()
+        timestamps = {
+            task_type.value: dt.timestamp()
+            for task_type, dt in self.next_execution_at.items()
+            if dt.timestamp() > now
+        }
+        self.metrics.set_next_execution_timestamps(timestamps)
+
+    def _sync_db_task_counts(self):
+        try:
+            with SessionLocal() as db:
+                rows = (
+                    db.query(Task.type, Task.status, func.count(Task.id))
+                    .group_by(Task.type, Task.status)
+                    .all()
+                )
+            counts = {
+                (task_type.value, status.value): count
+                for task_type, status, count in rows
+            }
+            self.metrics.set_db_task_counts(counts)
+        except Exception as exc:
+            logger.warning("Failed to refresh DB task count metrics: %s", exc)
 
     def _init_spacing_from_db(self):
         """Initialize next execution times from last executed tasks in DB."""
@@ -241,6 +271,7 @@ class TaskDispatcher:
         logger.info(
             f"Next {task_type} scheduled in ~{remaining_minutes(interval)} minutes"
         )
+        self._sync_next_execution_metrics()
 
     def schedule_skip_cooldown(self, task_type: TaskType, reason: str):
         """Apply a temporary task-type cooldown for skip reasons that indicate platform limits."""
@@ -258,6 +289,7 @@ class TaskDispatcher:
         logger.warning(
             f"{task_type} cooling down for {cooldown} due to skip reason: {reason}"
         )
+        self._sync_next_execution_metrics()
 
         notification = build_cooldown_notification(task_type, reason, next_allowed)
         if notification:
@@ -266,11 +298,13 @@ class TaskDispatcher:
     def can_run_autonomous_comment(self) -> bool:
         """Return whether an autonomous feed comment action is currently allowed."""
         if not os.getenv("OPENROUTER_API_KEY"):
+            self.metrics.set_autonomous_comment_allowed(False)
             return False
 
         task_type = TaskType.COMMENT_FEED_POST
         next_allowed = self.next_execution_at.get(task_type)
         if next_allowed and datetime.utcnow() < next_allowed:
+            self.metrics.set_autonomous_comment_allowed(False)
             return False
 
         last_24h = datetime.utcnow() - timedelta(hours=24)
@@ -279,8 +313,11 @@ class TaskDispatcher:
         limit = self.autonomous_rate_limits[task_type]
         if len(recent) >= limit:
             self.next_execution_at[task_type] = min(recent) + timedelta(hours=24)
+            self._sync_next_execution_metrics()
+            self.metrics.set_autonomous_comment_allowed(False)
             return False
 
+        self.metrics.set_autonomous_comment_allowed(True)
         return True
 
     def maybe_run_autonomous_comment(self) -> bool:
@@ -289,17 +326,27 @@ class TaskDispatcher:
             return False
 
         logger.info("Executing autonomous feed comment action")
+        started_at = time.monotonic()
+        outcome = "completed"
         try:
             self.feed_comment_handler.run({})
             self.schedule_next_execution(TaskType.COMMENT_FEED_POST)
         except TaskSkippedException as e:
             logger.info(f"Autonomous feed comment skipped: {e.reason}")
             self.schedule_skip_cooldown(TaskType.COMMENT_FEED_POST, e.reason)
+            outcome = "skipped"
         except Exception as e:
             logger.error(f"Autonomous feed comment failed: {e}")
             self.next_execution_at[TaskType.COMMENT_FEED_POST] = (
                 datetime.utcnow() + AUTONOMOUS_COMMENT_FAILURE_COOLDOWN
             )
+            self._sync_next_execution_metrics()
+            outcome = "failed"
+        self.metrics.observe_task(
+            TaskType.COMMENT_FEED_POST.value,
+            outcome,
+            time.monotonic() - started_at,
+        )
         return True
 
     def get_rate_limited_types(self, pending_types: set[TaskType]) -> list[TaskType]:
@@ -359,6 +406,9 @@ class TaskDispatcher:
 
     def poll(self):
         """Fetch and execute pending tasks."""
+        self.metrics.mark_poll()
+        self._sync_db_task_counts()
+
         # Get distinct pending task types first
         with SessionLocal() as db:
             pending_types = set(
@@ -417,6 +467,8 @@ class TaskDispatcher:
             task_to_run.status = TaskStatus.PROCESSING
             db.commit()
 
+            outcome = "completed"
+            started_at = time.monotonic()
             try:
                 handler = self.handlers.get(task_to_run.type)
                 if not handler:
@@ -444,10 +496,12 @@ class TaskDispatcher:
                 task_to_run.executed_at = datetime.utcnow()
                 self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
                 # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
+                outcome = "skipped"
 
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")
                 task_to_run.status = TaskStatus.PENDING
+                outcome = "session_expired"
                 raise e
 
             except Exception as e:
@@ -478,12 +532,20 @@ class TaskDispatcher:
                     logger.warning(f"Detected session issue during task {task_to_run.id}: {e}")
                     task_to_run.status = TaskStatus.PENDING
                     db.commit()
+                    outcome = "session_expired"
                     raise SessionExpiredException(f"Session issue detected: {e}")
 
                 logger.error(f"Task failed: {e}")
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = normalize_skip_reason(task_to_run.type, str(e))
                 task_to_run.executed_at = datetime.utcnow()
+                outcome = "failed"
 
             finally:
                 db.commit()
+                self.metrics.observe_task(
+                    task_to_run.type.value,
+                    outcome,
+                    time.monotonic() - started_at,
+                )
+                self._sync_db_task_counts()

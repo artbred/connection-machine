@@ -15,6 +15,7 @@ load_dotenv()
 
 from dispatcher import TaskDispatcher
 from exceptions import SessionExpiredException
+from metrics import NoopMetrics, create_metrics
 from tasks.invite import InviteTask
 from tasks.comment import FeedCommentTask
 
@@ -31,6 +32,7 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+metrics = NoopMetrics()
 
 
 def check_linkedin_auth(page):
@@ -197,7 +199,11 @@ def launch_browser_context(playwright, user_data_dir: str, launch_args: list[str
 
 
 def main():
+    global metrics
+
     args = parse_args()
+    metrics = create_metrics()
+    metrics.set_up(True)
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, signal_handler)
@@ -230,12 +236,17 @@ def main():
                 if shutdown_event.is_set():
                     break
 
-                if check_linkedin_auth(page):
+                is_authenticated = check_linkedin_auth(page)
+                metrics.set_linkedin_authenticated(is_authenticated)
+
+                if is_authenticated:
                     is_logged_in = True
+                    metrics.mark_login_success()
                     logger.info("Logged in to LinkedIn successfully.")
                     break
                 else:
                     logger.info("Logging in to LinkedIn...")
+                    metrics.inc_login_attempts()
                     login(page)
                     if shutdown_event.wait(5):
                         break
@@ -266,7 +277,7 @@ def main():
                 logger.info("Debug feed comment completed.")
                 return
 
-            dispatcher = TaskDispatcher(page)
+            dispatcher = TaskDispatcher(page, metrics=metrics)
             logger.info("Task dispatcher initialized.")
             dispatcher.cleanup_zombie_tasks()
             dispatcher.cleanup_db_backed_feed_comment_tasks()
@@ -278,15 +289,21 @@ def main():
                     dispatcher.poll()
                 except SessionExpiredException:
                     logger.warning("Session expired. Re-authenticating...")
+                    metrics.set_linkedin_authenticated(False)
+                    metrics.inc_reauth()
 
                     re_authenticated = False
                     for attempt in range(max_login_attempts):
                         if shutdown_event.is_set():
                             break
 
+                        metrics.inc_login_attempts()
                         login(page)
-                        if check_linkedin_auth(page):
+                        is_authenticated = check_linkedin_auth(page)
+                        metrics.set_linkedin_authenticated(is_authenticated)
+                        if is_authenticated:
                             logger.info("Re-authentication successful.")
+                            metrics.mark_login_success()
                             re_authenticated = True
                             break
                         else:
@@ -311,6 +328,8 @@ def main():
     except Exception as e:
         logger.error(f"An error occurred: {e}")
     finally:
+        metrics.set_up(False)
+        metrics.shutdown()
         logger.info("Shutdown complete.")
         sys.exit(0)
 

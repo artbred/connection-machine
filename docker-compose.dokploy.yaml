@@ -6,11 +6,15 @@ services:
       - .env
     environment:
       CHROME_PORT: ${CHROME_PORT:-9225}
+      METRICS_ENABLED: ${METRICS_ENABLED:-true}
+      METRICS_HOST: ${METRICS_HOST:-0.0.0.0}
+      METRICS_PORT: ${METRICS_PORT:-9102}
     restart: always
     dns:
       - 1.1.1.1
     ports:
       - "127.0.0.1:${CHROME_PORT:-9225}:${CHROME_PORT:-9225}"
+      - "${METRICS_BIND_HOST:-0.0.0.0}:${METRICS_PORT:-9102}:${METRICS_PORT:-9102}"
     logging:
       driver: "json-file"
       options:
