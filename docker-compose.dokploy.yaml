@@ -1,0 +1,25 @@
+services:
+  connection-machine:
+    build:
+      context: .
+    env_file:
+      - .env
+    environment:
+      CHROME_PORT: ${CHROME_PORT:-9225}
+    restart: always
+    dns:
+      - 1.1.1.1
+    ports:
+      - "127.0.0.1:${CHROME_PORT:-9225}:${CHROME_PORT:-9225}"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "500m"
+        max-file: "3"
+    volumes:
+      - connection-machine-data:/app/data
+
+volumes:
+  connection-machine-data:
+    external: true
+    name: connection-machine-data
