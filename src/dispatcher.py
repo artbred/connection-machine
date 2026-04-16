@@ -145,7 +145,33 @@ class TaskDispatcher:
             invite_handler = self.handlers.get(TaskType.SEND_INVITE)
             if not invite_handler or not hasattr(invite_handler, "get_invite_history_entries"):
                 self.metrics.set_invite_history([])
+                self.metrics.set_invite_summary(0, 0)
                 return
+
+            today_start = datetime.utcnow().replace(
+                hour=0,
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            with SessionLocal() as db:
+                invites_sent_total = (
+                    db.query(Task)
+                    .filter(
+                        Task.type == TaskType.SEND_INVITE,
+                        Task.status == TaskStatus.COMPLETED,
+                    )
+                    .count()
+                )
+                invites_sent_today = (
+                    db.query(Task)
+                    .filter(
+                        Task.type == TaskType.SEND_INVITE,
+                        Task.status == TaskStatus.COMPLETED,
+                        Task.executed_at >= today_start,
+                    )
+                    .count()
+                )
 
             recent_entries = [
                 {
@@ -160,6 +186,7 @@ class TaskDispatcher:
                     :INVITE_HISTORY_RECENT_ENTRY_LIMIT
                 ]
             ]
+            self.metrics.set_invite_summary(invites_sent_total, invites_sent_today)
             self.metrics.set_invite_history(recent_entries)
         except Exception as exc:
             logger.warning("Failed to refresh invite history metrics: %s", exc)

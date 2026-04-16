@@ -147,6 +147,18 @@ class CommentHistoryMetricsTests(unittest.TestCase):
             rendered,
         )
 
+    def test_metrics_render_invite_summary_series(self):
+        metrics = ConnectionMachineMetrics(host="127.0.0.1", port=0)
+        metrics.set_invite_summary(
+            invites_sent_total=563,
+            invites_sent_today=4,
+        )
+
+        rendered = metrics.render()
+
+        self.assertIn("connection_machine_invites_sent_total 563", rendered)
+        self.assertIn("connection_machine_invites_sent_today 4", rendered)
+
 
 if __name__ == "__main__":
     unittest.main()

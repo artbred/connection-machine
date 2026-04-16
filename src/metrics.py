@@ -77,6 +77,13 @@ class NoopMetrics:
     ):
         return None
 
+    def set_invite_summary(
+        self,
+        invites_sent_total: int,
+        invites_sent_today: int,
+    ):
+        return None
+
 
 class ConnectionMachineMetrics:
     def __init__(self, host: str, port: int):
@@ -104,6 +111,8 @@ class ConnectionMachineMetrics:
         self._comments_by_day: dict[str, int] = {}
         self._recent_comment_entries: list[dict[str, str | float]] = []
         self._recent_invite_entries: list[dict[str, str | float]] = []
+        self._invites_sent_total = 0
+        self._invites_sent_today = 0
 
     def start(self):
         metrics = self
@@ -222,6 +231,15 @@ class ConnectionMachineMetrics:
                 for entry in recent_entries
             ]
 
+    def set_invite_summary(
+        self,
+        invites_sent_total: int,
+        invites_sent_today: int,
+    ):
+        with self._lock:
+            self._invites_sent_total = max(0, int(invites_sent_total))
+            self._invites_sent_today = max(0, int(invites_sent_today))
+
     def render(self) -> str:
         with self._lock:
             up = self._up
@@ -241,6 +259,8 @@ class ConnectionMachineMetrics:
             comments_by_day = dict(self._comments_by_day)
             recent_comment_entries = list(self._recent_comment_entries)
             recent_invite_entries = list(self._recent_invite_entries)
+            invites_sent_total = self._invites_sent_total
+            invites_sent_today = self._invites_sent_today
 
         lines = [
             "# HELP connection_machine_up Whether the connection-machine process considers itself healthy.",
@@ -399,6 +419,18 @@ class ConnectionMachineMetrics:
 
         lines.extend(
             [
+                "# HELP connection_machine_invites_sent_total Total completed LinkedIn invite requests stored in the database.",
+                "# TYPE connection_machine_invites_sent_total gauge",
+                _format_sample(
+                    "connection_machine_invites_sent_total",
+                    invites_sent_total,
+                ),
+                "# HELP connection_machine_invites_sent_today Completed LinkedIn invite requests executed since today's UTC midnight.",
+                "# TYPE connection_machine_invites_sent_today gauge",
+                _format_sample(
+                    "connection_machine_invites_sent_today",
+                    invites_sent_today,
+                ),
                 "# HELP connection_machine_invite_history_entry_timestamp_seconds Unix timestamp for each recent successful invite retained for dashboard history.",
                 "# TYPE connection_machine_invite_history_entry_timestamp_seconds gauge",
             ]
