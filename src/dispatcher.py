@@ -121,6 +121,8 @@ class TaskDispatcher:
                 if day in comments_by_day:
                     comments_by_day[day] += 1
 
+            comments_sent_today = comments_by_day.get(today.isoformat(), 0)
+
             recent_entries = [
                 {
                     "author": entry["author"],
@@ -134,6 +136,7 @@ class TaskDispatcher:
             ]
             self.metrics.set_comment_history(
                 total_comments=len(history_entries),
+                comments_sent_today=comments_sent_today,
                 comments_by_day=comments_by_day,
                 recent_entries=recent_entries,
             )

@@ -66,6 +66,7 @@ class NoopMetrics:
     def set_comment_history(
         self,
         total_comments: int,
+        comments_sent_today: int,
         comments_by_day: dict[str, int],
         recent_entries: list[dict[str, str | float]],
     ):
@@ -108,6 +109,7 @@ class ConnectionMachineMetrics:
         self._db_task_counts: dict[tuple[str, str], int] = {}
         self._next_execution_timestamps: dict[str, float] = {}
         self._comments_sent_total = 0
+        self._comments_sent_today = 0
         self._comments_by_day: dict[str, int] = {}
         self._recent_comment_entries: list[dict[str, str | float]] = []
         self._recent_invite_entries: list[dict[str, str | float]] = []
@@ -191,11 +193,13 @@ class ConnectionMachineMetrics:
     def set_comment_history(
         self,
         total_comments: int,
+        comments_sent_today: int,
         comments_by_day: dict[str, int],
         recent_entries: list[dict[str, str | float]],
     ):
         with self._lock:
             self._comments_sent_total = max(0, int(total_comments))
+            self._comments_sent_today = max(0, int(comments_sent_today))
             self._comments_by_day = {
                 str(day): max(0, int(count))
                 for day, count in comments_by_day.items()
@@ -256,6 +260,7 @@ class ConnectionMachineMetrics:
             db_task_counts = dict(self._db_task_counts)
             next_execution_timestamps = dict(self._next_execution_timestamps)
             comments_sent_total = self._comments_sent_total
+            comments_sent_today = self._comments_sent_today
             comments_by_day = dict(self._comments_by_day)
             recent_comment_entries = list(self._recent_comment_entries)
             recent_invite_entries = list(self._recent_invite_entries)
@@ -382,6 +387,12 @@ class ConnectionMachineMetrics:
                 _format_sample(
                     "connection_machine_comments_sent_total",
                     comments_sent_total,
+                ),
+                "# HELP connection_machine_comments_sent_today Feed comments retained with timestamps since today's UTC midnight.",
+                "# TYPE connection_machine_comments_sent_today gauge",
+                _format_sample(
+                    "connection_machine_comments_sent_today",
+                    comments_sent_today,
                 ),
                 "# HELP connection_machine_comments_sent_by_day Number of feed comments retained for each UTC day.",
                 "# TYPE connection_machine_comments_sent_by_day gauge",

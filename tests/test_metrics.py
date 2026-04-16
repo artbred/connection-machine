@@ -59,6 +59,7 @@ class CommentHistoryMetricsTests(unittest.TestCase):
         metrics = ConnectionMachineMetrics(host="127.0.0.1", port=0)
         metrics.set_comment_history(
             total_comments=12,
+            comments_sent_today=4,
             comments_by_day={
                 "2026-04-15": 3,
                 "2026-04-16": 4,
@@ -78,6 +79,7 @@ class CommentHistoryMetricsTests(unittest.TestCase):
         rendered = metrics.render()
 
         self.assertIn("connection_machine_comments_sent_total 12", rendered)
+        self.assertIn("connection_machine_comments_sent_today 4", rendered)
         self.assertIn(
             'connection_machine_comments_sent_by_day{day="2026-04-15"} 3',
             rendered,
