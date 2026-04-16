@@ -24,6 +24,7 @@ SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
 AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
 COMMENT_HISTORY_DAYS = 30
 COMMENT_HISTORY_RECENT_ENTRY_LIMIT = 25
+INVITE_HISTORY_RECENT_ENTRY_LIMIT = 25
 
 
 def normalize_skip_reason(task_type: TaskType, reason: str) -> str:
@@ -80,6 +81,7 @@ class TaskDispatcher:
         self._sync_next_execution_metrics()
         self._sync_db_task_counts()
         self._sync_comment_history_metrics()
+        self._sync_invite_history_metrics()
 
     def _sync_next_execution_metrics(self):
         now = datetime.utcnow().timestamp()
@@ -122,7 +124,7 @@ class TaskDispatcher:
             recent_entries = [
                 {
                     "author": entry["author"],
-                    "comment_preview": entry["comment_preview"],
+                    "comment": entry["comment"],
                     "commented_at_iso": entry["commented_at"].isoformat(),
                     "commented_at_timestamp": entry["commented_at"].timestamp(),
                     "post_href": entry["post_href"],
@@ -137,6 +139,30 @@ class TaskDispatcher:
             )
         except Exception as exc:
             logger.warning("Failed to refresh comment history metrics: %s", exc)
+
+    def _sync_invite_history_metrics(self):
+        try:
+            invite_handler = self.handlers.get(TaskType.SEND_INVITE)
+            if not invite_handler or not hasattr(invite_handler, "get_invite_history_entries"):
+                self.metrics.set_invite_history([])
+                return
+
+            recent_entries = [
+                {
+                    "entry_key": entry["entry_key"],
+                    "message": entry["message"],
+                    "profile_url": entry["url"],
+                    "sent_at_iso": entry["sent_at"].isoformat(),
+                    "sent_at_timestamp": entry["sent_at"].timestamp(),
+                    "status": entry["status"],
+                }
+                for entry in invite_handler.get_invite_history_entries()[
+                    :INVITE_HISTORY_RECENT_ENTRY_LIMIT
+                ]
+            ]
+            self.metrics.set_invite_history(recent_entries)
+        except Exception as exc:
+            logger.warning("Failed to refresh invite history metrics: %s", exc)
 
     def _init_spacing_from_db(self):
         """Initialize next execution times from last executed tasks in DB."""
@@ -446,6 +472,7 @@ class TaskDispatcher:
         self.metrics.mark_poll()
         self._sync_db_task_counts()
         self._sync_comment_history_metrics()
+        self._sync_invite_history_metrics()
 
         # Get distinct pending task types first
         with SessionLocal() as db:
@@ -588,3 +615,4 @@ class TaskDispatcher:
                 )
                 self._sync_db_task_counts()
                 self._sync_comment_history_metrics()
+                self._sync_invite_history_metrics()

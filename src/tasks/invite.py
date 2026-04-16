@@ -1,6 +1,10 @@
 import base64
+import hashlib
+import json
 import logging
-from typing import Optional, Tuple
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional, Tuple
 from urllib.parse import urlparse
 
 from playwright.sync_api import Locator
@@ -16,8 +20,12 @@ from exceptions import TaskSkippedException
 logger = logging.getLogger(__name__)
 
 MAX_CONNECT_ITERATIONS = 5
+INVITE_HISTORY_RETENTION_DAYS = 30
 ADD_NOTE_SELECTOR = "button[aria-label='Add a note']"
 SEND_INVITATION_SELECTOR = "button[aria-label='Send invitation']"
+INVITE_HISTORY_PATH = (
+    Path(__file__).resolve().parents[2] / "data" / "invite_history.json"
+)
 
 PROFILE_CONTAINER_SELECTORS = [
     "div.pvs-profile-actions",
@@ -343,6 +351,91 @@ class InviteTask(BaseTask):
 
         return detect_connection_state(self.page)
 
+    def _load_invite_history(self) -> dict[str, Any]:
+        if not INVITE_HISTORY_PATH.exists():
+            return {}
+
+        try:
+            raw = json.loads(INVITE_HISTORY_PATH.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to read invite history: %s", exc)
+            return {}
+
+        if not isinstance(raw, dict):
+            return {}
+
+        cutoff = datetime.utcnow() - timedelta(days=INVITE_HISTORY_RETENTION_DAYS)
+        pruned: dict[str, Any] = {}
+        for key, value in raw.items():
+            if not isinstance(value, dict):
+                continue
+
+            sent_at = value.get("sent_at")
+            if not sent_at:
+                continue
+
+            try:
+                parsed = datetime.fromisoformat(sent_at)
+            except ValueError:
+                continue
+
+            if parsed >= cutoff:
+                pruned[key] = value
+
+        return pruned
+
+    def get_invite_history_entries(self) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for entry_key, value in self._load_invite_history().items():
+            if not isinstance(value, dict):
+                continue
+
+            sent_at = value.get("sent_at")
+            if not sent_at:
+                continue
+
+            try:
+                sent_at_dt = datetime.fromisoformat(sent_at)
+            except ValueError:
+                continue
+
+            entries.append(
+                {
+                    "entry_key": entry_key,
+                    "message": str(value.get("message") or ""),
+                    "sent_at": sent_at_dt,
+                    "status": str(value.get("status") or ""),
+                    "url": str(value.get("url") or ""),
+                }
+            )
+
+        entries.sort(key=lambda entry: entry["sent_at"], reverse=True)
+        return entries
+
+    def _record_invite_history(
+        self,
+        url: str,
+        status: str,
+        connection_message: Optional[str],
+    ):
+        history = self._load_invite_history()
+        sent_at = datetime.utcnow()
+        entry_key = hashlib.sha256(
+            f"{self._normalize_profile_url(url)}|{sent_at.isoformat()}".encode("utf-8")
+        ).hexdigest()[:16]
+        history[entry_key] = {
+            "message": connection_message or "",
+            "sent_at": sent_at.isoformat(),
+            "status": status,
+            "url": url,
+        }
+
+        INVITE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
+        INVITE_HISTORY_PATH.write_text(
+            json.dumps(history, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+
     def _after_connect_click(
         self,
         try_personal_message: bool,
@@ -427,14 +520,13 @@ class InviteTask(BaseTask):
             raise TaskSkippedException("invite_not_confirmed")
 
         logger.info("Connection request confirmed with state: %s", final_state.value)
-
-        message_preview = (
-            f'"{connection_message[:50]}..."'
-            if connection_message and len(connection_message) > 50
-            else (f'"{connection_message}"' if connection_message else "None")
+        self._record_invite_history(
+            url,
+            final_state.value,
+            connection_message,
         )
         send_notification(
-            f"Invite Confirmed to {url}\nState: {final_state.value}\nMessage: {message_preview}"
+            f"Invite Confirmed to {url}\nState: {final_state.value}\nMessage: {connection_message or 'None'}"
         )
 
         return {

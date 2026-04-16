@@ -71,6 +71,12 @@ class NoopMetrics:
     ):
         return None
 
+    def set_invite_history(
+        self,
+        recent_entries: list[dict[str, str | float]],
+    ):
+        return None
+
 
 class ConnectionMachineMetrics:
     def __init__(self, host: str, port: int):
@@ -97,6 +103,7 @@ class ConnectionMachineMetrics:
         self._comments_sent_total = 0
         self._comments_by_day: dict[str, int] = {}
         self._recent_comment_entries: list[dict[str, str | float]] = []
+        self._recent_invite_entries: list[dict[str, str | float]] = []
 
     def start(self):
         metrics = self
@@ -187,13 +194,30 @@ class ConnectionMachineMetrics:
             self._recent_comment_entries = [
                 {
                     "author": str(entry.get("author") or ""),
-                    "comment_preview": str(entry.get("comment_preview") or ""),
+                    "comment": str(entry.get("comment") or ""),
                     "commented_at": str(entry.get("commented_at_iso") or ""),
                     "commented_at_timestamp": float(
                         entry.get("commented_at_timestamp") or 0.0
                     ),
                     "post_href": str(entry.get("post_href") or ""),
                     "post_key": str(entry.get("post_key") or ""),
+                }
+                for entry in recent_entries
+            ]
+
+    def set_invite_history(
+        self,
+        recent_entries: list[dict[str, str | float]],
+    ):
+        with self._lock:
+            self._recent_invite_entries = [
+                {
+                    "entry_key": str(entry.get("entry_key") or ""),
+                    "message": str(entry.get("message") or ""),
+                    "profile_url": str(entry.get("profile_url") or ""),
+                    "sent_at": str(entry.get("sent_at_iso") or ""),
+                    "sent_at_timestamp": float(entry.get("sent_at_timestamp") or 0.0),
+                    "status": str(entry.get("status") or ""),
                 }
                 for entry in recent_entries
             ]
@@ -216,6 +240,7 @@ class ConnectionMachineMetrics:
             comments_sent_total = self._comments_sent_total
             comments_by_day = dict(self._comments_by_day)
             recent_comment_entries = list(self._recent_comment_entries)
+            recent_invite_entries = list(self._recent_invite_entries)
 
         lines = [
             "# HELP connection_machine_up Whether the connection-machine process considers itself healthy.",
@@ -364,10 +389,31 @@ class ConnectionMachineMetrics:
                     entry["commented_at_timestamp"],
                     {
                         "author": str(entry["author"]),
-                        "comment_preview": str(entry["comment_preview"]),
+                        "comment": str(entry["comment"]),
                         "commented_at": str(entry["commented_at"]),
                         "post_href": str(entry["post_href"]),
                         "post_key": str(entry["post_key"]),
+                    },
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_invite_history_entry_timestamp_seconds Unix timestamp for each recent successful invite retained for dashboard history.",
+                "# TYPE connection_machine_invite_history_entry_timestamp_seconds gauge",
+            ]
+        )
+        for entry in recent_invite_entries:
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_history_entry_timestamp_seconds",
+                    entry["sent_at_timestamp"],
+                    {
+                        "entry_key": str(entry["entry_key"]),
+                        "message": str(entry["message"]),
+                        "profile_url": str(entry["profile_url"]),
+                        "sent_at": str(entry["sent_at"]),
+                        "status": str(entry["status"]),
                     },
                 )
             )

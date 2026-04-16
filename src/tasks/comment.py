@@ -434,7 +434,11 @@ el => {
             entries.append(
                 {
                     "author": str(value.get("author") or ""),
-                    "comment_preview": str(value.get("comment_preview") or ""),
+                    "comment": str(
+                        value.get("comment")
+                        or value.get("comment_preview")
+                        or ""
+                    ),
                     "commented_at": commented_at_dt,
                     "post_href": str(value.get("post_href") or ""),
                     "post_key": post_key,
@@ -448,6 +452,7 @@ el => {
         history = self._load_comment_history()
         history[candidate["post_key"]] = {
             "author": candidate.get("author"),
+            "comment": candidate["comment"],
             "comment_preview": candidate["comment"][:120],
             "commented_at": datetime.utcnow().isoformat(),
             "post_href": candidate.get("post_href"),
@@ -466,7 +471,7 @@ el => {
     ) -> str:
         status = "Dry Run Feed Comment" if dry_run else "Feed Comment Sent"
         author = html.escape(candidate.get("author") or "Unknown author")
-        preview = html.escape(candidate["comment"][:120])
+        comment = html.escape(candidate["comment"])
         post_href = candidate.get("post_href")
 
         lines = [f"<b>{status}</b>", f"Author: {author}"]
@@ -475,5 +480,5 @@ el => {
             lines.append(f'Post: <a href="{escaped_href}">Open post</a>')
         else:
             lines.append("Post: unavailable")
-        lines.append(f'Comment: "{preview}"')
+        lines.append(f'Comment: "{comment}"')
         return "\n".join(lines)

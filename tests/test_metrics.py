@@ -16,6 +16,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from metrics import ConnectionMachineMetrics
 from tasks.comment import FeedCommentTask
+from tasks.invite import InviteTask
 
 
 class CommentHistoryMetricsTests(unittest.TestCase):
@@ -30,13 +31,13 @@ class CommentHistoryMetricsTests(unittest.TestCase):
             },
             "older-recent-entry": {
                 "author": "Older Recent",
-                "comment_preview": "Still recent",
+                "comment": "Still recent",
                 "commented_at": (now - timedelta(days=2)).isoformat(),
                 "post_href": "https://example.com/older-recent",
             },
             "newer-entry": {
                 "author": "Newer Author",
-                "comment_preview": "Most recent",
+                "comment": "Most recent",
                 "commented_at": (now - timedelta(hours=2)).isoformat(),
                 "post_href": "https://example.com/newer",
             },
@@ -65,7 +66,7 @@ class CommentHistoryMetricsTests(unittest.TestCase):
             recent_entries=[
                 {
                     "author": "Ada Lovelace",
-                    "comment_preview": "Thoughtful point",
+                    "comment": "Thoughtful point",
                     "commented_at_iso": "2026-04-16T00:00:00",
                     "commented_at_timestamp": 1776355200.0,
                     "post_href": "https://example.com/post",
@@ -82,7 +83,67 @@ class CommentHistoryMetricsTests(unittest.TestCase):
             rendered,
         )
         self.assertIn(
-            'connection_machine_comment_history_entry_timestamp_seconds{author="Ada Lovelace",comment_preview="Thoughtful point",commented_at="2026-04-16T00:00:00",post_href="https://example.com/post",post_key="abc123"} 1776355200.0',
+            'connection_machine_comment_history_entry_timestamp_seconds{author="Ada Lovelace",comment="Thoughtful point",commented_at="2026-04-16T00:00:00",post_href="https://example.com/post",post_key="abc123"} 1776355200.0',
+            rendered,
+        )
+
+    def test_invite_history_entries_are_sorted_and_pruned(self):
+        now = datetime.utcnow()
+        payload = {
+            "old-entry": {
+                "message": "Too old",
+                "sent_at": (now - timedelta(days=45)).isoformat(),
+                "status": "pending",
+                "url": "https://example.com/old",
+            },
+            "older-recent-entry": {
+                "message": "Still recent",
+                "sent_at": (now - timedelta(days=2)).isoformat(),
+                "status": "pending",
+                "url": "https://example.com/older-recent",
+            },
+            "newer-entry": {
+                "message": "Newest",
+                "sent_at": (now - timedelta(hours=2)).isoformat(),
+                "status": "connected",
+                "url": "https://example.com/newer",
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            history_path = Path(tmpdir) / "invite_history.json"
+            history_path.write_text(json.dumps(payload), encoding="utf-8")
+
+            task = object.__new__(InviteTask)
+            with patch("tasks.invite.INVITE_HISTORY_PATH", history_path):
+                entries = task.get_invite_history_entries()
+
+        self.assertEqual(
+            [entry["entry_key"] for entry in entries],
+            ["newer-entry", "older-recent-entry"],
+        )
+        self.assertEqual(entries[0]["message"], "Newest")
+        self.assertIsInstance(entries[0]["sent_at"], datetime)
+
+    def test_metrics_render_invite_history_series(self):
+        metrics = ConnectionMachineMetrics(host="127.0.0.1", port=0)
+        metrics.set_invite_history(
+            recent_entries=[
+                {
+                    "entry_key": "invite-1",
+                    "message": "Appreciated your post about infra reliability.",
+                    "profile_url": "https://example.com/profile",
+                    "sent_at_iso": "2026-04-16T01:00:00",
+                    "sent_at_timestamp": 1776358800.0,
+                    "status": "pending",
+                }
+            ],
+        )
+
+        rendered = metrics.render()
+
+        self.assertIn(
+            'connection_machine_invite_history_entry_timestamp_seconds{entry_key="invite-1",message="Appreciated your post about infra reliability.",profile_url="https://example.com/profile",sent_at="2026-04-16T01:00:00",status="pending"} 1776358800.0',
             rendered,
         )
 
