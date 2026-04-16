@@ -22,6 +22,8 @@ SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
     (TaskType.COMMENT_FEED_POST, "no_safe_commentable_posts"): timedelta(minutes=30),
 }
 AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
+COMMENT_HISTORY_DAYS = 30
+COMMENT_HISTORY_RECENT_ENTRY_LIMIT = 25
 
 
 def normalize_skip_reason(task_type: TaskType, reason: str) -> str:
@@ -76,6 +78,8 @@ class TaskDispatcher:
         self._init_spacing_from_db()
         self._init_autonomous_spacing()
         self._sync_next_execution_metrics()
+        self._sync_db_task_counts()
+        self._sync_comment_history_metrics()
 
     def _sync_next_execution_metrics(self):
         now = datetime.utcnow().timestamp()
@@ -101,6 +105,38 @@ class TaskDispatcher:
             self.metrics.set_db_task_counts(counts)
         except Exception as exc:
             logger.warning("Failed to refresh DB task count metrics: %s", exc)
+
+    def _sync_comment_history_metrics(self):
+        try:
+            history_entries = self.feed_comment_handler.get_comment_history_entries()
+            today = datetime.utcnow().date()
+            comments_by_day = {
+                (today - timedelta(days=offset)).isoformat(): 0
+                for offset in range(COMMENT_HISTORY_DAYS - 1, -1, -1)
+            }
+            for entry in history_entries:
+                day = entry["commented_at"].date().isoformat()
+                if day in comments_by_day:
+                    comments_by_day[day] += 1
+
+            recent_entries = [
+                {
+                    "author": entry["author"],
+                    "comment_preview": entry["comment_preview"],
+                    "commented_at_iso": entry["commented_at"].isoformat(),
+                    "commented_at_timestamp": entry["commented_at"].timestamp(),
+                    "post_href": entry["post_href"],
+                    "post_key": entry["post_key"],
+                }
+                for entry in history_entries[:COMMENT_HISTORY_RECENT_ENTRY_LIMIT]
+            ]
+            self.metrics.set_comment_history(
+                total_comments=len(history_entries),
+                comments_by_day=comments_by_day,
+                recent_entries=recent_entries,
+            )
+        except Exception as exc:
+            logger.warning("Failed to refresh comment history metrics: %s", exc)
 
     def _init_spacing_from_db(self):
         """Initialize next execution times from last executed tasks in DB."""
@@ -342,6 +378,7 @@ class TaskDispatcher:
             )
             self._sync_next_execution_metrics()
             outcome = "failed"
+        self._sync_comment_history_metrics()
         self.metrics.observe_task(
             TaskType.COMMENT_FEED_POST.value,
             outcome,
@@ -408,6 +445,7 @@ class TaskDispatcher:
         """Fetch and execute pending tasks."""
         self.metrics.mark_poll()
         self._sync_db_task_counts()
+        self._sync_comment_history_metrics()
 
         # Get distinct pending task types first
         with SessionLocal() as db:
@@ -549,3 +587,4 @@ class TaskDispatcher:
                     time.monotonic() - started_at,
                 )
                 self._sync_db_task_counts()
+                self._sync_comment_history_metrics()

@@ -63,6 +63,14 @@ class NoopMetrics:
     def observe_task(self, task_type: str, outcome: str, duration_seconds: float):
         return None
 
+    def set_comment_history(
+        self,
+        total_comments: int,
+        comments_by_day: dict[str, int],
+        recent_entries: list[dict[str, str | float]],
+    ):
+        return None
+
 
 class ConnectionMachineMetrics:
     def __init__(self, host: str, port: int):
@@ -86,6 +94,9 @@ class ConnectionMachineMetrics:
         self._task_last_execution_timestamp: dict[tuple[str, str], float] = {}
         self._db_task_counts: dict[tuple[str, str], int] = {}
         self._next_execution_timestamps: dict[str, float] = {}
+        self._comments_sent_total = 0
+        self._comments_by_day: dict[str, int] = {}
+        self._recent_comment_entries: list[dict[str, str | float]] = []
 
     def start(self):
         metrics = self
@@ -161,6 +172,32 @@ class ConnectionMachineMetrics:
             self._task_duration_count[key] = self._task_duration_count.get(key, 0) + 1
             self._task_last_execution_timestamp[key] = now
 
+    def set_comment_history(
+        self,
+        total_comments: int,
+        comments_by_day: dict[str, int],
+        recent_entries: list[dict[str, str | float]],
+    ):
+        with self._lock:
+            self._comments_sent_total = max(0, int(total_comments))
+            self._comments_by_day = {
+                str(day): max(0, int(count))
+                for day, count in comments_by_day.items()
+            }
+            self._recent_comment_entries = [
+                {
+                    "author": str(entry.get("author") or ""),
+                    "comment_preview": str(entry.get("comment_preview") or ""),
+                    "commented_at": str(entry.get("commented_at_iso") or ""),
+                    "commented_at_timestamp": float(
+                        entry.get("commented_at_timestamp") or 0.0
+                    ),
+                    "post_href": str(entry.get("post_href") or ""),
+                    "post_key": str(entry.get("post_key") or ""),
+                }
+                for entry in recent_entries
+            ]
+
     def render(self) -> str:
         with self._lock:
             up = self._up
@@ -176,6 +213,9 @@ class ConnectionMachineMetrics:
             task_last_execution_timestamp = dict(self._task_last_execution_timestamp)
             db_task_counts = dict(self._db_task_counts)
             next_execution_timestamps = dict(self._next_execution_timestamps)
+            comments_sent_total = self._comments_sent_total
+            comments_by_day = dict(self._comments_by_day)
+            recent_comment_entries = list(self._recent_comment_entries)
 
         lines = [
             "# HELP connection_machine_up Whether the connection-machine process considers itself healthy.",
@@ -287,6 +327,48 @@ class ConnectionMachineMetrics:
                     "connection_machine_next_execution_timestamp_seconds",
                     value,
                     {"task_type": task_type},
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_comments_sent_total Total feed comments retained in local history.",
+                "# TYPE connection_machine_comments_sent_total gauge",
+                _format_sample(
+                    "connection_machine_comments_sent_total",
+                    comments_sent_total,
+                ),
+                "# HELP connection_machine_comments_sent_by_day Number of feed comments retained for each UTC day.",
+                "# TYPE connection_machine_comments_sent_by_day gauge",
+            ]
+        )
+        for day, value in sorted(comments_by_day.items()):
+            lines.append(
+                _format_sample(
+                    "connection_machine_comments_sent_by_day",
+                    value,
+                    {"day": day},
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_comment_history_entry_timestamp_seconds Unix timestamp for each recent feed comment entry retained for dashboard history.",
+                "# TYPE connection_machine_comment_history_entry_timestamp_seconds gauge",
+            ]
+        )
+        for entry in recent_comment_entries:
+            lines.append(
+                _format_sample(
+                    "connection_machine_comment_history_entry_timestamp_seconds",
+                    entry["commented_at_timestamp"],
+                    {
+                        "author": str(entry["author"]),
+                        "comment_preview": str(entry["comment_preview"]),
+                        "commented_at": str(entry["commented_at"]),
+                        "post_href": str(entry["post_href"]),
+                        "post_key": str(entry["post_key"]),
+                    },
                 )
             )
 

@@ -416,6 +416,34 @@ el => {
         timestamps.sort()
         return timestamps
 
+    def get_comment_history_entries(self) -> list[dict[str, Any]]:
+        entries: list[dict[str, Any]] = []
+        for post_key, value in self._load_comment_history().items():
+            if not isinstance(value, dict):
+                continue
+
+            commented_at = value.get("commented_at")
+            if not commented_at:
+                continue
+
+            try:
+                commented_at_dt = datetime.fromisoformat(commented_at)
+            except ValueError:
+                continue
+
+            entries.append(
+                {
+                    "author": str(value.get("author") or ""),
+                    "comment_preview": str(value.get("comment_preview") or ""),
+                    "commented_at": commented_at_dt,
+                    "post_href": str(value.get("post_href") or ""),
+                    "post_key": post_key,
+                }
+            )
+
+        entries.sort(key=lambda entry: entry["commented_at"], reverse=True)
+        return entries
+
     def _mark_post_commented(self, candidate: dict[str, Any]):
         history = self._load_comment_history()
         history[candidate["post_key"]] = {
