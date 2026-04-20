@@ -18,7 +18,7 @@ from dispatcher import (
     normalize_skip_reason,
     remaining_minutes,
 )
-from tasks.invite import classify_invitation_feedback
+from tasks.invite import _format_invite_notification, classify_invitation_feedback
 
 
 class InviteFlowLogicTests(unittest.TestCase):
@@ -139,6 +139,16 @@ class InviteFlowLogicTests(unittest.TestCase):
             has_following=False,
         )
         self.assertEqual(state, ConnectionState.CONNECTED)
+
+    def test_invite_notification_escapes_dynamic_fields(self):
+        message = _format_invite_notification(
+            "Invite confirmed",
+            profile_url="https://example.com/profile?x=1&y=2",
+            state="pending",
+            message="<b>Hello</b> & welcome",
+        )
+        self.assertIn("https://example.com/profile?x=1&amp;y=2", message)
+        self.assertIn("&lt;b&gt;Hello&lt;/b&gt; &amp; welcome", message)
 
     def test_weekly_limit_notification_mentions_7_day_cooldown(self):
         next_allowed = datetime(2026, 4, 6, 12, 30)

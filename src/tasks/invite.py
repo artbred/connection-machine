@@ -10,9 +10,10 @@ from urllib.parse import urlparse
 from playwright.sync_api import Locator
 
 from .base import BaseTask
+from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
 from llm import generate_connection_message, get_next_connect_action
 from markdownify import markdownify as md
-from notifications import send_notification
+from notifications import escape_html_text, send_notification
 from connection_state import detect_connection_state, ConnectionState
 from connect_heuristics import try_heuristic_connect, get_cached_selector, save_selector_to_cache
 from exceptions import TaskSkippedException
@@ -36,6 +37,24 @@ PROFILE_CONTAINER_SELECTORS = [
 ]
 
 DROPDOWN_SELECTOR = "div.artdeco-dropdown__content:visible, div[role='menu']:visible"
+INVITE_REASON_DESCRIPTIONS = {
+    "weekly_limit_reached": "LinkedIn weekly invitation limit reached",
+    "withdrawal_cooldown": "LinkedIn is still withdrawing previous invitations",
+    "already_pending": "Connection is already pending",
+    "already_connected": "Profile is already a 1st-degree connection",
+    "connect_unavailable": "No Connect action is available on the profile",
+    "invite_not_confirmed": "Invite send action could not be confirmed",
+    "profile_not_found": "Profile page was not found",
+    "policy_skip": "Invite was skipped by local policy",
+    "memorialized_account": "Profile appears to be memorialized",
+    "security_checkpoint": "LinkedIn presented a security checkpoint",
+    "profile_unavailable": "Profile page content was unavailable",
+    "navigation_timeout": "Profile navigation timed out",
+    "navigation_error": "Profile navigation failed",
+    "send_button_timeout": "Send invitation button timed out",
+    "add_note_unreachable": "Could not reach the invite modal",
+    "llm_invalid_response": "LLM selector guidance was invalid",
+}
 
 
 def _normalize_feedback_text(text: str) -> str:
@@ -216,7 +235,40 @@ def normalize_invite_skip_reason(reason: str) -> str:
     return reason
 
 
+def describe_invite_reason(reason: str) -> str:
+    return INVITE_REASON_DESCRIPTIONS.get(reason, reason.replace("_", " "))
+
+
+def _format_invite_notification(
+    title: str,
+    *,
+    profile_url: str = "",
+    state: str = "",
+    reason: str = "",
+    message: str = "",
+    cooldown_until: datetime | None = None,
+) -> str:
+    lines = [f"<b>{escape_html_text(title)}</b>"]
+    if profile_url:
+        lines.append(f"Profile: {escape_html_text(profile_url)}")
+    if state:
+        lines.append(f"State: {escape_html_text(state)}")
+    if reason:
+        lines.append(f"Reason: {escape_html_text(describe_invite_reason(reason))}")
+    if cooldown_until:
+        lines.append(
+            f"Resume after: {escape_html_text(cooldown_until.strftime('%Y-%m-%d %H:%M UTC'))}"
+        )
+    if message:
+        lines.append(f"Message: {escape_html_text(message)}")
+    return "\n".join(lines)
+
+
 class InviteTask(BaseTask):
+    def __init__(self, page):
+        super().__init__(page)
+        self.invite_state = InviteStateStore()
+
     def run(self, payload: dict):
         url = payload.get("url")
         if not url:
@@ -225,7 +277,66 @@ class InviteTask(BaseTask):
         self.validate_session()
 
         try_personal_message = payload.get("try_personal_message", True)
-        self.send_connection_request(url, try_personal_message)
+        active_cooldown = self.invite_state.get_active_cooldown()
+
+        try:
+            if active_cooldown:
+                logger.warning(
+                    "Invite cooldown active for %s until %s",
+                    active_cooldown.get("reason") or "unknown",
+                    active_cooldown["active_until"].isoformat(),
+                )
+                raise TaskSkippedException(active_cooldown["reason"])
+
+            self.send_connection_request(url, try_personal_message)
+        except TaskSkippedException as exc:
+            normalized_reason = normalize_invite_skip_reason(exc.reason)
+            cooldown_until = None
+            outcome = "skipped"
+
+            if (
+                active_cooldown
+                and active_cooldown.get("reason") == normalized_reason
+            ):
+                cooldown_until = active_cooldown["active_until"]
+                outcome = "blocked"
+            else:
+                cooldown = INVITE_SKIP_COOLDOWNS.get(normalized_reason)
+                if cooldown:
+                    cooldown_until = datetime.utcnow() + cooldown
+                    self.invite_state.set_cooldown(
+                        normalized_reason,
+                        cooldown_until,
+                        source="invite_task",
+                        profile_url=url,
+                    )
+
+            self.invite_state.record_event(
+                outcome=outcome,
+                reason=normalized_reason,
+                profile_url=url,
+                source="invite_task",
+                cooldown_until=cooldown_until,
+            )
+            if cooldown_until:
+                send_notification(
+                    _format_invite_notification(
+                        "Invite blocked",
+                        profile_url=url,
+                        reason=normalized_reason,
+                        cooldown_until=cooldown_until,
+                    )
+                )
+            raise TaskSkippedException(normalized_reason)
+        except Exception as exc:
+            normalized_reason = normalize_invite_skip_reason(str(exc))
+            self.invite_state.record_event(
+                outcome="failed",
+                reason=normalized_reason,
+                profile_url=url,
+                source="invite_task",
+            )
+            raise
 
     def get_profile_content(self) -> str:
         try:
@@ -525,8 +636,21 @@ class InviteTask(BaseTask):
             final_state.value,
             connection_message,
         )
+        self.invite_state.record_event(
+            outcome="success",
+            reason="",
+            profile_url=url,
+            message_preview=connection_message or "",
+            status=final_state.value,
+            source="invite_task",
+        )
         send_notification(
-            f"Invite Confirmed to {url}\nState: {final_state.value}\nMessage: {connection_message or 'None'}"
+            _format_invite_notification(
+                "Invite confirmed",
+                profile_url=url,
+                state=final_state.value,
+                message=connection_message or "None",
+            )
         )
 
         return {

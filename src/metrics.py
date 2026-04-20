@@ -85,6 +85,16 @@ class NoopMetrics:
     ):
         return None
 
+    def set_invite_state(
+        self,
+        cooldown: dict[str, str | float] | None,
+        last_event: dict[str, str | float] | None,
+        recent_events: list[dict[str, str | float]],
+        event_counts: dict[tuple[str, str], int],
+        reason_counts: dict[str, int],
+    ):
+        return None
+
 
 class ConnectionMachineMetrics:
     def __init__(self, host: str, port: int):
@@ -115,6 +125,11 @@ class ConnectionMachineMetrics:
         self._recent_invite_entries: list[dict[str, str | float]] = []
         self._invites_sent_total = 0
         self._invites_sent_today = 0
+        self._invite_cooldown: dict[str, str | float] | None = None
+        self._invite_last_event: dict[str, str | float] | None = None
+        self._invite_recent_events: list[dict[str, str | float]] = []
+        self._invite_event_counts: dict[tuple[str, str], int] = {}
+        self._invite_reason_counts: dict[str, int] = {}
 
     def start(self):
         metrics = self
@@ -244,6 +259,71 @@ class ConnectionMachineMetrics:
             self._invites_sent_total = max(0, int(invites_sent_total))
             self._invites_sent_today = max(0, int(invites_sent_today))
 
+    def set_invite_state(
+        self,
+        cooldown: dict[str, str | float] | None,
+        last_event: dict[str, str | float] | None,
+        recent_events: list[dict[str, str | float]],
+        event_counts: dict[tuple[str, str], int],
+        reason_counts: dict[str, int],
+    ):
+        with self._lock:
+            self._invite_cooldown = (
+                {
+                    "reason": str(cooldown.get("reason") or ""),
+                    "active_until_timestamp": float(
+                        cooldown.get("active_until_timestamp") or 0.0
+                    ),
+                    "active_until": str(cooldown.get("active_until") or ""),
+                    "source": str(cooldown.get("source") or ""),
+                    "profile_url": str(cooldown.get("profile_url") or ""),
+                }
+                if cooldown
+                else None
+            )
+            self._invite_last_event = (
+                {
+                    "event_id": str(last_event.get("event_id") or ""),
+                    "recorded_at_timestamp": float(
+                        last_event.get("recorded_at_timestamp") or 0.0
+                    ),
+                    "recorded_at": str(last_event.get("recorded_at") or ""),
+                    "outcome": str(last_event.get("outcome") or ""),
+                    "reason": str(last_event.get("reason") or ""),
+                    "profile_url": str(last_event.get("profile_url") or ""),
+                    "message_preview": str(last_event.get("message_preview") or ""),
+                    "source": str(last_event.get("source") or ""),
+                    "status": str(last_event.get("status") or ""),
+                }
+                if last_event
+                else None
+            )
+            self._invite_recent_events = [
+                {
+                    "event_id": str(event.get("event_id") or ""),
+                    "recorded_at_timestamp": float(
+                        event.get("recorded_at_timestamp") or 0.0
+                    ),
+                    "recorded_at": str(event.get("recorded_at") or ""),
+                    "outcome": str(event.get("outcome") or ""),
+                    "reason": str(event.get("reason") or ""),
+                    "profile_url": str(event.get("profile_url") or ""),
+                    "message_preview": str(event.get("message_preview") or ""),
+                    "source": str(event.get("source") or ""),
+                    "status": str(event.get("status") or ""),
+                    "cooldown_until": str(event.get("cooldown_until") or ""),
+                }
+                for event in recent_events
+            ]
+            self._invite_event_counts = {
+                (str(outcome), str(reason)): max(0, int(count))
+                for (outcome, reason), count in event_counts.items()
+            }
+            self._invite_reason_counts = {
+                str(reason): max(0, int(count))
+                for reason, count in reason_counts.items()
+            }
+
     def render(self) -> str:
         with self._lock:
             up = self._up
@@ -266,6 +346,13 @@ class ConnectionMachineMetrics:
             recent_invite_entries = list(self._recent_invite_entries)
             invites_sent_total = self._invites_sent_total
             invites_sent_today = self._invites_sent_today
+            invite_cooldown = dict(self._invite_cooldown) if self._invite_cooldown else None
+            invite_last_event = (
+                dict(self._invite_last_event) if self._invite_last_event else None
+            )
+            invite_recent_events = list(self._invite_recent_events)
+            invite_event_counts = dict(self._invite_event_counts)
+            invite_reason_counts = dict(self._invite_reason_counts)
 
         lines = [
             "# HELP connection_machine_up Whether the connection-machine process considers itself healthy.",
@@ -457,6 +544,139 @@ class ConnectionMachineMetrics:
                         "profile_url": str(entry["profile_url"]),
                         "sent_at": str(entry["sent_at"]),
                         "status": str(entry["status"]),
+                    },
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_invite_cooldown_active Whether invite sending is currently blocked by a durable cooldown.",
+                "# TYPE connection_machine_invite_cooldown_active gauge",
+                _format_sample(
+                    "connection_machine_invite_cooldown_active",
+                    1 if invite_cooldown else 0,
+                ),
+                "# HELP connection_machine_invite_cooldown_end_timestamp_seconds Unix timestamp when the active invite cooldown ends.",
+                "# TYPE connection_machine_invite_cooldown_end_timestamp_seconds gauge",
+                "# HELP connection_machine_invite_cooldown_remaining_seconds Remaining seconds until the active invite cooldown expires.",
+                "# TYPE connection_machine_invite_cooldown_remaining_seconds gauge",
+            ]
+        )
+        if invite_cooldown:
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_cooldown_end_timestamp_seconds",
+                    invite_cooldown["active_until_timestamp"],
+                    {
+                        "reason": str(invite_cooldown["reason"]),
+                        "source": str(invite_cooldown["source"]),
+                        "profile_url": str(invite_cooldown["profile_url"]),
+                        "active_until": str(invite_cooldown["active_until"]),
+                    },
+                )
+            )
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_cooldown_remaining_seconds",
+                    max(
+                        0.0,
+                        float(invite_cooldown["active_until_timestamp"]) - time.time(),
+                    ),
+                    {
+                        "reason": str(invite_cooldown["reason"]),
+                        "source": str(invite_cooldown["source"]),
+                    },
+                )
+            )
+        else:
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_cooldown_end_timestamp_seconds",
+                    0,
+                )
+            )
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_cooldown_remaining_seconds",
+                    0,
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_invite_events_total Total invite events retained in durable local state, partitioned by outcome and reason.",
+                "# TYPE connection_machine_invite_events_total gauge",
+            ]
+        )
+        for (outcome, reason), value in sorted(invite_event_counts.items()):
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_events_total",
+                    value,
+                    {"outcome": outcome, "reason": reason},
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_invite_reason_total Total invite events retained in durable local state, partitioned by normalized reason.",
+                "# TYPE connection_machine_invite_reason_total gauge",
+            ]
+        )
+        for reason, value in sorted(invite_reason_counts.items()):
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_reason_total",
+                    value,
+                    {"reason": reason},
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_invite_last_event_timestamp_seconds Unix timestamp of the most recent invite event retained in durable local state.",
+                "# TYPE connection_machine_invite_last_event_timestamp_seconds gauge",
+            ]
+        )
+        if invite_last_event:
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_last_event_timestamp_seconds",
+                    invite_last_event["recorded_at_timestamp"],
+                    {
+                        "event_id": str(invite_last_event["event_id"]),
+                        "outcome": str(invite_last_event["outcome"]),
+                        "reason": str(invite_last_event["reason"]),
+                        "profile_url": str(invite_last_event["profile_url"]),
+                        "message_preview": str(invite_last_event["message_preview"]),
+                        "source": str(invite_last_event["source"]),
+                        "status": str(invite_last_event["status"]),
+                        "recorded_at": str(invite_last_event["recorded_at"]),
+                    },
+                )
+            )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_invite_recent_event_timestamp_seconds Unix timestamp for each recent invite event retained for dashboard history.",
+                "# TYPE connection_machine_invite_recent_event_timestamp_seconds gauge",
+            ]
+        )
+        for event in invite_recent_events:
+            lines.append(
+                _format_sample(
+                    "connection_machine_invite_recent_event_timestamp_seconds",
+                    event["recorded_at_timestamp"],
+                    {
+                        "event_id": str(event["event_id"]),
+                        "outcome": str(event["outcome"]),
+                        "reason": str(event["reason"]),
+                        "profile_url": str(event["profile_url"]),
+                        "message_preview": str(event["message_preview"]),
+                        "source": str(event["source"]),
+                        "status": str(event["status"]),
+                        "recorded_at": str(event["recorded_at"]),
+                        "cooldown_until": str(event["cooldown_until"]),
                     },
                 )
             )

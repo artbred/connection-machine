@@ -161,6 +161,71 @@ class CommentHistoryMetricsTests(unittest.TestCase):
         self.assertIn("connection_machine_invites_sent_total 563", rendered)
         self.assertIn("connection_machine_invites_sent_today 4", rendered)
 
+    def test_metrics_render_invite_state_series(self):
+        metrics = ConnectionMachineMetrics(host="127.0.0.1", port=0)
+        metrics.set_invite_state(
+            cooldown={
+                "reason": "weekly_limit_reached",
+                "active_until_timestamp": 1776637380.0,
+                "active_until": "2026-04-19T22:23:00",
+                "source": "invite_task",
+                "profile_url": "https://example.com/profile",
+            },
+            last_event={
+                "event_id": "evt-123",
+                "recorded_at_timestamp": 1776633780.0,
+                "recorded_at": "2026-04-19T21:23:00",
+                "outcome": "skipped",
+                "reason": "weekly_limit_reached",
+                "profile_url": "https://example.com/profile",
+                "message_preview": "",
+                "source": "invite_task",
+                "status": "",
+            },
+            recent_events=[
+                {
+                    "event_id": "evt-123",
+                    "recorded_at_timestamp": 1776633780.0,
+                    "recorded_at": "2026-04-19T21:23:00",
+                    "outcome": "skipped",
+                    "reason": "weekly_limit_reached",
+                    "profile_url": "https://example.com/profile",
+                    "message_preview": "",
+                    "source": "invite_task",
+                    "status": "",
+                    "cooldown_until": "2026-04-19T22:23:00",
+                }
+            ],
+            event_counts={
+                ("skipped", "weekly_limit_reached"): 2,
+                ("success", ""): 1,
+            },
+            reason_counts={
+                "weekly_limit_reached": 2,
+            },
+        )
+
+        rendered = metrics.render()
+
+        self.assertIn("connection_machine_invite_cooldown_active 1", rendered)
+        self.assertIn(
+            'connection_machine_invite_cooldown_end_timestamp_seconds{active_until="2026-04-19T22:23:00",profile_url="https://example.com/profile",reason="weekly_limit_reached",source="invite_task"} 1776637380.0',
+            rendered,
+        )
+        self.assertIn("connection_machine_invite_cooldown_remaining_seconds", rendered)
+        self.assertIn(
+            'connection_machine_invite_events_total{outcome="skipped",reason="weekly_limit_reached"} 2',
+            rendered,
+        )
+        self.assertIn(
+            'connection_machine_invite_reason_total{reason="weekly_limit_reached"} 2',
+            rendered,
+        )
+        self.assertIn(
+            'connection_machine_invite_last_event_timestamp_seconds{event_id="evt-123",message_preview="",outcome="skipped",profile_url="https://example.com/profile",reason="weekly_limit_reached",recorded_at="2026-04-19T21:23:00",source="invite_task",status=""} 1776633780.0',
+            rendered,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import time
 
 from datetime import datetime, timedelta
 from db import SessionLocal, Task, TaskType, TaskStatus
+from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
 from metrics import NoopMetrics
 from tasks.invite import InviteTask, normalize_invite_skip_reason
 from tasks.comment import FeedCommentTask
@@ -17,8 +18,10 @@ from sqlalchemy import func
 logger = logging.getLogger(__name__)
 
 SKIP_COOLDOWNS: dict[tuple[TaskType, str], timedelta] = {
-    (TaskType.SEND_INVITE, "weekly_limit_reached"): timedelta(days=7),
-    (TaskType.SEND_INVITE, "withdrawal_cooldown"): timedelta(hours=6),
+    **{
+        (TaskType.SEND_INVITE, reason): cooldown
+        for reason, cooldown in INVITE_SKIP_COOLDOWNS.items()
+    },
     (TaskType.COMMENT_FEED_POST, "no_safe_commentable_posts"): timedelta(minutes=30),
 }
 AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
@@ -53,6 +56,15 @@ def build_cooldown_notification(
             f"Resume after: {until_text}"
         )
 
+    if task_type == TaskType.SEND_INVITE and reason == "withdrawal_cooldown":
+        until_text = next_allowed.strftime("%Y-%m-%d %H:%M UTC")
+        return (
+            "<b>Invite temporarily blocked</b>\n"
+            "Reason: LinkedIn is still withdrawing previous invitations\n"
+            "Cooldown: 6 hours\n"
+            f"Resume after: {until_text}"
+        )
+
     return None
 
 
@@ -60,6 +72,7 @@ class TaskDispatcher:
     def __init__(self, page, metrics=None):
         self.page = page
         self.metrics = metrics or NoopMetrics()
+        self.invite_state = InviteStateStore()
         self.feed_comment_handler = FeedCommentTask(page)
         self.handlers = {
             TaskType.SEND_INVITE: InviteTask(page),
@@ -78,10 +91,12 @@ class TaskDispatcher:
         self._logged_no_pending: bool = False
         self._init_spacing_from_db()
         self._init_autonomous_spacing()
+        self._apply_durable_invite_cooldown()
         self._sync_next_execution_metrics()
         self._sync_db_task_counts()
         self._sync_comment_history_metrics()
         self._sync_invite_history_metrics()
+        self._sync_invite_state_metrics()
 
     def _sync_next_execution_metrics(self):
         now = datetime.utcnow().timestamp()
@@ -193,6 +208,77 @@ class TaskDispatcher:
             self.metrics.set_invite_history(recent_entries)
         except Exception as exc:
             logger.warning("Failed to refresh invite history metrics: %s", exc)
+
+    def _sync_invite_state_metrics(self):
+        try:
+            snapshot = self.invite_state.get_metrics_snapshot()
+            cooldown = snapshot.get("cooldown")
+            serialized_cooldown = None
+            if cooldown:
+                serialized_cooldown = {
+                    "reason": cooldown["reason"],
+                    "active_until": cooldown["active_until"].isoformat(),
+                    "active_until_timestamp": cooldown["active_until"].timestamp(),
+                    "source": cooldown.get("source") or "",
+                    "profile_url": cooldown.get("profile_url") or "",
+                }
+
+            def serialize_event(event):
+                if not event:
+                    return None
+                return {
+                    "event_id": event.get("event_id") or "",
+                    "recorded_at": event["recorded_at"].isoformat(),
+                    "recorded_at_timestamp": event["recorded_at"].timestamp(),
+                    "outcome": event.get("outcome") or "",
+                    "reason": event.get("reason") or "",
+                    "profile_url": event.get("profile_url") or "",
+                    "message_preview": event.get("message_preview") or "",
+                    "source": event.get("source") or "",
+                    "status": event.get("status") or "",
+                    "cooldown_until": (
+                        event["cooldown_until"].isoformat()
+                        if event.get("cooldown_until")
+                        else ""
+                    ),
+                }
+
+            self.metrics.set_invite_state(
+                cooldown=serialized_cooldown,
+                last_event=serialize_event(snapshot.get("last_event")),
+                recent_events=[
+                    serialize_event(event)
+                    for event in snapshot.get("recent_events", [])
+                    if event is not None
+                ],
+                event_counts=snapshot.get("event_counts", {}),
+                reason_counts=snapshot.get("reason_counts", {}),
+            )
+        except Exception as exc:
+            logger.warning("Failed to refresh invite state metrics: %s", exc)
+
+    def _apply_durable_invite_cooldown(self):
+        try:
+            cooldown = self.invite_state.get_active_cooldown()
+        except Exception as exc:
+            logger.warning("Failed to load durable invite cooldown state: %s", exc)
+            return
+
+        if not cooldown:
+            return
+
+        next_allowed = cooldown["active_until"]
+        existing = self.next_execution_at.get(TaskType.SEND_INVITE)
+        if existing and existing >= next_allowed:
+            return
+
+        self.next_execution_at[TaskType.SEND_INVITE] = next_allowed
+        wait_min = remaining_minutes(next_allowed - datetime.utcnow())
+        logger.info(
+            "Applied durable invite cooldown from state: %s (~%s min remaining)",
+            cooldown.get("reason") or "unknown",
+            wait_min,
+        )
 
     def _init_spacing_from_db(self):
         """Initialize next execution times from last executed tasks in DB."""
@@ -381,7 +467,14 @@ class TaskDispatcher:
         logger.warning(
             f"{task_type} cooling down for {cooldown} due to skip reason: {reason}"
         )
+        if task_type == TaskType.SEND_INVITE:
+            self.invite_state.set_cooldown(
+                reason,
+                next_allowed,
+                source="dispatcher",
+            )
         self._sync_next_execution_metrics()
+        self._sync_invite_state_metrics()
 
         notification = build_cooldown_notification(task_type, reason, next_allowed)
         if notification:
@@ -499,10 +592,12 @@ class TaskDispatcher:
 
     def poll(self):
         """Fetch and execute pending tasks."""
+        self._apply_durable_invite_cooldown()
         self.metrics.mark_poll()
         self._sync_db_task_counts()
         self._sync_comment_history_metrics()
         self._sync_invite_history_metrics()
+        self._sync_invite_state_metrics()
 
         # Get distinct pending task types first
         with SessionLocal() as db:
@@ -646,3 +741,4 @@ class TaskDispatcher:
                 self._sync_db_task_counts()
                 self._sync_comment_history_metrics()
                 self._sync_invite_history_metrics()
+                self._sync_invite_state_metrics()
