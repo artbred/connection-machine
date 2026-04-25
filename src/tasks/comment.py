@@ -193,11 +193,11 @@ class FeedCommentTask(BaseTask):
     def _extract_candidate(self, button) -> dict[str, Any] | None:
         data = button.evaluate(
             """
-el => {
+(btn) => {
   // Walk up to find the social-actions root container (_9eb33242 div)
   // This contains the full post: author, content, and action bar
-  let el = el.parentElement;
   let container = null;
+  let el = btn.parentElement;
   for (let level = 0; level < 16 && el; level++, el = el.parentElement) {
     const cls = (el.className || '');
     // The _9eb33242 class is the social actions observer root
