@@ -28,7 +28,7 @@ COMMENT_EDITOR_RELATIVE_XPATH = (
 COMMENT_SUBMIT_RELATIVE_XPATH = (
     "xpath=ancestor::*[.//div[@role='textbox' and "
     "@aria-label='Text editor for creating comment']][1]"
-    "//button[normalize-space()='Comment']"
+    "//button[contains(translate(normalize-space(), 'Pc', 'pc'), 'ost') or contains(translate(normalize-space(), 'Pc', 'pc'), 'omment')]"
 )
 COMMENT_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "feed_comment_history.json"
