@@ -278,22 +278,21 @@ class FeedCommentTask(BaseTask):
         return editor
 
     def _get_post_submit_button(self, button):
-        # After typing in the editor, the submit button appears near it.
-        # Try multiple selectors for different LinkedIn UI versions.
-        # Prefer the button near the editor (last visible one with relevant text).
-        for selector in [
-            "button[type='submit']",
-            "button:has-text('Post')",
-            "button:has-text('Comment')",
-        ]:
-            locator = self.page.locator(selector)
-            try:
-                count = locator.count()
-                if count > 0:
-                    return locator.last
-            except Exception:
-                continue
-        return self.page.locator("button:has-text('Post')").last
+        # After clicking Comment, the editor and submit button appear in the
+        # same section. Find the Post button within the editor's parent chain.
+        editor = self.page.locator(COMMENT_EDITOR_SELECTOR).first
+        xpath = (
+            "xpath=ancestor::*[.//button[@type='submit' and not(@disabled)]][1]"
+            "//button[@type='submit' and not(@disabled)]"
+        )
+        submit = editor.locator(xpath)
+        try:
+            if submit.count() > 0:
+                return submit.first
+        except Exception:
+            pass
+        # Fallback
+        return self.page.locator("button:has-text('Post'):not([disabled])").last
 
     def _clean_post_lines(self, raw_text: str) -> list[str]:
         cleaned_lines: list[str] = []
