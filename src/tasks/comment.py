@@ -370,10 +370,20 @@ class FeedCommentTask(BaseTask):
         self.human.type(editor, comment_text)
         self.human.random_sleep(0.8, 1.6)
 
-        submit_button = self._get_post_submit_button(button)
-        submit_button.wait_for(state="visible", timeout=10000)
-        self.human.click(submit_button)
+        # Try Ctrl+Enter first (LinkedIn rich text editor submits on Ctrl+Enter)
+        self.page.keyboard.press("Control+Enter")
         self.human.random_sleep(2.5, 4.5)
+
+        # Fallback: try the submit button if Ctrl+Enter didn't work
+        try:
+            submit_button = self._get_post_submit_button(button)
+            if submit_button.count() > 0:
+                submit_button.wait_for(state="visible", timeout=5000)
+                self.human.click(submit_button)
+                self.human.random_sleep(2.5, 4.5)
+        except Exception:
+            # Ctrl+Enter should have worked
+            pass
 
     def _scroll_feed(self):
         distance = random.randint(900, 1500)
