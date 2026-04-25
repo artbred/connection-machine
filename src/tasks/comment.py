@@ -194,37 +194,36 @@ class FeedCommentTask(BaseTask):
         data = button.evaluate(
             """
 el => {
-  let container = el;
-  for (let i = 0; i < 12 && container; i++, container = container.parentElement) {
-    const buttonTexts = Array.from(container.querySelectorAll('button'))
-      .map(btn => (btn.innerText || '').trim())
-      .filter(Boolean);
-    const hasActionRow =
-      buttonTexts.includes('Comment') &&
-      (
-        buttonTexts.includes('Repost') ||
-        buttonTexts.includes('Send') ||
-        buttonTexts.includes('Share')
-      ) &&
-      (buttonTexts.includes('Like') || buttonTexts.some(text => text.startsWith('Like')));
-    const rawText = (container.innerText || '').trim();
-    if (hasActionRow && rawText.length > 60) {
-      const links = Array.from(container.querySelectorAll('a[href]'))
-        .map(link => link.href)
-        .filter(Boolean);
-      const postHref = links.find(
-        href =>
-          href.includes('/feed/update/') ||
-          href.includes('/posts/') ||
-          href.includes('/activity-')
-      ) || null;
-      return {
-        rawText,
-        postHref,
-      };
+  // Walk up to find the social-actions root container (_9eb33242 div)
+  // This contains the full post: author, content, and action bar
+  let el = el.parentElement;
+  let container = null;
+  for (let level = 0; level < 16 && el; level++, el = el.parentElement) {
+    const cls = (el.className || '');
+    // The _9eb33242 class is the social actions observer root
+    if (cls === '_9eb33242' && (el.textContent || '').trim().length > 200) {
+      container = el;
+      break;
     }
   }
-  return null;
+
+  if (!container) return null;
+
+  const rawText = (container.textContent || '').trim();
+  if (rawText.length < 80) return null;
+
+  // Find post href - look for feed/update or activity links
+  const links = Array.from(container.querySelectorAll('a[href]'))
+    .map(a => a.href)
+    .filter(Boolean);
+  const postHref = links.find(
+    href =>
+      href.includes('/feed/update/') ||
+      href.includes('/posts/') ||
+      href.includes('/activity-')
+  ) || null;
+
+  return { rawText, postHref };
 }
 """
         )
