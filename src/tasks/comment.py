@@ -212,7 +212,8 @@ class FeedCommentTask(BaseTask):
   const rawText = (container.textContent || '').trim();
   if (rawText.length < 80) return null;
 
-  // Find post href - look for feed/update or activity links
+  // Find post href - look for feed/update, activity, or permalink links
+  // LinkedIn may use different URL patterns depending on the feed version
   const links = Array.from(container.querySelectorAll('a[href]'))
     .map(a => a.href)
     .filter(Boolean);
@@ -220,7 +221,9 @@ class FeedCommentTask(BaseTask):
     href =>
       href.includes('/feed/update/') ||
       href.includes('/posts/') ||
-      href.includes('/activity-')
+      href.includes('/activity-') ||
+      href.includes('/feed/view/') ||
+      (href.includes('linkedin.com') && href.includes('/feed/'))
   ) || null;
 
   return { rawText, postHref };
