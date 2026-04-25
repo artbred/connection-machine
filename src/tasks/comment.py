@@ -268,7 +268,9 @@ class FeedCommentTask(BaseTask):
         return None
 
     def _get_post_editor(self, button):
-        return button.locator(COMMENT_EDITOR_RELATIVE_XPATH).first
+        # In the new LinkedIn UI, the editor appears as a sibling/cousin of the
+        # Comment button, not inside its parent chain. Use a page-level selector.
+        return self.page.locator(COMMENT_EDITOR_SELECTOR).first
 
     def _wait_for_post_editor(self, button, timeout: int = 5000):
         editor = self._get_post_editor(button)
@@ -276,7 +278,22 @@ class FeedCommentTask(BaseTask):
         return editor
 
     def _get_post_submit_button(self, button):
-        return button.locator(COMMENT_SUBMIT_RELATIVE_XPATH).last
+        # After typing in the editor, the submit button appears near it.
+        # Try multiple selectors for different LinkedIn UI versions.
+        # Prefer the button near the editor (last visible one with relevant text).
+        for selector in [
+            "button[type='submit']",
+            "button:has-text('Post')",
+            "button:has-text('Comment')",
+        ]:
+            locator = self.page.locator(selector)
+            try:
+                count = locator.count()
+                if count > 0:
+                    return locator.last
+            except Exception:
+                continue
+        return self.page.locator("button:has-text('Post')").last
 
     def _clean_post_lines(self, raw_text: str) -> list[str]:
         cleaned_lines: list[str] = []
