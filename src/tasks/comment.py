@@ -58,6 +58,10 @@ GENERIC_LINES = {
 }
 
 ACTION_ROW_PATTERN = re.compile(r"^(like|comment|repost|send|reply)$", re.IGNORECASE)
+INTERACTION_PATTERN = re.compile(
+    r"(?:commented|likes|celebrates|finds this|reposted|shared)\s+(?:on\s+)?this",
+    re.IGNORECASE,
+)
 METRIC_LINE_PATTERN = re.compile(
     r"^(?:\d[\d,\.]*\s+)+(?:reactions?|comments?|reposts?|followers?|follows?)\b",
     re.IGNORECASE,
@@ -329,6 +333,8 @@ class FeedCommentTask(BaseTask):
             normalized = line.lower()
             if normalized in GENERIC_LINES:
                 continue
+            if INTERACTION_PATTERN.search(line):
+                continue
             if ACTION_ROW_PATTERN.match(line):
                 continue
             if METRIC_LINE_PATTERN.match(line):
@@ -349,10 +355,16 @@ class FeedCommentTask(BaseTask):
             normalized = line.lower()
             if normalized in GENERIC_LINES:
                 continue
+            if INTERACTION_PATTERN.search(line):
+                continue
             if TIMESTAMP_LINE_PATTERN.match(line):
                 continue
             if METRIC_LINE_PATTERN.match(line):
                 continue
+            # Take the name part before the first bullet separator
+            for sep in [" • ", " · ", " | "]:
+                if sep in line:
+                    return line.split(sep)[0].strip()[:120]
             return line[:120]
         return None
 
