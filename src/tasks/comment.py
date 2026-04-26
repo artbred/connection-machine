@@ -100,6 +100,11 @@ class FeedCommentTask(BaseTask):
             return candidate
 
         self._post_comment(candidate)
+        # Try to extract a proper shareable link if current one is missing
+        if not candidate.get("post_href"):
+            share_link = self._extract_shareable_post_link(candidate)
+            if share_link:
+                candidate["post_href"] = share_link
         self._mark_post_commented(candidate)
         send_notification(
             self._build_notification_message(
@@ -212,19 +217,36 @@ class FeedCommentTask(BaseTask):
   const rawText = (container.textContent || '').trim();
   if (rawText.length < 80) return null;
 
-  // Find post href - look for feed/update, activity, or permalink links
-  // LinkedIn may use different URL patterns depending on the feed version
-  const links = Array.from(container.querySelectorAll('a[href]'))
+  // Find post href - prioritize timestamp link (has <time> child)
+  // then fall back to feed/update/activity patterns
+  let postHref = null;
+  const allLinks = Array.from(container.querySelectorAll('a[href]'))
     .map(a => a.href)
     .filter(Boolean);
-  const postHref = links.find(
-    href =>
-      href.includes('/feed/update/') ||
-      href.includes('/posts/') ||
-      href.includes('/activity-') ||
-      href.includes('/feed/view/') ||
-      (href.includes('linkedin.com') && href.includes('/feed/'))
-  ) || null;
+
+  // Try 1: timestamp link is the most reliable permalink
+  const timeAnchors = container.querySelectorAll('a:has(time)');
+  for (const a of timeAnchors) {
+    const h = a.href;
+    if (h && (h.includes('/feed/update/') || h.includes('/activity-') || h.includes('/posts/') || h.includes('/ugcPost'))) {
+      postHref = h;
+      break;
+    }
+  }
+
+  // Try 2: feed/update, activity, ugcPost patterns
+  if (!postHref) {
+    postHref = allLinks.find(h =>
+      h.includes('/feed/update/') || h.includes('/activity-') || h.includes('/ugcPost')
+    ) || null;
+  }
+
+  // Try 3: posts/ or feed/view patterns
+  if (!postHref) {
+    postHref = allLinks.find(h =>
+      h.includes('/posts/') || h.includes('/feed/view/') || (h.includes('linkedin.com') && h.includes('/feed/'))
+    ) || null;
+  }
 
   return { rawText, postHref };
 }
@@ -492,6 +514,68 @@ class FeedCommentTask(BaseTask):
             encoding="utf-8",
         )
 
+
+
+    def _extract_shareable_post_link(self, candidate: dict[str, Any]) -> str | None:
+        """Try to extract a proper shareable LinkedIn post link via the share button."""
+        button = self._find_button_for_post_key(candidate["post_key"])
+        if not button:
+            logger.info("Could not re-find comment button for share link extraction")
+            return None
+
+        try:
+            share_btn = button.page().locator("button:has-text('Share'), button:has-text('Repost')").first
+            if share_btn.is_visible(timeout=2000):
+                share_btn.scroll_into_view_if_needed()
+                self.human.random_sleep(0.5, 1.0)
+                share_btn.click(timeout=3000)
+                self.human.random_sleep(0.5, 1.0)
+
+                # Look for a copy-link input or shareable URL in the dialog
+                share_input = button.page().locator(
+                    "input[readonly], input[aria-label*='link' i], input[aria-label*='URL' i], "
+                    "input[aria-label*='url' i]"
+                ).first
+                if share_input.is_visible(timeout=3000):
+                    link = share_input.input_value(timeout=2000)
+                    if link and (link.startswith("http://") or link.startswith("https://")):
+                        logger.info("Extracted shareable link: %s", link)
+                        self._dismiss_share_dialog(button)
+                        return link
+
+                # Alternative: click "Copy link to post" text
+                copy_link = button.page().locator(
+                    "text=Copy link, text=Copy link to post, text=Copy, "
+                    "[data-testid*='copy-link'], [aria-label*='copy' i]"
+                ).first
+                if copy_link.is_visible(timeout=2000):
+                    copy_link.click(timeout=2000)
+                    self.human.random_sleep(0.5, 1.0)
+
+                self._dismiss_share_dialog(button)
+        except Exception as exc:
+            logger.warning("Failed to extract shareable post link: %s", exc)
+            try:
+                self._dismiss_share_dialog(button)
+            except Exception:
+                pass
+
+        return None
+
+    def _dismiss_share_dialog(self, button) -> None:
+        """Close any open share dialog."""
+        for close_sel in [
+            "button[aria-label='Dismiss']",
+            "button[aria-label='Close']",
+            ".artdeco-modal__dismiss",
+        ]:
+            try:
+                cb = button.page().locator(close_sel).first
+                if cb.is_visible(timeout=500):
+                    cb.click(timeout=1000)
+            except Exception:
+                pass
+
     def _build_notification_message(
         self,
         candidate: dict[str, Any],
@@ -499,14 +583,22 @@ class FeedCommentTask(BaseTask):
     ) -> str:
         status = "Dry Run Feed Comment" if dry_run else "Feed Comment Sent"
         author = html.escape(candidate.get("author") or "Unknown author")
-        comment = html.escape(candidate["comment"])
+        comment_str = html.escape(candidate["comment"])
         post_href = candidate.get("post_href")
+
+        # Post content summary (first 250 chars)
+        post_content = candidate.get("post_content", "")
+        post_summary = html.escape(post_content[:250])
+        if len(post_content) > 250:
+            post_summary += "..."
 
         lines = [f"<b>{status}</b>", f"Author: {author}"]
         if post_href:
             escaped_href = html.escape(post_href, quote=True)
-            lines.append(f'Post: <a href="{escaped_href}">Open post</a>')
+            lines.append(f"Link: <a href='{escaped_href}'>Open post</a>")
         else:
-            lines.append("Post: unavailable")
-        lines.append(f'Comment: "{comment}"')
+            lines.append("Post: No link available")
+        if post_summary:
+            lines.append(f"Post summary: {post_summary}")
+        lines.append(f'Comment: "{comment_str}"')
         return "\n".join(lines)
