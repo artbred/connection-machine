@@ -203,16 +203,25 @@ class FeedCommentTask(BaseTask):
         data = button.evaluate(
             """
 (btn) => {
-  // Walk up to find the social-actions root container (_9eb33242 div)
-  // This contains the full post: author, content, and action bar
+  // Walk up the DOM tree to find the post container.
+  // We look for an ancestor that:
+  // 1. Contains the button itself (so we know it's the right scope)
+  // 2. Has substantial text content (>200 chars) — the post body
+  // 3. Is not the entire document body
+  // We do NOT rely on any specific LinkedIn class names.
   let container = null;
   let el = btn.parentElement;
-  for (let level = 0; level < 16 && el; level++, el = el.parentElement) {
-    const cls = (el.className || '');
-    // The _9eb33242 class is the social actions observer root
-    if (cls === '_9eb33242' && (el.textContent || '').trim().length > 200) {
-      container = el;
-      break;
+  for (let level = 0; level < 20 && el; level++, el = el.parentElement) {
+    if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+    const textLen = (el.textContent || '').trim().length;
+    // The post container should have substantial text (post + actions)
+    // but not be too huge (which would mean we went too far up)
+    if (textLen > 200 && textLen < 15000) {
+      // Verify this container actually contains the button
+      if (el.contains(btn)) {
+        container = el;
+        break;
+      }
     }
   }
 
