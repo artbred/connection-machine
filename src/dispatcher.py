@@ -65,6 +65,15 @@ def build_cooldown_notification(
             f"Resume after: {until_text}"
         )
 
+    if task_type == TaskType.COMMENT_FEED_POST and reason == "no_safe_commentable_posts":
+        until_text = next_allowed.strftime("%Y-%m-%d %H:%M UTC")
+        return (
+            "<b>Feed comment temporarily blocked</b>\n"
+            "Reason: No safe commentable posts found in feed\n"
+            "Cooldown: 30 minutes\n"
+            f"Resume after: {until_text}"
+        )
+
     return None
 
 
