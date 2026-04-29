@@ -34,7 +34,7 @@ COMMENT_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "feed_comment_history.json"
 )
 
-MAX_SCROLL_ATTEMPTS = 4
+MAX_SCROLL_ATTEMPTS = 6
 MAX_CANDIDATES_PER_RUN = 15
 MAX_POST_CONTENT_LENGTH = 3000
 COMMENT_HISTORY_RETENTION_DAYS = 30
@@ -132,6 +132,9 @@ class FeedCommentTask(BaseTask):
         self.human.random_sleep(4.0, 7.0)
         self.human.random_hover()
 
+        # Ensure we're on the main feed, not a single-post view
+        self._ensure_main_feed(feed_url)
+        
         for scroll_attempt in range(MAX_SCROLL_ATTEMPTS + 1):
             buttons = self.page.locator(COMMENT_BUTTON_SELECTOR)
             count = buttons.count()
@@ -202,6 +205,16 @@ class FeedCommentTask(BaseTask):
 
             if scroll_attempt == MAX_SCROLL_ATTEMPTS:
                 break
+
+            # If we've scrolled multiple times and only keep finding the same
+            # already-commented post, try refreshing the feed to load new content
+            if scroll_attempt >= 2 and inspected_count == 0 and len(inspected_keys) > 0:
+                logger.info("Feed seems stuck on same post(s), refreshing page")
+                self.page.goto(feed_url, timeout=60000, wait_until="domcontentloaded")
+                self.page.wait_for_selector("main", timeout=15000)
+                self.human.random_sleep(4.0, 7.0)
+                self._ensure_main_feed(feed_url)
+                continue
 
             self._scroll_feed()
 
@@ -450,10 +463,74 @@ class FeedCommentTask(BaseTask):
             # Ctrl+Enter should have worked
             pass
 
+    def _ensure_main_feed(self, feed_url: str):
+        """Ensure we're viewing the main feed, not a single-post detail view."""
+        # Check if URL indicates we're on a specific post rather than the feed
+        current_url = self.page.url
+        if "/feed/update/" in current_url or "/posts/" in current_url or "/activity-" in current_url:
+            logger.info("Detected single-post view at %s, navigating to main feed", current_url)
+            self.page.goto(feed_url, timeout=60000, wait_until="domcontentloaded")
+            self.page.wait_for_selector("main", timeout=15000)
+            self.human.random_sleep(4.0, 7.0)
+            return
+        
+        # Also check if we see a "Back to feed" or similar button
+        try:
+            back_button = self.page.locator("button:has-text('Back to feed'), a:has-text('Back to feed'), [aria-label*='Back to feed']").first
+            if back_button.is_visible(timeout=2000):
+                logger.info("Clicking 'Back to feed' button")
+                back_button.click()
+                self.human.random_sleep(3.0, 5.0)
+                return
+        except Exception:
+            pass
+        
+        # Try clicking the LinkedIn logo or Home nav to ensure fresh feed
+        try:
+            home_link = self.page.locator("a[href='/feed/'], nav a:has-text('Home'), [aria-label='Home']").first
+            if home_link.is_visible(timeout=2000):
+                logger.info("Clicking Home link to ensure fresh feed")
+                home_link.click()
+                self.human.random_sleep(3.0, 5.0)
+                self.page.wait_for_selector("main", timeout=15000)
+                return
+        except Exception:
+            pass
+
     def _scroll_feed(self):
-        distance = random.randint(900, 1500)
+        # LinkedIn feed may use window scroll or an inner scrollable container.
+        # Try both approaches to ensure new posts load.
+        distance = random.randint(1200, 2000)
+        
+        # First try scrolling the window
         self.page.evaluate("(delta) => window.scrollBy(0, delta)", distance)
         self.human.random_sleep(2.0, 4.0)
+        
+        # Also try scrolling the main feed container if it exists
+        self.page.evaluate("""
+            (delta) => {
+                const feed = document.querySelector('main.scaffold-layout__main') ||
+                             document.querySelector('[data-test-id="feed-activity"]').closest('[class*="feed"], [class*="scaffold"], main, section') ||
+                             document.querySelector('main') ||
+                             document.body;
+                if (feed && feed.scrollHeight > feed.clientHeight) {
+                    feed.scrollBy(0, delta);
+                }
+            }
+        """, distance)
+        
+        # Wait for LinkedIn to load more content
+        self.human.random_sleep(3.0, 5.0)
+        
+        # Check if loading indicator is present and wait for it to disappear
+        try:
+            loading = self.page.locator(".loading, [class*='loading'], [class*='spinner'], [aria-label*='loading']").first
+            if loading.is_visible(timeout=2000):
+                loading.wait_for(state="hidden", timeout=10000)
+        except Exception:
+            pass
+        
+        self.human.random_sleep(1.0, 2.0)
 
     def _load_comment_history(self) -> dict[str, Any]:
         if not COMMENT_HISTORY_PATH.exists():
