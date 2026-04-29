@@ -156,7 +156,15 @@ class FeedCommentTask(BaseTask):
 
                 candidate = self._extract_candidate(button)
                 if not candidate:
+                    logger.debug("No candidate extracted for button %s", index)
                     continue
+
+                logger.debug(
+                    "Candidate extracted: author=%s content_len=%s post_key=%s",
+                    candidate.get("author"),
+                    len(candidate.get("post_content", "")),
+                    candidate["post_key"],
+                )
 
                 post_key = candidate["post_key"]
                 if post_key in inspected_keys:
@@ -204,20 +212,31 @@ class FeedCommentTask(BaseTask):
             """
 (btn) => {
   // Walk up the DOM tree to find the post container.
-  // We look for an ancestor that:
-  // 1. Contains the button itself (so we know it's the right scope)
-  // 2. Has substantial text content (>200 chars) — the post body
-  // 3. Is not the entire document body
-  // We do NOT rely on any specific LinkedIn class names.
+  // LinkedIn feed posts are typically wrapped in <article> or <div> with
+  // specific data-test-id or data-id attributes. We look for:
+  // 1. An ancestor with data-test-id="feed-activity" or data-id containing "activity"
+  // 2. OR an ancestor with substantial text (200-15000 chars)
+  // 3. Must contain the button
   let container = null;
   let el = btn.parentElement;
-  for (let level = 0; level < 20 && el; level++, el = el.parentElement) {
+  for (let level = 0; level < 25 && el; level++, el = el.parentElement) {
     if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
+    
+    // Prefer LinkedIn's feed post containers by data attributes
+    const dataTestId = el.getAttribute('data-test-id') || '';
+    const dataId = el.getAttribute('data-id') || '';
+    const dataUrn = el.getAttribute('data-urn') || '';
+    if (dataTestId.includes('feed-activity') || 
+        dataId.includes('activity') || 
+        dataUrn.includes('activity') ||
+        dataUrn.includes('urn:li:activity')) {
+      container = el;
+      break;
+    }
+    
+    // Fallback: structural heuristic
     const textLen = (el.textContent || '').trim().length;
-    // The post container should have substantial text (post + actions)
-    // but not be too huge (which would mean we went too far up)
     if (textLen > 200 && textLen < 15000) {
-      // Verify this container actually contains the button
       if (el.contains(btn)) {
         container = el;
         break;
