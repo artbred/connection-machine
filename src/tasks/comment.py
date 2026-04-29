@@ -18,7 +18,7 @@ from notifications import send_notification
 logger = logging.getLogger(__name__)
 
 FEED_URL = "https://www.linkedin.com/feed/"
-COMMENT_BUTTON_SELECTOR = "button:has-text('Comment')"
+COMMENT_BUTTON_SELECTOR = "button:has-text('Comment'), button:has-text('Add a comment'), button[aria-label*='comment' i], button[aria-label*='reply' i]"
 COMMENT_EDITOR_SELECTOR = "div[role='textbox'][aria-label='Text editor for creating comment']"
 COMMENT_EDITOR_RELATIVE_XPATH = (
     "xpath=ancestor::*[.//div[@role='textbox' and "
@@ -135,6 +135,9 @@ class FeedCommentTask(BaseTask):
         # Ensure we're on the main feed, not a single-post view
         self._ensure_main_feed(feed_url)
         
+        # Debug: log page structure
+        self._log_feed_debug()
+        
         for scroll_attempt in range(MAX_SCROLL_ATTEMPTS + 1):
             buttons = self.page.locator(COMMENT_BUTTON_SELECTOR)
             count = buttons.count()
@@ -214,9 +217,11 @@ class FeedCommentTask(BaseTask):
                 self.page.wait_for_selector("main", timeout=15000)
                 self.human.random_sleep(4.0, 7.0)
                 self._ensure_main_feed(feed_url)
+                self._log_feed_debug()
                 continue
 
             self._scroll_feed()
+            self._log_feed_debug()
 
         return None, None
 
@@ -496,6 +501,51 @@ class FeedCommentTask(BaseTask):
                 return
         except Exception:
             pass
+
+    def _log_feed_debug(self):
+        """Log debug info about the current feed page structure."""
+        try:
+            debug_info = self.page.evaluate("""
+                () => {
+                    const articles = document.querySelectorAll('article');
+                    const feedItems = document.querySelectorAll('[data-test-id="feed-activity"], [data-id*="activity"], [class*="feed-shared"], [class*="update-v2"]');
+                    const allButtons = Array.from(document.querySelectorAll('button'));
+                    const commentButtons = allButtons.filter(b => {
+                        const text = (b.textContent || '').trim().toLowerCase();
+                        return text.includes('comment') || text.includes('reply') || b.getAttribute('aria-label')?.toLowerCase().includes('comment');
+                    });
+                    const visibleCommentButtons = commentButtons.filter(b => {
+                        const rect = b.getBoundingClientRect();
+                        return rect.width > 0 && rect.height > 0 && rect.top >= 0 && rect.top <= window.innerHeight;
+                    });
+                    return {
+                        url: window.location.href,
+                        articleCount: articles.length,
+                        feedItemCount: feedItems.length,
+                        totalButtonCount: allButtons.length,
+                        commentButtonCount: commentButtons.length,
+                        visibleCommentButtonCount: visibleCommentButtons.length,
+                        commentButtonTexts: visibleCommentButtons.slice(0, 5).map(b => (b.textContent || '').trim().substring(0, 50)),
+                        pageHeight: document.body.scrollHeight,
+                        viewportHeight: window.innerHeight,
+                        scrollY: window.scrollY,
+                    };
+                }
+            """)
+            logger.info("Feed debug: url=%s articles=%s feedItems=%s totalButtons=%s commentButtons=%s visibleCommentButtons=%s pageHeight=%s viewport=%s scrollY=%s buttonTexts=%s",
+                debug_info.get('url'),
+                debug_info.get('articleCount'),
+                debug_info.get('feedItemCount'),
+                debug_info.get('totalButtonCount'),
+                debug_info.get('commentButtonCount'),
+                debug_info.get('visibleCommentButtonCount'),
+                debug_info.get('pageHeight'),
+                debug_info.get('viewportHeight'),
+                debug_info.get('scrollY'),
+                debug_info.get('commentButtonTexts'),
+            )
+        except Exception as exc:
+            logger.warning("Feed debug failed: %s", exc)
 
     def _scroll_feed(self):
         # LinkedIn feed may use window scroll or an inner scrollable container.
