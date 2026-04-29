@@ -509,10 +509,19 @@ class FeedCommentTask(BaseTask):
         # Also try scrolling the main feed container if it exists
         self.page.evaluate("""
             (delta) => {
-                const feed = document.querySelector('main.scaffold-layout__main') ||
-                             document.querySelector('[data-test-id="feed-activity"]').closest('[class*="feed"], [class*="scaffold"], main, section') ||
-                             document.querySelector('main') ||
-                             document.body;
+                let feed = document.querySelector('main.scaffold-layout__main');
+                if (!feed) {
+                    const el = document.querySelector('[data-test-id="feed-activity"]');
+                    if (el) {
+                        feed = el.closest('[class*="feed"], [class*="scaffold"], main, section');
+                    }
+                }
+                if (!feed) {
+                    feed = document.querySelector('main');
+                }
+                if (!feed) {
+                    feed = document.body;
+                }
                 if (feed && feed.scrollHeight > feed.clientHeight) {
                     feed.scrollBy(0, delta);
                 }
