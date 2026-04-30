@@ -44,6 +44,7 @@ GENERIC_LINES = {
     "feed post",
     "suggested",
     "follow",
+    "following",
     "promoted",
     "like",
     "comment",
@@ -55,6 +56,8 @@ GENERIC_LINES = {
     "video",
     "photo",
     "write article",
+    "premium profile",
+    "reposted this",
 }
 
 ACTION_ROW_PATTERN = re.compile(r"^(like|comment|repost|send|reply)$", re.IGNORECASE)
@@ -407,11 +410,22 @@ class FeedCommentTask(BaseTask):
                 continue
             if METRIC_LINE_PATTERN.match(line):
                 continue
+
+            # Strip common LinkedIn UI prefixes from the author line
+            cleaned = line
+            for prefix in ["Feed post", "Suggested", "Premium Profile", "Following", "Reposted this"]:
+                if cleaned.startswith(prefix):
+                    cleaned = cleaned[len(prefix):].strip()
+
+            # Strip degree badges (1st, 2nd, 3rd+) from the name
+            cleaned = re.sub(r"^(.*?)(?:\s+•\s+|\s+\d+(?:st|nd|rd|th)\+?\s+)", r"\1", cleaned)
+            cleaned = re.sub(r"\s+\d+(?:st|nd|rd|th)\+?$", "", cleaned)
+
             # Take the name part before the first bullet separator
             for sep in [" • ", " · ", " | "]:
-                if sep in line:
-                    return line.split(sep)[0].strip()[:120]
-            return line[:120]
+                if sep in cleaned:
+                    return cleaned.split(sep)[0].strip()[:120]
+            return cleaned.strip()[:120]
         return None
 
     def _get_skip_reason(
@@ -762,10 +776,29 @@ class FeedCommentTask(BaseTask):
         comment_str = html.escape(candidate["comment"])
         post_href = candidate.get("post_href")
 
-        # Post content summary (first 250 chars)
+        # Post content summary: skip the author line, take next meaningful lines
         post_content = candidate.get("post_content", "")
-        post_summary = html.escape(post_content[:250])
-        if len(post_content) > 250:
+        content_lines = post_content.splitlines()
+        # Skip first line if it looks like the author/header line
+        summary_lines = []
+        for line in content_lines[1:]:
+            normalized = line.lower().strip()
+            if normalized in GENERIC_LINES:
+                continue
+            if INTERACTION_PATTERN.search(line):
+                continue
+            if TIMESTAMP_LINE_PATTERN.match(line):
+                continue
+            if METRIC_LINE_PATTERN.match(line):
+                continue
+            if not normalized:
+                continue
+            summary_lines.append(line)
+            if len("\n".join(summary_lines)) >= 250:
+                break
+
+        post_summary = html.escape("\n".join(summary_lines)[:250])
+        if len("\n".join(summary_lines)) > 250:
             post_summary += "..."
 
         lines = [f"<b>{status}</b>", f"Author: {author}"]
