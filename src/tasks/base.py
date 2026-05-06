@@ -1,5 +1,7 @@
 from abc import ABC, abstractmethod
 import logging
+from typing import Any
+
 from playwright.sync_api import Page
 from human_actions import HumanActions
 from exceptions import SessionExpiredException
@@ -13,7 +15,7 @@ class BaseTask(ABC):
         self.human = HumanActions(page)
 
     @abstractmethod
-    def run(self, payload: dict):
+    def run(self, payload: dict) -> Any:
         """
         Execute the task with the given payload.
         """
@@ -39,6 +41,8 @@ class BaseTask(ABC):
             raise SessionExpiredException("Session expired message detected")
 
         # Check for sign-in button on page (indicates logged out)
-        signin_buttons = self.page.locator("a[href*='/login'], a[data-tracking-control-name='auth_wall_']")
+        signin_buttons = self.page.locator(
+            "a[href*='/login'], a[data-tracking-control-name='auth_wall_']"
+        )
         if signin_buttons.count() > 0 and self.page.locator("nav").count() == 0:
             raise SessionExpiredException("Sign-in prompts detected without navigation")
