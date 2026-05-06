@@ -10,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 MAX_DOM_LENGTH = 50000
 
-MAX_MESSAGE_LENGTH = 300
+MAX_MESSAGE_LENGTH = 200
 MAX_COMMENT_LENGTH = 180
 MAX_REFINEMENT_ATTEMPTS = 3
 
@@ -106,9 +106,10 @@ Post content:
 {post_content}
 """
 
+
 def _clean_llm_output(text: str) -> str:
     """Strip thinking tags, wrapping quotes, and extra whitespace from LLM output."""
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL).strip()
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
     # Strip wrapping quotes
     if len(text) >= 2 and text[0] == text[-1] and text[0] in ('"', "'"):
         text = text[1:-1].strip()
@@ -122,13 +123,13 @@ def _refine_text_length(
     content_label: str,
 ) -> str | None:
     url = "https://openrouter.ai/api/v1/chat/completions"
-    
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "X-Title": "LinkedIn Auto-Connector",
     }
-    
+
     payload = {
         "model": "google/gemini-3-flash-preview",
         "messages": [
@@ -144,21 +145,21 @@ def _refine_text_length(
         ],
         "temperature": 0.3,
     }
-    
+
     try:
         response = httpx.post(url, headers=headers, json=payload, timeout=30)
         response.raise_for_status()
-        
+
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
             return _clean_llm_output(data["choices"][0]["message"]["content"])
     except Exception as e:
         logger.error(f"Failed to refine message: {e}")
-    
+
     return None
 
 
-def generate_connection_message(profile_content: str) -> str:
+def generate_connection_message(profile_content: str) -> str | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping message generation.")
@@ -193,13 +194,15 @@ def generate_connection_message(profile_content: str) -> str:
         data = response.json()
         if "choices" in data and len(data["choices"]) > 0:
             message = _clean_llm_output(data["choices"][0]["message"]["content"])
-            
+
             if len(message) <= MAX_MESSAGE_LENGTH:
                 logger.info(f"Generated message ({len(message)} chars): {message}")
                 return message
-            
-            logger.info(f"Message too long ({len(message)} chars), attempting refinement...")
-            
+
+            logger.info(
+                f"Message too long ({len(message)} chars), attempting refinement..."
+            )
+
             for attempt in range(MAX_REFINEMENT_ATTEMPTS):
                 refined = _refine_text_length(
                     message,
@@ -208,18 +211,24 @@ def generate_connection_message(profile_content: str) -> str:
                     "message",
                 )
                 if refined and len(refined) <= MAX_MESSAGE_LENGTH:
-                    logger.info(f"Refinement succeeded on attempt {attempt + 1} ({len(refined)} chars)")
+                    logger.info(
+                        f"Refinement succeeded on attempt {attempt + 1} ({len(refined)} chars)"
+                    )
                     return refined
                 elif refined:
-                    logger.info(f"Refinement attempt {attempt + 1} still too long ({len(refined)} chars)")
+                    logger.info(
+                        f"Refinement attempt {attempt + 1} still too long ({len(refined)} chars)"
+                    )
                     message = refined
                 else:
                     logger.warning(f"Refinement attempt {attempt + 1} failed")
-            
-            logger.warning(f"All refinement attempts failed, truncating from {len(message)} to {MAX_MESSAGE_LENGTH} chars")
+
+            logger.warning(
+                f"All refinement attempts failed, truncating from {len(message)} to {MAX_MESSAGE_LENGTH} chars"
+            )
             truncated = message[:MAX_MESSAGE_LENGTH]
             if " " in truncated:
-                truncated = truncated[:truncated.rfind(" ")]
+                truncated = truncated[: truncated.rfind(" ")]
             return truncated.rstrip()
 
     except Exception as e:
@@ -264,22 +273,22 @@ def generate_feed_comment(post_content: str) -> dict | None:
                     "properties": {
                         "isProhibit": {
                             "type": "boolean",
-                            "description": "Whether the post should be prohibited from commenting."
+                            "description": "Whether the post should be prohibited from commenting.",
                         },
                         "reason": {
                             "type": "string",
-                            "description": "Short explanation for the decision."
+                            "description": "Short explanation for the decision.",
                         },
                         "comment": {
                             "type": ["string", "null"],
-                            "description": "Positive LinkedIn comment, or null when commenting is prohibited."
-                        }
+                            "description": "Positive LinkedIn comment, or null when commenting is prohibited.",
+                        },
                     },
                     "required": ["isProhibit", "reason", "comment"],
-                    "additionalProperties": False
-                }
-            }
-        }
+                    "additionalProperties": False,
+                },
+            },
+        },
     }
 
     try:
@@ -308,7 +317,7 @@ def generate_feed_comment(post_content: str) -> dict | None:
                 else:
                     truncated = comment[:MAX_COMMENT_LENGTH]
                     if " " in truncated:
-                        truncated = truncated[:truncated.rfind(" ")]
+                        truncated = truncated[: truncated.rfind(" ")]
                     comment = truncated.rstrip()
             decision["comment"] = comment
 
@@ -316,17 +325,24 @@ def generate_feed_comment(post_content: str) -> dict | None:
 
     except httpx.HTTPStatusError as e:
         if e.response.status_code == 401:
-            raise ValueError("OpenRouter rejected the feed comment request with 401 Unauthorized") from e
+            raise ValueError(
+                "OpenRouter rejected the feed comment request with 401 Unauthorized"
+            ) from e
         logger.error(f"Failed to generate feed comment: {e}")
     except Exception as e:
         logger.error(f"Failed to generate feed comment: {e}")
 
     return None
 
-def get_next_connect_action(screenshot_base64: str, raw_html: str, previous_feedback: str | None = None) -> dict | None:
+
+def get_next_connect_action(
+    screenshot_base64: str, raw_html: str, previous_feedback: str | None = None
+) -> dict | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
-        logger.warning("OPENROUTER_API_KEY is not set. Skipping connect action detection.")
+        logger.warning(
+            "OPENROUTER_API_KEY is not set. Skipping connect action detection."
+        )
         return None
 
     minified_html = minify_dom(raw_html, max_length=MAX_DOM_LENGTH)
@@ -354,13 +370,10 @@ def get_next_connect_action(screenshot_base64: str, raw_html: str, previous_feed
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:image/png;base64,{screenshot_base64}"
-                        }
+                        },
                     },
-                    {
-                        "type": "text",
-                        "text": prompt_text
-                    }
-                ]
+                    {"type": "text", "text": prompt_text},
+                ],
             }
         ],
         "temperature": 0,
@@ -374,22 +387,22 @@ def get_next_connect_action(screenshot_base64: str, raw_html: str, previous_feed
                     "properties": {
                         "selector": {
                             "type": ["string", "null"],
-                            "description": "CSS selector for button to click, or null if connection not possible"
+                            "description": "CSS selector for button to click, or null if connection not possible",
                         },
                         "expected_text": {
                             "type": ["string", "null"],
-                            "description": "Exact visible text of the target button (e.g., 'Connect', 'More'). Null if selector is null."
+                            "description": "Exact visible text of the target button (e.g., 'Connect', 'More'). Null if selector is null.",
                         },
                         "reason": {
                             "type": "string",
-                            "description": "Brief explanation (e.g., 'found Connect button', 'already connected')"
-                        }
+                            "description": "Brief explanation (e.g., 'found Connect button', 'already connected')",
+                        },
                     },
                     "required": ["selector", "expected_text", "reason"],
-                    "additionalProperties": False
-                }
-            }
-        }
+                    "additionalProperties": False,
+                },
+            },
+        },
     }
 
     try:
