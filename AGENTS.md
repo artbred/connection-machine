@@ -113,7 +113,6 @@ Optional but important:
 
 - `OPENROUTER_API_KEY`: enables AI-generated invite notes, connect-action detection, and autonomous feed comments
 - `HEADLESS`: browser visibility toggle. Defaults to `true`
-- `SOCKS_PROXY`: optional proxy passed through Chromium as `--proxy-server=...`
 - `TELEGRAM_NOTIFICATIONS_URL`: notification endpoint
 - `TELEGRAM_CHAT_ID`: notification target
 - `TELEGRAM_API_KEY`: bearer token for the notification endpoint

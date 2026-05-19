@@ -3,10 +3,8 @@ import json
 import logging
 import os
 import signal
-import socket
 import sys
 import threading
-import urllib.request
 
 from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
@@ -23,8 +21,6 @@ from tasks.comment import FeedCommentTask  # noqa: E402
 shutdown_event = threading.Event()
 
 # --- Configuration ---
-INTERNAL_DEBUG_PORT = int(os.getenv("CHROME_PORT", "9224"))
-SOCKS_PROXY = os.getenv("SOCKS_PROXY")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
 
@@ -74,13 +70,6 @@ def check_linkedin_auth(page):
         return False
 
 
-def get_free_port():
-    """Finds a free port on localhost to bind the bridge to."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
-
-
 def login(page):
     """Login to LinkedIn."""
     logger.info("Logging in to LinkedIn...")
@@ -125,20 +114,6 @@ def check_ip(page):
         logger.error(f"Error checking IP: {e}")
 
 
-def log_ws_endpoint():
-    """Fetch and log the DevTools WebSocket URL."""
-    try:
-        # Give the browser a moment to ensure the DevTools server is up
-        shutdown_event.wait(2)
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{INTERNAL_DEBUG_PORT}/json/version"
-        ) as response:
-            data = json.loads(response.read().decode())
-            logger.info(f"DevTools listening on {data['webSocketDebuggerUrl']}")
-    except Exception as e:
-        logger.error(f"Failed to get DevTools URL: {e}")
-
-
 def signal_handler(signum, frame):
     """Handle shutdown signals gracefully."""
     signal_name = signal.Signals(signum).name
@@ -172,10 +147,9 @@ def parse_args():
     return parser.parse_args()
 
 
-def launch_browser_context(playwright, user_data_dir: str, launch_args: list[str]):
+def launch_browser_context(playwright, user_data_dir: str):
     context_kwargs = {
         "headless": HEADLESS,
-        "args": launch_args,
         "viewport": {"height": 1080, "width": 1920},
     }
 
@@ -210,21 +184,11 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        launch_args = [
-            f"--remote-debugging-port={INTERNAL_DEBUG_PORT}",
-            "--remote-debugging-address=127.0.0.1",
-        ]
-
-        if SOCKS_PROXY and len(SOCKS_PROXY) > 0:
-            launch_args.append(f"--proxy-server={SOCKS_PROXY}")
-
-        logger.info(f"Launching browser with args: {launch_args}")
-
         user_data_dir = os.path.join(os.getcwd(), "data", "connection-machine-chrome")
         logger.info(f"Using user data dir: {user_data_dir}")
 
         with sync_playwright() as p:
-            context = launch_browser_context(p, user_data_dir, launch_args)
+            context = launch_browser_context(p, user_data_dir)
 
             page = context.new_page()
             check_ip(page)

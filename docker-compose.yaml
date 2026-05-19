@@ -6,7 +6,6 @@ services:
     env_file:
       - .env
     environment:
-      - CHROME_PORT=9225
       - METRICS_ENABLED=${METRICS_ENABLED:-true}
       - METRICS_HOST=${METRICS_HOST:-0.0.0.0}
       - METRICS_PORT=${METRICS_PORT:-9102}
