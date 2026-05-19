@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 MAX_CONNECT_ITERATIONS = 5
 INVITE_HISTORY_RETENTION_DAYS = 30
 WEEKLY_LIMIT_CONFIRMATION_WINDOW = timedelta(minutes=15)
+MAX_INVITE_MESSAGE_LENGTH = 200
 ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a note')"
 SEND_INVITATION_SELECTOR = (
     "button[aria-label*='Send invitation' i], "
@@ -587,18 +588,104 @@ class InviteTask(BaseTask):
             return False
 
     def _is_send_modal_open(self) -> bool:
-        selectors = [
-            "#custom-message",
-            SEND_INVITATION_SELECTOR,
-            ADD_NOTE_SELECTOR,
-        ]
+        try:
+            dialog = self.page.locator("div[role='dialog']:visible").first
+            if not dialog.is_visible(timeout=500):
+                return False
+        except Exception:
+            return False
+
+        selectors = ["#custom-message", SEND_INVITATION_SELECTOR, ADD_NOTE_SELECTOR]
         for selector in selectors:
             try:
-                if self.page.locator(selector).first.is_visible(timeout=500):
+                if dialog.locator(selector).first.is_visible(timeout=500):
                     return True
             except Exception:
                 continue
-        return False
+        return True
+
+    def _is_enabled_button(self, button: Any) -> bool:
+        try:
+            if not button.is_visible(timeout=500):
+                return False
+            if button.is_disabled(timeout=500):
+                return False
+            aria_disabled = (button.get_attribute("aria-disabled") or "").lower()
+            disabled_attr = button.get_attribute("disabled")
+            class_name = (button.get_attribute("class") or "").lower()
+            return (
+                aria_disabled != "true"
+                and disabled_attr is None
+                and "disabled" not in class_name
+            )
+        except Exception:
+            return False
+
+    def _get_send_invitation_button(self) -> Locator:
+        try:
+            dialog = self.page.locator("div[role='dialog']:visible").first
+            if dialog.is_visible(timeout=500):
+                buttons = dialog.locator("button")
+                fallback = None
+                for index in range(min(buttons.count(), 20)):
+                    button = buttons.nth(index)
+                    label = _locator_accessible_text(button).lower()
+                    is_send = (
+                        "send invitation" in label
+                        or "send without a note" in label
+                        or label == "send"
+                    )
+                    if not is_send:
+                        continue
+                    if self._is_enabled_button(button):
+                        return button
+                    if fallback is None:
+                        fallback = button
+
+                if fallback is not None:
+                    return fallback
+        except Exception as exc:
+            logger.debug("Could not resolve send button inside invite dialog: %s", exc)
+
+        return self.page.locator(SEND_INVITATION_SELECTOR).first
+
+    def _enter_connection_message(self, connection_message: str) -> None:
+        message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
+        custom_message = self.page.locator("#custom-message").first
+        self.human.type(custom_message, message)
+
+        for _ in range(3):
+            try:
+                entered_text = " ".join(custom_message.inner_text(timeout=1000).split())
+                expected_text = " ".join(message.split())
+                if expected_text in entered_text:
+                    return
+            except Exception:
+                pass
+            self.human.random_sleep(0.3, 0.6)
+
+        logger.warning(
+            "Human typing did not populate invite note; retrying with direct fill"
+        )
+        try:
+            custom_message.fill(message, timeout=3000)
+        except Exception:
+            custom_message.evaluate(
+                """
+(element, value) => {
+  element.focus();
+  element.textContent = value;
+  element.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+  element.dispatchEvent(new Event('change', {bubbles: true}));
+}
+""",
+                message,
+            )
+
+        entered_text = " ".join(custom_message.inner_text(timeout=1000).split())
+        expected_text = " ".join(message.split())
+        if expected_text not in entered_text:
+            raise TaskSkippedException("invite_not_confirmed")
 
     def _normalize_profile_url(self, url: str) -> str:
         parsed = urlparse(url)
@@ -785,6 +872,7 @@ class InviteTask(BaseTask):
             if len(profile_content) > 0:
                 connection_message = generate_connection_message(profile_content)
                 if connection_message:
+                    connection_message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
                     logger.info(f"Generated connection message: {connection_message}")
 
         if connection_message:
@@ -801,12 +889,16 @@ class InviteTask(BaseTask):
                 self.human.click(add_note)
 
             self.page.wait_for_selector("#custom-message", timeout=3000)
-            self.human.type("#custom-message", connection_message)
+            self._enter_connection_message(connection_message)
 
-        send_btn = self.page.locator(SEND_INVITATION_SELECTOR).first
+        send_btn = self._get_send_invitation_button()
         if not send_btn.is_visible(timeout=1000):
             raise TaskSkippedException("invite_not_confirmed")
-        if send_btn.is_disabled(timeout=1000):
+        if not self._is_enabled_button(send_btn):
+            logger.warning(
+                "Invite send button is disabled: %s",
+                _locator_accessible_text(send_btn),
+            )
             raise TaskSkippedException("invite_not_confirmed")
 
         feedback_before_send = self._collect_visible_feedback_texts()
@@ -834,18 +926,16 @@ class InviteTask(BaseTask):
             raise TaskSkippedException(error)
 
         success_toast_detected = self._check_invitation_success()
-        if self._is_send_modal_open() and not success_toast_detected:
-            logger.warning(
-                "Invite modal still open after send click; treating invite as unconfirmed"
-            )
-            raise TaskSkippedException("invite_not_confirmed")
-
         final_state = self._confirm_invitation_sent(url)
         confirmed_state = final_state
         if final_state not in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
             if success_toast_detected:
                 confirmed_state = ConnectionState.PENDING
             else:
+                if self._is_send_modal_open():
+                    logger.warning(
+                        "Invite modal still open after send click; treating invite as unconfirmed"
+                    )
                 logger.warning(
                     "Invite not confirmed after send. success_toast=%s final_state=%s",
                     success_toast_detected,

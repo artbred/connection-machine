@@ -20,13 +20,32 @@ from dispatcher import (  # noqa: E402
 )
 from tasks.invite import _format_invite_notification, classify_invitation_feedback  # noqa: E402
 from tasks.invite import classify_platform_invitation_feedback  # noqa: E402
+from tasks.invite import InviteTask  # noqa: E402
 from tasks.invite import _locator_matches_expected_text  # noqa: E402
 
 
 class FakeLocator:
-    def __init__(self, text: str = "", aria_label: str = ""):
+    def __init__(
+        self,
+        text: str = "",
+        aria_label: str = "",
+        aria_disabled: str = "",
+        class_name: str = "",
+        disabled: bool = False,
+        visible: bool = True,
+    ):
         self.text = text
         self.aria_label = aria_label
+        self.aria_disabled = aria_disabled
+        self.class_name = class_name
+        self.disabled = disabled
+        self.visible = visible
+
+    def is_visible(self, timeout: int = 500):
+        return self.visible
+
+    def is_disabled(self, timeout: int = 500):
+        return self.disabled
 
     def inner_text(self, timeout: int = 300):
         return self.text
@@ -34,6 +53,12 @@ class FakeLocator:
     def get_attribute(self, name: str):
         if name == "aria-label":
             return self.aria_label
+        if name == "aria-disabled":
+            return self.aria_disabled
+        if name == "class":
+            return self.class_name
+        if name == "disabled" and self.disabled:
+            return ""
         return None
 
 
@@ -211,6 +236,18 @@ class InviteFlowLogicTests(unittest.TestCase):
         locator = FakeLocator(text="", aria_label="Connect with Ada Lovelace")
 
         self.assertTrue(_locator_matches_expected_text(locator, "Connect"))
+
+    def test_invite_send_button_respects_aria_disabled(self):
+        task = InviteTask.__new__(InviteTask)
+        button = FakeLocator(text="Send", aria_disabled="true")
+
+        self.assertFalse(task._is_enabled_button(button))
+
+    def test_invite_send_button_respects_disabled_class(self):
+        task = InviteTask.__new__(InviteTask)
+        button = FakeLocator(text="Send", class_name="artdeco-button--disabled")
+
+        self.assertFalse(task._is_enabled_button(button))
 
 
 if __name__ == "__main__":
