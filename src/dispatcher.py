@@ -65,7 +65,10 @@ def build_cooldown_notification(
             f"Resume after: {until_text}"
         )
 
-    if task_type == TaskType.COMMENT_FEED_POST and reason == "no_safe_commentable_posts":
+    if (
+        task_type == TaskType.COMMENT_FEED_POST
+        and reason == "no_safe_commentable_posts"
+    ):
         until_text = next_allowed.strftime("%Y-%m-%d %H:%M UTC")
         return (
             "<b>Feed comment temporarily blocked</b>\n"
@@ -170,7 +173,9 @@ class TaskDispatcher:
     def _sync_invite_history_metrics(self):
         try:
             invite_handler = self.handlers.get(TaskType.SEND_INVITE)
-            if not invite_handler or not hasattr(invite_handler, "get_invite_history_entries"):
+            if not invite_handler or not hasattr(
+                invite_handler, "get_invite_history_entries"
+            ):
                 self.metrics.set_invite_history([])
                 self.metrics.set_invite_summary(0, 0)
                 return
@@ -313,15 +318,18 @@ class TaskDispatcher:
                             f"Restored spacing for {task_type}: ~{wait_min} min remaining"
                         )
 
-                cooldown_until = self._get_restored_cooldown(db, task_type)
-                if cooldown_until:
-                    restored_until = self.next_execution_at.get(task_type)
-                    if not restored_until or cooldown_until > restored_until:
-                        self.next_execution_at[task_type] = cooldown_until
-                        wait_min = remaining_minutes(cooldown_until - datetime.utcnow())
-                        logger.info(
-                            f"Restored cooldown for {task_type}: ~{wait_min} min remaining"
-                        )
+                if task_type != TaskType.SEND_INVITE:
+                    cooldown_until = self._get_restored_cooldown(db, task_type)
+                    if cooldown_until:
+                        restored_until = self.next_execution_at.get(task_type)
+                        if not restored_until or cooldown_until > restored_until:
+                            self.next_execution_at[task_type] = cooldown_until
+                            wait_min = remaining_minutes(
+                                cooldown_until - datetime.utcnow()
+                            )
+                            logger.info(
+                                f"Restored cooldown for {task_type}: ~{wait_min} min remaining"
+                            )
 
     def _init_autonomous_spacing(self):
         """Initialize spacing for non-DB autonomous actions from local history."""
@@ -437,9 +445,7 @@ class TaskDispatcher:
         """Remove legacy DB-backed feed comment tasks. Feed comments now run autonomously."""
         with SessionLocal() as db:
             comment_tasks = (
-                db.query(Task)
-                .filter(Task.type == TaskType.COMMENT_FEED_POST)
-                .all()
+                db.query(Task).filter(Task.type == TaskType.COMMENT_FEED_POST).all()
             )
             if not comment_tasks:
                 return
@@ -466,6 +472,20 @@ class TaskDispatcher:
         cooldown = SKIP_COOLDOWNS.get((task_type, reason))
         if not cooldown:
             return
+
+        if task_type == TaskType.SEND_INVITE:
+            active_cooldown = self.invite_state.get_active_cooldown()
+            if active_cooldown and active_cooldown.get("reason") == reason:
+                next_allowed = active_cooldown["active_until"]
+                existing = self.next_execution_at.get(task_type)
+                if not existing or existing < next_allowed:
+                    self.next_execution_at[task_type] = next_allowed
+                logger.warning(
+                    f"{task_type} cooling down until existing invite cooldown expires due to skip reason: {reason}"
+                )
+                self._sync_next_execution_metrics()
+                self._sync_invite_state_metrics()
+                return
 
         next_allowed = datetime.utcnow() + cooldown
         existing = self.next_execution_at.get(task_type)
@@ -648,12 +668,13 @@ class TaskDispatcher:
 
                 # Log rate-limited status periodically (every 5 minutes)
                 if blocked_types:
-                    should_log = (
-                        self._last_idle_log is None
-                        or (now - self._last_idle_log) > timedelta(minutes=5)
-                    )
+                    should_log = self._last_idle_log is None or (
+                        now - self._last_idle_log
+                    ) > timedelta(minutes=5)
                     if should_log:
-                        logger.info(f"Waiting: {len(blocked_types)} task type(s) rate-limited")
+                        logger.info(
+                            f"Waiting: {len(blocked_types)} task type(s) rate-limited"
+                        )
                         self._last_idle_log = now
 
                 return
@@ -690,12 +711,21 @@ class TaskDispatcher:
                     )
                 else:
                     logger.info(f"Task {task_to_run.id} skipped: {e.reason}")
-                task_to_run.status = TaskStatus.FAILED
-                task_to_run.error = normalized_reason
-                task_to_run.executed_at = datetime.utcnow()
-                self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
-                # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
-                outcome = "skipped"
+                if e.from_active_cooldown:
+                    task_to_run.status = TaskStatus.PENDING
+                    task_to_run.error = None
+                    cooldown_until = e.cooldown_until
+                    if cooldown_until and cooldown_until > datetime.utcnow():
+                        self.next_execution_at[task_to_run.type] = cooldown_until
+                        self._sync_next_execution_metrics()
+                    outcome = "blocked"
+                else:
+                    task_to_run.status = TaskStatus.FAILED
+                    task_to_run.error = normalized_reason
+                    task_to_run.executed_at = datetime.utcnow()
+                    self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
+                    # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
+                    outcome = "skipped"
 
             except SessionExpiredException as e:
                 logger.warning(f"Session expired during task {task_to_run.id}: {e}")
@@ -714,7 +744,9 @@ class TaskDispatcher:
                     "authentication",
                     "net::err_aborted",  # Often happens on auth redirects
                 ]
-                is_session_error = any(indicator in error_str for indicator in session_indicators)
+                is_session_error = any(
+                    indicator in error_str for indicator in session_indicators
+                )
 
                 # Also check page state if we can
                 if not is_session_error:
@@ -728,7 +760,9 @@ class TaskDispatcher:
                         pass  # Page might be in bad state, continue with original error
 
                 if is_session_error:
-                    logger.warning(f"Detected session issue during task {task_to_run.id}: {e}")
+                    logger.warning(
+                        f"Detected session issue during task {task_to_run.id}: {e}"
+                    )
                     task_to_run.status = TaskStatus.PENDING
                     db.commit()
                     outcome = "session_expired"

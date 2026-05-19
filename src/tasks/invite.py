@@ -30,7 +30,9 @@ ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a 
 SEND_INVITATION_SELECTOR = (
     "button[aria-label*='Send invitation' i], "
     "button:has-text('Send invitation'), "
-    "button:has-text('Send without a note')"
+    "button:has-text('Send without a note'), "
+    "div[role='dialog'] button[aria-label='Send' i], "
+    "div[role='dialog'] button:has-text('Send')"
 )
 INVITE_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "invite_history.json"
@@ -289,7 +291,11 @@ class InviteTask(BaseTask):
                     active_cooldown.get("reason") or "unknown",
                     active_cooldown["active_until"].isoformat(),
                 )
-                raise TaskSkippedException(active_cooldown["reason"])
+                raise TaskSkippedException(
+                    active_cooldown["reason"],
+                    cooldown_until=active_cooldown["active_until"],
+                    from_active_cooldown=True,
+                )
 
             self.send_connection_request(url, try_personal_message)
         except TaskSkippedException as exc:
@@ -297,7 +303,10 @@ class InviteTask(BaseTask):
             cooldown_until = None
             outcome = "skipped"
 
-            if active_cooldown and active_cooldown.get("reason") == normalized_reason:
+            if exc.from_active_cooldown:
+                cooldown_until = exc.cooldown_until
+                outcome = "blocked"
+            elif active_cooldown and active_cooldown.get("reason") == normalized_reason:
                 cooldown_until = active_cooldown["active_until"]
                 outcome = "blocked"
             else:
@@ -327,7 +336,11 @@ class InviteTask(BaseTask):
                         cooldown_until=cooldown_until,
                     )
                 )
-            raise TaskSkippedException(normalized_reason)
+            raise TaskSkippedException(
+                normalized_reason,
+                cooldown_until=cooldown_until,
+                from_active_cooldown=exc.from_active_cooldown,
+            )
         except Exception as exc:
             normalized_reason = normalize_invite_skip_reason(str(exc))
             self.invite_state.record_event(
@@ -417,8 +430,12 @@ class InviteTask(BaseTask):
             pass
 
         try:
-            page_text = self.page.locator("body").inner_text(timeout=1500).lower()
-            reason = classify_invitation_feedback(page_text)
+            dialog = self.page.locator("div[role='dialog']:visible").first
+            if not dialog.is_visible(timeout=500):
+                return None
+            text = dialog.inner_text(timeout=1500).lower()
+            logger.debug(f"Dialog content: {text}")
+            reason = classify_invitation_feedback(text)
             if reason:
                 return reason
         except Exception:
@@ -472,6 +489,42 @@ class InviteTask(BaseTask):
         self.human.random_sleep(1.0, 2.0)
 
         return detect_connection_state(self.page)
+
+    def _record_confirmed_invite(
+        self,
+        url: str,
+        confirmed_state: ConnectionState,
+        connection_message: Optional[str],
+    ) -> dict:
+        logger.info(
+            "Connection request confirmed with state: %s", confirmed_state.value
+        )
+        self._record_invite_history(
+            url,
+            confirmed_state.value,
+            connection_message,
+        )
+        self.invite_state.record_event(
+            outcome="success",
+            reason="",
+            profile_url=url,
+            message_preview=connection_message or "",
+            status=confirmed_state.value,
+            source="invite_task",
+        )
+        send_notification(
+            _format_invite_notification(
+                "Invite confirmed",
+                profile_url=url,
+                state=confirmed_state.value,
+                message=connection_message or "None",
+            )
+        )
+
+        return {
+            "status": confirmed_state.value,
+            "message": connection_message,
+        }
 
     def _load_invite_history(self) -> dict[str, Any]:
         if not INVITE_HISTORY_PATH.exists():
@@ -578,6 +631,10 @@ class InviteTask(BaseTask):
             logger.warning(f"Invitation blocked after {source} click: {error}")
             raise TaskSkippedException(error)
 
+        final_state = self._confirm_invitation_sent(url)
+        if final_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+            return self._record_confirmed_invite(url, final_state, None)
+
         return None
 
     def _complete_connection(self, try_personal_message: bool, url: str) -> dict:
@@ -639,8 +696,16 @@ class InviteTask(BaseTask):
             logger.warning(
                 "Invite modal still open after send click; treating invite as unconfirmed"
             )
-            page_text = self.page.locator("body").inner_text().lower()
-            reason = classify_invitation_feedback(page_text)
+            reason = None
+            try:
+                dialog_text = (
+                    self.page.locator("div[role='dialog']:visible")
+                    .first.inner_text()
+                    .lower()
+                )
+                reason = classify_invitation_feedback(dialog_text)
+            except Exception:
+                pass
             if reason:
                 raise TaskSkippedException(reason)
             raise TaskSkippedException("invite_not_confirmed")
@@ -658,35 +723,7 @@ class InviteTask(BaseTask):
                 )
                 raise TaskSkippedException("invite_not_confirmed")
 
-        logger.info(
-            "Connection request confirmed with state: %s", confirmed_state.value
-        )
-        self._record_invite_history(
-            url,
-            confirmed_state.value,
-            connection_message,
-        )
-        self.invite_state.record_event(
-            outcome="success",
-            reason="",
-            profile_url=url,
-            message_preview=connection_message or "",
-            status=confirmed_state.value,
-            source="invite_task",
-        )
-        send_notification(
-            _format_invite_notification(
-                "Invite confirmed",
-                profile_url=url,
-                state=confirmed_state.value,
-                message=connection_message or "None",
-            )
-        )
-
-        return {
-            "status": confirmed_state.value,
-            "message": connection_message,
-        }
+        return self._record_confirmed_invite(url, confirmed_state, connection_message)
 
     def send_connection_request(
         self, url: str, try_personal_message: bool = True
@@ -696,7 +733,7 @@ class InviteTask(BaseTask):
         try:
             self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
             self.human.random_sleep(2.0, 4.0)
-            self.page.wait_for_selector("h2", timeout=15000)
+            self.page.wait_for_selector("main", timeout=15000)
 
             state = detect_connection_state(self.page)
 

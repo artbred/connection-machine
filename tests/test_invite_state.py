@@ -12,7 +12,10 @@ if str(SRC) not in sys.path:
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
-from invite_state import InviteStateStore
+from db import TaskType  # noqa: E402
+from dispatcher import TaskDispatcher  # noqa: E402
+from invite_state import InviteStateStore  # noqa: E402
+from metrics import NoopMetrics  # noqa: E402
 
 
 class InviteStateStoreTests(unittest.TestCase):
@@ -86,7 +89,41 @@ class InviteStateStoreTests(unittest.TestCase):
 
         self.assertEqual(snapshot["cooldown"]["reason"], "withdrawal_cooldown")
         self.assertEqual(snapshot["last_event"]["reason"], "withdrawal_cooldown")
-        self.assertEqual(snapshot["event_counts"][("skipped", "withdrawal_cooldown")], 1)
+        self.assertEqual(
+            snapshot["event_counts"][("skipped", "withdrawal_cooldown")], 1
+        )
+
+    def test_dispatcher_reuses_existing_invite_cooldown_without_extending_it(self):
+        now = datetime.utcnow()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = InviteStateStore(path=Path(tmpdir) / "invite_state.json")
+            active_until = now + timedelta(days=2)
+            store.set_cooldown(
+                "weekly_limit_reached",
+                active_until,
+                source="invite_task",
+                profile_url="https://example.com/profile",
+            )
+
+            dispatcher = TaskDispatcher.__new__(TaskDispatcher)
+            dispatcher.invite_state = store
+            dispatcher.next_execution_at = {}
+            dispatcher.metrics = NoopMetrics()
+
+            dispatcher.schedule_skip_cooldown(
+                TaskType.SEND_INVITE,
+                "weekly_limit_reached",
+            )
+
+            cooldown = store.get_active_cooldown(now=now)
+
+        if cooldown is None:
+            self.fail("cooldown should stay active")
+        self.assertEqual(cooldown["active_until"], active_until)
+        self.assertEqual(
+            dispatcher.next_execution_at[TaskType.SEND_INVITE],
+            active_until,
+        )
 
 
 if __name__ == "__main__":
