@@ -19,6 +19,7 @@ from dispatcher import (  # noqa: E402
     remaining_minutes,
 )
 from tasks.invite import _format_invite_notification, classify_invitation_feedback  # noqa: E402
+from tasks.invite import classify_platform_invitation_feedback  # noqa: E402
 from tasks.invite import _locator_matches_expected_text  # noqa: E402
 
 
@@ -55,6 +56,22 @@ class InviteFlowLogicTests(unittest.TestCase):
         )
         self.assertEqual(
             classify_invitation_feedback(text),
+            "weekly_limit_reached",
+        )
+
+    def test_strict_platform_feedback_requires_send_failure_context(self):
+        text = "Weekly connection limit tips can help you connect safely."
+
+        self.assertIsNone(classify_platform_invitation_feedback(text))
+
+    def test_strict_platform_feedback_detects_linkedin_weekly_limit(self):
+        text = (
+            "Your invitation to Jacob was not sent because you have reached the "
+            "weekly limit for connection invitations. Please try again next week"
+        )
+
+        self.assertEqual(
+            classify_platform_invitation_feedback(text),
             "weekly_limit_reached",
         )
 

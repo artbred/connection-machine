@@ -21,8 +21,10 @@ class TaskSkippedException(Exception):
         *,
         cooldown_until: datetime | None = None,
         from_active_cooldown: bool = False,
+        cooldown_eligible: bool = True,
     ):
         self.reason = reason
         self.cooldown_until = cooldown_until
         self.from_active_cooldown = from_active_cooldown
+        self.cooldown_eligible = cooldown_eligible
         super().__init__(f"Task skipped: {reason}")

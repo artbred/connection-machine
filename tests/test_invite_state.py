@@ -14,8 +14,35 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from db import TaskType  # noqa: E402
 from dispatcher import TaskDispatcher  # noqa: E402
+from exceptions import TaskSkippedException  # noqa: E402
 from invite_state import InviteStateStore  # noqa: E402
 from metrics import NoopMetrics  # noqa: E402
+from tasks.invite import InviteTask  # noqa: E402
+
+
+class EmptyLocator:
+    def count(self):
+        return 0
+
+
+class DummyPage:
+    url = "https://www.linkedin.com/feed/"
+
+    def locator(self, _selector: str):
+        return EmptyLocator()
+
+
+class SkippingInviteTask(InviteTask):
+    def __init__(self, page, reason: str):
+        super().__init__(page)
+        self.reason = reason
+
+    def send_connection_request(
+        self,
+        url: str,
+        try_personal_message: bool = True,
+    ) -> dict:
+        raise TaskSkippedException(self.reason)
 
 
 class InviteStateStoreTests(unittest.TestCase):
@@ -124,6 +151,61 @@ class InviteStateStoreTests(unittest.TestCase):
             dispatcher.next_execution_at[TaskType.SEND_INVITE],
             active_until,
         )
+
+    def test_verbose_weekly_reason_does_not_create_invite_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = InviteStateStore(path=Path(tmpdir) / "invite_state.json")
+            task = SkippingInviteTask(
+                DummyPage(),
+                "A visible error message indicates the weekly connection limit has been reached.",
+            )
+            task.invite_state = store
+
+            with self.assertRaises(TaskSkippedException) as raised:
+                task.run({"url": "https://example.com/profile"})
+
+            cooldown = store.get_active_cooldown()
+
+        self.assertEqual(raised.exception.reason, "weekly_limit_reached")
+        self.assertFalse(raised.exception.cooldown_eligible)
+        self.assertIsNone(cooldown)
+
+    def test_first_canonical_weekly_feedback_does_not_create_invite_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = InviteStateStore(path=Path(tmpdir) / "invite_state.json")
+            task = SkippingInviteTask(DummyPage(), "weekly_limit_reached")
+            task.invite_state = store
+
+            with self.assertRaises(TaskSkippedException) as raised:
+                task.run({"url": "https://example.com/profile"})
+
+            cooldown = store.get_active_cooldown()
+
+        self.assertEqual(raised.exception.reason, "weekly_limit_reached")
+        self.assertFalse(raised.exception.cooldown_eligible)
+        self.assertIsNone(cooldown)
+
+    def test_repeated_weekly_feedback_creates_invite_cooldown(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = InviteStateStore(path=Path(tmpdir) / "invite_state.json")
+            store.record_event(
+                outcome="skipped",
+                reason="weekly_limit_reached",
+                profile_url="https://example.com/previous",
+                source="invite_task",
+                recorded_at=datetime.utcnow(),
+            )
+            task = SkippingInviteTask(DummyPage(), "weekly_limit_reached")
+            task.invite_state = store
+
+            with self.assertRaises(TaskSkippedException) as raised:
+                task.run({"url": "https://example.com/profile"})
+
+            cooldown = store.get_active_cooldown()
+
+        self.assertEqual(raised.exception.reason, "weekly_limit_reached")
+        self.assertTrue(raised.exception.cooldown_eligible)
+        self.assertIsNotNone(cooldown)
 
 
 if __name__ == "__main__":

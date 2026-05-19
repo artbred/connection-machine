@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 MAX_CONNECT_ITERATIONS = 5
 INVITE_HISTORY_RETENTION_DAYS = 30
+WEEKLY_LIMIT_CONFIRMATION_WINDOW = timedelta(minutes=15)
 ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a note')"
 SEND_INVITATION_SELECTOR = (
     "button[aria-label*='Send invitation' i], "
@@ -114,6 +115,43 @@ def classify_invitation_feedback(text: str) -> Optional[str]:
         return "weekly_limit_reached"
 
     if "withdrawing" in normalized or "withdraw" in normalized:
+        return "withdrawal_cooldown"
+
+    if "error" in normalized or "failed" in normalized:
+        return "unknown_error"
+
+    return None
+
+
+def classify_platform_invitation_feedback(text: str) -> Optional[str]:
+    normalized = _normalize_feedback_text(text)
+    if not normalized:
+        return None
+
+    if normalized in {"weekly_limit_reached", "withdrawal_cooldown"}:
+        return normalized
+
+    not_sent_markers = (
+        "not sent",
+        "wasn't sent",
+        "was not sent",
+        "couldn't send",
+        "could not send",
+        "unable to send",
+    )
+    has_not_sent_marker = any(marker in normalized for marker in not_sent_markers)
+
+    if has_not_sent_marker and (
+        "weekly invitation limit" in normalized
+        or "weekly limit for connection invitation" in normalized
+        or "weekly limit for connection invitations" in normalized
+        or "reached your weekly invitation limit" in normalized
+    ):
+        return "weekly_limit_reached"
+
+    if has_not_sent_marker and (
+        "withdrawing" in normalized or "withdraw" in normalized
+    ):
         return "withdrawal_cooldown"
 
     if "error" in normalized or "failed" in normalized:
@@ -330,6 +368,12 @@ class InviteTask(BaseTask):
             normalized_reason = normalize_invite_skip_reason(exc.reason)
             cooldown_until = None
             outcome = "skipped"
+            reason_came_from_canonical_feedback = (
+                exc.cooldown_eligible and exc.reason == normalized_reason
+            )
+            cooldown_eligible = (
+                exc.from_active_cooldown or reason_came_from_canonical_feedback
+            )
 
             if exc.from_active_cooldown:
                 cooldown_until = exc.cooldown_until
@@ -339,7 +383,18 @@ class InviteTask(BaseTask):
                 outcome = "blocked"
             else:
                 cooldown = INVITE_SKIP_COOLDOWNS.get(normalized_reason)
-                if cooldown:
+                if (
+                    normalized_reason == "weekly_limit_reached"
+                    and cooldown
+                    and not self._has_recent_weekly_limit_signal(url)
+                ):
+                    logger.warning(
+                        "Weekly invite limit feedback seen once for %s; recording without global cooldown until confirmed",
+                        url,
+                    )
+                    cooldown = None
+
+                if cooldown and cooldown_eligible:
                     cooldown_until = datetime.utcnow() + cooldown
                     self.invite_state.set_cooldown(
                         normalized_reason,
@@ -368,6 +423,7 @@ class InviteTask(BaseTask):
                 normalized_reason,
                 cooldown_until=cooldown_until,
                 from_active_cooldown=exc.from_active_cooldown,
+                cooldown_eligible=cooldown_until is not None,
             )
         except Exception as exc:
             normalized_reason = normalize_invite_skip_reason(str(exc))
@@ -378,6 +434,30 @@ class InviteTask(BaseTask):
                 source="invite_task",
             )
             raise
+
+    def _has_recent_weekly_limit_signal(self, profile_url: str) -> bool:
+        cutoff = datetime.utcnow() - WEEKLY_LIMIT_CONFIRMATION_WINDOW
+        try:
+            events = self.invite_state.get_recent_events(limit=25)
+        except Exception:
+            return False
+
+        for event in events:
+            if event.get("reason") != "weekly_limit_reached":
+                continue
+            if event.get("outcome") not in {"skipped", "blocked"}:
+                continue
+
+            recorded_at = event.get("recorded_at")
+            if not isinstance(recorded_at, datetime) or recorded_at < cutoff:
+                continue
+
+            if event.get("profile_url") == profile_url:
+                continue
+
+            return True
+
+        return False
 
     def get_profile_content(self) -> str:
         try:
@@ -433,41 +513,62 @@ class InviteTask(BaseTask):
 
         return self.page.locator("body").first, "body"
 
-    def _check_invitation_error(self) -> Optional[str]:
-        try:
-            toast = self.page.locator("div.artdeco-toast-item").first
-            toast.wait_for(state="visible", timeout=3000)
-            text = toast.inner_text().lower()
-            logger.debug(f"Toast content: {text}")
+    def _collect_visible_feedback_texts(self) -> set[str]:
+        texts: set[str] = set()
+        selectors = [
+            "div.artdeco-toast-item:visible",
+            "div[role='alert']:visible",
+        ]
 
-            reason = classify_invitation_feedback(text)
-            if reason:
-                return reason
-        except Exception:
-            pass
+        for selector in selectors:
+            try:
+                locator = self.page.locator(selector)
+                for index in range(min(locator.count(), 5)):
+                    item = locator.nth(index)
+                    if not item.is_visible(timeout=300):
+                        continue
+                    text = _normalize_feedback_text(item.inner_text(timeout=500))
+                    if text:
+                        texts.add(text)
+            except Exception:
+                continue
 
-        try:
-            alert = self.page.locator("div[role='alert']:visible").first
-            if alert.is_visible(timeout=500):
-                text = alert.inner_text().lower()
-                logger.debug(f"Alert content: {text}")
-                reason = classify_invitation_feedback(text)
-                if reason:
-                    return reason
-        except Exception:
-            pass
+        return texts
 
-        try:
-            dialog = self.page.locator("div[role='dialog']:visible").first
-            if not dialog.is_visible(timeout=500):
-                return None
-            text = dialog.inner_text(timeout=1500).lower()
-            logger.debug(f"Dialog content: {text}")
-            reason = classify_invitation_feedback(text)
-            if reason:
-                return reason
-        except Exception:
-            pass
+    def _check_invitation_error(
+        self,
+        ignored_feedback: set[str] | None = None,
+    ) -> Optional[str]:
+        ignored_feedback = ignored_feedback or set()
+
+        for label, selector, wait_for_first in (
+            ("toast", "div.artdeco-toast-item:visible", True),
+            ("alert", "div[role='alert']:visible", False),
+        ):
+            try:
+                locator = self.page.locator(selector)
+                if wait_for_first:
+                    locator.first.wait_for(state="visible", timeout=3000)
+
+                for index in range(min(locator.count(), 5)):
+                    item = locator.nth(index)
+                    if not item.is_visible(timeout=500):
+                        continue
+
+                    text = item.inner_text(timeout=1000).lower()
+                    normalized_text = _normalize_feedback_text(text)
+                    if normalized_text in ignored_feedback:
+                        logger.debug(
+                            "Ignoring pre-existing %s feedback: %s", label, text
+                        )
+                        continue
+
+                    logger.debug("%s content: %s", label.title(), text)
+                    reason = classify_platform_invitation_feedback(text)
+                    if reason:
+                        return reason
+            except Exception:
+                pass
 
         return None
 
@@ -708,6 +809,8 @@ class InviteTask(BaseTask):
         if send_btn.is_disabled(timeout=1000):
             raise TaskSkippedException("invite_not_confirmed")
 
+        feedback_before_send = self._collect_visible_feedback_texts()
+
         # Use a precise click here. Missing the modal action button looks like a silent invite failure.
         try:
             send_btn.click(delay=100, timeout=5000)
@@ -719,7 +822,7 @@ class InviteTask(BaseTask):
 
         self.human.random_sleep(2.0, 4.0)
 
-        error = self._check_invitation_error()
+        error = self._check_invitation_error(ignored_feedback=feedback_before_send)
         if error:
             logger.warning(f"Invitation failed: {error}")
             try:
@@ -735,18 +838,6 @@ class InviteTask(BaseTask):
             logger.warning(
                 "Invite modal still open after send click; treating invite as unconfirmed"
             )
-            reason = None
-            try:
-                dialog_text = (
-                    self.page.locator("div[role='dialog']:visible")
-                    .first.inner_text()
-                    .lower()
-                )
-                reason = classify_invitation_feedback(dialog_text)
-            except Exception:
-                pass
-            if reason:
-                raise TaskSkippedException(reason)
             raise TaskSkippedException("invite_not_confirmed")
 
         final_state = self._confirm_invitation_sent(url)
@@ -847,7 +938,7 @@ class InviteTask(BaseTask):
 
                 if selector is None:
                     logger.info(f"LLM says skip: {reason}")
-                    raise TaskSkippedException(reason)
+                    raise TaskSkippedException(reason, cooldown_eligible=False)
 
                 try:
                     all_matches = container.locator(selector).all()

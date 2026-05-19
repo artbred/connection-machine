@@ -723,7 +723,8 @@ class TaskDispatcher:
                     task_to_run.status = TaskStatus.FAILED
                     task_to_run.error = normalized_reason
                     task_to_run.executed_at = datetime.utcnow()
-                    self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
+                    if e.cooldown_eligible:
+                        self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
                     # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
                     outcome = "skipped"
 
