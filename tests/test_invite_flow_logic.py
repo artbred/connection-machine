@@ -12,6 +12,7 @@ if str(SRC) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 from connection_state import ConnectionState, resolve_connection_state  # noqa: E402
+from connection_state import _has_visible_pending_button  # noqa: E402
 from db import TaskType  # noqa: E402
 from dispatcher import (  # noqa: E402
     build_cooldown_notification,
@@ -22,6 +23,7 @@ from tasks.invite import _format_invite_notification, classify_invitation_feedba
 from tasks.invite import classify_platform_invitation_feedback  # noqa: E402
 from tasks.invite import InviteTask  # noqa: E402
 from tasks.invite import _locator_matches_expected_text  # noqa: E402
+from connect_heuristics import _is_valid_connect_button  # noqa: E402
 
 
 class FakeLocator:
@@ -31,6 +33,9 @@ class FakeLocator:
         aria_label: str = "",
         aria_disabled: str = "",
         class_name: str = "",
+        href: str = "",
+        input_value_text: str | None = None,
+        tag_name: str = "DIV",
         disabled: bool = False,
         visible: bool = True,
     ):
@@ -38,6 +43,9 @@ class FakeLocator:
         self.aria_label = aria_label
         self.aria_disabled = aria_disabled
         self.class_name = class_name
+        self.href = href
+        self.input_value_text = input_value_text
+        self.tag_name = tag_name
         self.disabled = disabled
         self.visible = visible
 
@@ -50,6 +58,19 @@ class FakeLocator:
     def inner_text(self, timeout: int = 300):
         return self.text
 
+    def input_value(self, timeout: int = 1000):
+        if self.input_value_text is None:
+            raise ValueError("locator does not support input_value")
+        return self.input_value_text
+
+    def evaluate(self, _script: str):
+        return self.tag_name
+
+    def bounding_box(self, timeout: int = 500):
+        if not self.visible:
+            return None
+        return {"x": 0, "y": 0, "width": 100, "height": 40}
+
     def get_attribute(self, name: str):
         if name == "aria-label":
             return self.aria_label
@@ -57,9 +78,30 @@ class FakeLocator:
             return self.aria_disabled
         if name == "class":
             return self.class_name
+        if name == "href":
+            return self.href
         if name == "disabled" and self.disabled:
             return ""
         return None
+
+
+class FakeLocatorList:
+    def __init__(self, locators):
+        self.locators = locators
+
+    def count(self):
+        return len(self.locators)
+
+    def nth(self, index: int):
+        return self.locators[index]
+
+
+class FakeScope:
+    def __init__(self, locators):
+        self.locators = locators
+
+    def locator(self, _selector: str):
+        return FakeLocatorList(self.locators)
 
 
 class InviteFlowLogicTests(unittest.TestCase):
@@ -248,6 +290,54 @@ class InviteFlowLogicTests(unittest.TestCase):
         button = FakeLocator(text="Send", class_name="artdeco-button--disabled")
 
         self.assertFalse(task._is_enabled_button(button))
+
+    def test_invite_note_text_reads_textarea_value(self):
+        task = InviteTask.__new__(InviteTask)
+        editor = FakeLocator(
+            text="", input_value_text="Hello there", tag_name="TEXTAREA"
+        )
+
+        self.assertEqual(task._get_invite_note_text(editor), "Hello there")
+
+    def test_preload_invite_anchor_is_valid_connect_button(self):
+        locator = FakeLocator(
+            text="Connect",
+            aria_label="Invite Ada Lovelace to connect",
+            href="/preload/custom-invite/?vanityName=ada-lovelace",
+        )
+
+        self.assertTrue(_is_valid_connect_button(locator))
+
+    def test_mutual_connection_text_is_not_connect_button(self):
+        locator = FakeLocator(text="3 mutual connections")
+
+        self.assertFalse(_is_valid_connect_button(locator))
+
+    def test_pending_anchor_is_detected_for_current_profile(self):
+        scope = FakeScope(
+            [
+                FakeLocator(
+                    text="Pending",
+                    aria_label="Pending, click to withdraw invitation sent to Rajat Bhargava",
+                    href="https://www.linkedin.com/in/rajat-bhargava-8190a723/",
+                )
+            ]
+        )
+
+        self.assertTrue(_has_visible_pending_button(scope, "rajat-bhargava-8190a723"))
+
+    def test_pending_anchor_for_other_profile_is_ignored(self):
+        scope = FakeScope(
+            [
+                FakeLocator(
+                    text="Pending",
+                    aria_label="Pending, click to withdraw invitation sent to Will Herman",
+                    href="https://www.linkedin.com/in/willherman/",
+                )
+            ]
+        )
+
+        self.assertFalse(_has_visible_pending_button(scope, "rajat-bhargava-8190a723"))
 
 
 if __name__ == "__main__":

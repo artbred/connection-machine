@@ -1,17 +1,31 @@
 import logging
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlparse
 from playwright.sync_api import Page, Locator
 
 from human_actions import HumanActions
 
 logger = logging.getLogger(__name__)
 
+CONNECT_WORD_RE = re.compile(r"\bconnect\b")
+
 PROFILE_ACTION_CONTAINER_SELECTORS = [
     "div.pvs-profile-actions",
     "section.pv-top-card",
     "main section:has(h1)",
-    "div.ph5:has(button[aria-label*='More'], button[aria-label*='Connect'], button:has-text('Connect'))",
+    "div.ph5:has(button[aria-label*='More'], button[aria-label*='Connect'], button:has-text('Connect'), a[href*='/preload/custom-invite/'])",
+]
+
+DIRECT_CONNECT_PATTERNS = [
+    "a[href*='/preload/custom-invite/']",
+    "a[aria-label*='connect' i]",
+    "a:has-text('Connect')",
+    "button:has-text('Connect')",
+    "button[aria-label*='Connect' i]",
+    "[role='button']:has-text('Connect')",
+    "[role='button'][aria-label*='Connect' i]",
 ]
 
 CONNECT_IN_DROPDOWN_PATTERNS = [
@@ -111,7 +125,7 @@ def _locator_matches_expected_text(locator: Any, expected_text: str) -> bool:
     return bool(actual and (expected in actual or actual in expected))
 
 
-def _is_valid_connect_button(locator: Locator) -> bool:
+def _is_valid_connect_button(locator: Any) -> bool:
     try:
         if not locator.is_visible(timeout=500):
             return False
@@ -123,12 +137,38 @@ def _is_valid_connect_button(locator: Locator) -> bool:
         if locator.is_disabled(timeout=300):
             return False
 
-        text = locator.inner_text(timeout=300).strip()
-        aria_label = (locator.get_attribute("aria-label") or "").strip()
-        combined = f"{text} {aria_label}".lower()
-        return "connect" in combined and "disconnect" not in combined
+        href = (locator.get_attribute("href") or "").lower()
+        text = _locator_accessible_text(locator).lower()
+        if "disconnect" in text or "disconnect" in href:
+            return False
+        return (
+            "/preload/custom-invite/" in href
+            or CONNECT_WORD_RE.search(text) is not None
+        )
     except Exception:
         return False
+
+
+def _current_profile_slug(page: Page) -> str:
+    parsed = urlparse(page.url)
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) >= 2 and parts[0] == "in":
+        return parts[1].lower()
+    return ""
+
+
+def _targets_current_profile(locator: Any, profile_slug: str) -> bool:
+    if not profile_slug:
+        return False
+
+    href = (locator.get_attribute("href") or "").lower()
+    if not href:
+        return False
+
+    parsed = urlparse(href)
+    query = {key.lower(): value for key, value in parse_qs(parsed.query).items()}
+    vanity_names = [value.lower() for value in query.get("vanityname", [])]
+    return profile_slug in vanity_names or f"/in/{profile_slug}" in parsed.path.lower()
 
 
 def _get_profile_action_container(page: Page) -> Optional[Locator]:
@@ -147,19 +187,36 @@ def _get_profile_action_container(page: Page) -> Optional[Locator]:
 
 def _find_direct_connect_button(page: Page) -> Optional[Locator]:
     container = _get_profile_action_container(page)
-    if not container:
+    profile_slug = _current_profile_slug(page)
+    scopes: list[Any] = []
+    if container:
+        scopes.append(container)
+    scopes.append(page)
+
+    valid_buttons: list[tuple[Any, Locator]] = []
+
+    for scope in scopes:
+        buttons = scope.locator(", ".join(DIRECT_CONNECT_PATTERNS))
+        for i in range(min(buttons.count(), 10)):
+            try:
+                btn = buttons.nth(i)
+                if not _is_valid_connect_button(btn):
+                    continue
+                if _targets_current_profile(btn, profile_slug):
+                    return btn
+                valid_buttons.append((scope, btn))
+            except Exception:
+                continue
+
+    if profile_slug:
+        if container:
+            for scope, btn in valid_buttons:
+                if scope == container:
+                    return btn
         return None
 
-    buttons = container.locator(
-        "button:has-text('Connect'), button[aria-label*='Connect' i]"
-    )
-    for i in range(min(buttons.count(), 10)):
-        try:
-            btn = buttons.nth(i)
-            if _is_valid_connect_button(btn):
-                return btn
-        except Exception:
-            continue
+    if valid_buttons:
+        return valid_buttons[0][1]
     return None
 
 

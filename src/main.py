@@ -6,24 +6,24 @@ import signal
 import socket
 import sys
 import threading
-import urllib
+import urllib.request
 
 from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
 load_dotenv()
 
-from dispatcher import TaskDispatcher
-from exceptions import SessionExpiredException
-from metrics import NoopMetrics, create_metrics
-from tasks.invite import InviteTask
-from tasks.comment import FeedCommentTask
+from dispatcher import TaskDispatcher  # noqa: E402
+from exceptions import SessionExpiredException  # noqa: E402
+from metrics import NoopMetrics, create_metrics  # noqa: E402
+from tasks.invite import InviteTask  # noqa: E402
+from tasks.comment import FeedCommentTask  # noqa: E402
 
 # Global shutdown flag
 shutdown_event = threading.Event()
 
 # --- Configuration ---
-INTERNAL_DEBUG_PORT = 9224
+INTERNAL_DEBUG_PORT = int(os.getenv("CHROME_PORT", "9224"))
 SOCKS_PROXY = os.getenv("SOCKS_PROXY")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 

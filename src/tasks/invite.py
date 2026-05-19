@@ -36,6 +36,13 @@ SEND_INVITATION_SELECTOR = (
     "div[role='dialog'] button[aria-label='Send' i], "
     "div[role='dialog'] button:has-text('Send')"
 )
+INVITE_NOTE_SELECTOR = (
+    "textarea#custom-message, "
+    "textarea[name='message'], "
+    "textarea.connect-button-send-invite__custom-message, "
+    "[contenteditable='true'][role='textbox'], "
+    "[contenteditable='true']"
+)
 INVITE_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "invite_history.json"
 )
@@ -488,7 +495,7 @@ class InviteTask(BaseTask):
     def _wait_for_invite_modal(self, timeout: int = 5000) -> bool:
         try:
             self.page.wait_for_selector(
-                f"{ADD_NOTE_SELECTOR}, {SEND_INVITATION_SELECTOR}, #custom-message",
+                f"{ADD_NOTE_SELECTOR}, {SEND_INVITATION_SELECTOR}, {INVITE_NOTE_SELECTOR}",
                 timeout=timeout,
             )
             logger.info("Invite modal detected")
@@ -595,7 +602,7 @@ class InviteTask(BaseTask):
         except Exception:
             return False
 
-        selectors = ["#custom-message", SEND_INVITATION_SELECTOR, ADD_NOTE_SELECTOR]
+        selectors = [INVITE_NOTE_SELECTOR, SEND_INVITATION_SELECTOR, ADD_NOTE_SELECTOR]
         for selector in selectors:
             try:
                 if dialog.locator(selector).first.is_visible(timeout=500):
@@ -649,42 +656,120 @@ class InviteTask(BaseTask):
 
         return self.page.locator(SEND_INVITATION_SELECTOR).first
 
+    def _get_invite_note_editor(self) -> Locator:
+        try:
+            dialog = self.page.locator("div[role='dialog']:visible").first
+            if dialog.is_visible(timeout=500):
+                return dialog.locator(INVITE_NOTE_SELECTOR).first
+        except Exception:
+            pass
+
+        return self.page.locator(INVITE_NOTE_SELECTOR).first
+
+    def _get_invite_note_text(self, editor: Any) -> str:
+        try:
+            tag_name = (editor.evaluate("element => element.tagName") or "").lower()
+            if tag_name in {"textarea", "input"}:
+                return editor.input_value(timeout=1000)
+        except Exception:
+            pass
+
+        try:
+            return editor.input_value(timeout=1000)
+        except Exception:
+            pass
+
+        try:
+            return editor.inner_text(timeout=1000)
+        except Exception:
+            return ""
+
+    def _set_invite_note_with_js(self, editor: Locator, message: str) -> None:
+        editor.evaluate(
+            """
+(element, value) => {
+  element.focus();
+
+  if (element instanceof HTMLTextAreaElement || element instanceof HTMLInputElement) {
+    const setter = Object.getOwnPropertyDescriptor(element.constructor.prototype, 'value')?.set;
+    if (setter) {
+      setter.call(element, value);
+    } else {
+      element.value = value;
+    }
+  } else {
+    element.textContent = value;
+  }
+
+  element.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
+  element.dispatchEvent(new Event('change', {bubbles: true}));
+}
+""",
+            message,
+        )
+
+    def _invite_note_is_ready(self, editor: Locator, expected_text: str) -> bool:
+        entered_text = " ".join(self._get_invite_note_text(editor).split())
+        if expected_text not in entered_text:
+            return False
+
+        try:
+            return self._is_enabled_button(self._get_send_invitation_button())
+        except Exception:
+            return True
+
     def _enter_connection_message(self, connection_message: str) -> None:
         message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
-        custom_message = self.page.locator("#custom-message").first
-        self.human.type(custom_message, message)
+        custom_message = self._get_invite_note_editor()
+        expected_text = " ".join(message.split())
+
+        try:
+            custom_message.fill("", timeout=1000)
+        except Exception:
+            pass
+
+        try:
+            self.human.type(custom_message, message)
+        except Exception:
+            logger.warning("Invite note human typing failed; retrying with direct fill")
+            try:
+                custom_message.fill(message, timeout=3000)
+            except Exception:
+                self._set_invite_note_with_js(custom_message, message)
 
         for _ in range(3):
             try:
-                entered_text = " ".join(custom_message.inner_text(timeout=1000).split())
-                expected_text = " ".join(message.split())
-                if expected_text in entered_text:
+                if self._invite_note_is_ready(custom_message, expected_text):
                     return
             except Exception:
                 pass
             self.human.random_sleep(0.3, 0.6)
 
         logger.warning(
-            "Human typing did not populate invite note; retrying with direct fill"
+            "Invite note typing did not enable send; retrying with direct fill"
         )
         try:
             custom_message.fill(message, timeout=3000)
         except Exception:
-            custom_message.evaluate(
-                """
-(element, value) => {
-  element.focus();
-  element.textContent = value;
-  element.dispatchEvent(new InputEvent('input', {bubbles: true, inputType: 'insertText', data: value}));
-  element.dispatchEvent(new Event('change', {bubbles: true}));
-}
-""",
-                message,
-            )
+            self._set_invite_note_with_js(custom_message, message)
 
-        entered_text = " ".join(custom_message.inner_text(timeout=1000).split())
-        expected_text = " ".join(message.split())
-        if expected_text not in entered_text:
+        for _ in range(3):
+            try:
+                if self._invite_note_is_ready(custom_message, expected_text):
+                    return
+            except Exception:
+                pass
+            self.human.random_sleep(0.3, 0.6)
+
+        logger.warning(
+            "Invite note direct fill did not enable send; retrying with native setter"
+        )
+        self._set_invite_note_with_js(custom_message, message)
+
+        entered_text = " ".join(self._get_invite_note_text(custom_message).split())
+        if expected_text not in entered_text or not self._is_enabled_button(
+            self._get_send_invitation_button()
+        ):
             raise TaskSkippedException("invite_not_confirmed")
 
     def _normalize_profile_url(self, url: str) -> str:
@@ -876,7 +961,7 @@ class InviteTask(BaseTask):
                     logger.info(f"Generated connection message: {connection_message}")
 
         if connection_message:
-            custom_message = self.page.locator("#custom-message").first
+            custom_message = self._get_invite_note_editor()
             try:
                 editor_visible = custom_message.is_visible(timeout=500)
             except Exception:
@@ -888,7 +973,7 @@ class InviteTask(BaseTask):
                     raise TaskSkippedException("add_note_unreachable")
                 self.human.click(add_note)
 
-            self.page.wait_for_selector("#custom-message", timeout=3000)
+            self.page.wait_for_selector(INVITE_NOTE_SELECTOR, timeout=3000)
             self._enter_connection_message(connection_message)
 
         send_btn = self._get_send_invitation_button()
