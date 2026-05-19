@@ -11,14 +11,29 @@ if str(SRC) not in sys.path:
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
-from connection_state import ConnectionState, resolve_connection_state
-from db import TaskType
-from dispatcher import (
+from connection_state import ConnectionState, resolve_connection_state  # noqa: E402
+from db import TaskType  # noqa: E402
+from dispatcher import (  # noqa: E402
     build_cooldown_notification,
     normalize_skip_reason,
     remaining_minutes,
 )
-from tasks.invite import _format_invite_notification, classify_invitation_feedback
+from tasks.invite import _format_invite_notification, classify_invitation_feedback  # noqa: E402
+from tasks.invite import _locator_matches_expected_text  # noqa: E402
+
+
+class FakeLocator:
+    def __init__(self, text: str = "", aria_label: str = ""):
+        self.text = text
+        self.aria_label = aria_label
+
+    def inner_text(self, timeout: int = 300):
+        return self.text
+
+    def get_attribute(self, name: str):
+        if name == "aria-label":
+            return self.aria_label
+        return None
 
 
 class InviteFlowLogicTests(unittest.TestCase):
@@ -89,7 +104,7 @@ class InviteFlowLogicTests(unittest.TestCase):
 
     def test_navigation_timeout_is_canonicalized(self):
         reason = (
-            'Page.goto: Timeout 60000ms exceeded.\nCall log:\n'
+            "Page.goto: Timeout 60000ms exceeded.\nCall log:\n"
             '  - navigating to "https://www.linkedin.com/in/example", '
             'waiting until "domcontentloaded"'
         )
@@ -100,8 +115,8 @@ class InviteFlowLogicTests(unittest.TestCase):
 
     def test_send_button_timeout_is_canonicalized(self):
         reason = (
-            'Locator.click: Timeout 30000ms exceeded.\nCall log:\n'
-            '  - waiting for locator("button[aria-label=\'Send invitation\']").first'
+            "Locator.click: Timeout 30000ms exceeded.\nCall log:\n"
+            "  - waiting for locator(\"button[aria-label='Send invitation']\").first"
         )
         self.assertEqual(
             normalize_skip_reason(TaskType.SEND_INVITE, reason),
@@ -116,7 +131,9 @@ class InviteFlowLogicTests(unittest.TestCase):
         )
 
     def test_withdraw_feedback_is_detected(self):
-        text = "Invitation not sent because you're still withdrawing previous invitations."
+        text = (
+            "Invitation not sent because you're still withdrawing previous invitations."
+        )
         self.assertEqual(
             classify_invitation_feedback(text),
             "withdrawal_cooldown",
@@ -158,11 +175,25 @@ class InviteFlowLogicTests(unittest.TestCase):
             next_allowed,
         )
         self.assertIsNotNone(message)
+        if message is None:
+            self.fail("weekly limit notification should be generated")
         self.assertIn("Cooldown: 7 days", message)
         self.assertIn("2026-04-06 12:30 UTC", message)
 
     def test_remaining_minutes_uses_total_seconds_for_multi_day_deltas(self):
-        self.assertEqual(remaining_minutes(timedelta(days=5, hours=5, minutes=38)), 7538)
+        self.assertEqual(
+            remaining_minutes(timedelta(days=5, hours=5, minutes=38)), 7538
+        )
+
+    def test_icon_only_more_button_matches_expected_text_from_aria_label(self):
+        locator = FakeLocator(text="", aria_label="More")
+
+        self.assertTrue(_locator_matches_expected_text(locator, "More"))
+
+    def test_aria_label_with_name_matches_generic_connect_expected_text(self):
+        locator = FakeLocator(text="", aria_label="Connect with Ada Lovelace")
+
+        self.assertTrue(_locator_matches_expected_text(locator, "Connect"))
 
 
 if __name__ == "__main__":

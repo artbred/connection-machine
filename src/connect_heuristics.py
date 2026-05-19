@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 from playwright.sync_api import Page, Locator
 
 from human_actions import HumanActions
@@ -17,10 +17,16 @@ PROFILE_ACTION_CONTAINER_SELECTORS = [
 CONNECT_IN_DROPDOWN_PATTERNS = [
     "div[role='menu'] button:has-text('Connect')",
     "div[role='menu'] button[aria-label*='Connect' i]",
+    "div[role='menu'] [role='button']:has-text('Connect')",
+    "div[role='menu'] [role='button'][aria-label*='Connect' i]",
     "div.artdeco-dropdown__content button:has-text('Connect')",
     "div.artdeco-dropdown__content button[aria-label*='Connect' i]",
+    "div.artdeco-dropdown__content [role='button']:has-text('Connect')",
+    "div.artdeco-dropdown__content [role='button'][aria-label*='Connect' i]",
     "[class*='dropdown'] button:has-text('Connect')",
     "[class*='dropdown'] button[aria-label*='Connect' i]",
+    "[class*='dropdown'] [role='button']:has-text('Connect')",
+    "[class*='dropdown'] [role='button'][aria-label*='Connect' i]",
 ]
 
 MORE_BUTTON_PATTERNS = [
@@ -75,6 +81,34 @@ class SelectorCache:
 
 
 selector_cache = SelectorCache()
+
+
+def _locator_accessible_text(locator: Any, timeout: int = 300) -> str:
+    parts = []
+    try:
+        text = (locator.inner_text(timeout=timeout) or "").strip()
+        if text:
+            parts.append(text)
+    except Exception:
+        pass
+
+    try:
+        aria_label = (locator.get_attribute("aria-label") or "").strip()
+        if aria_label:
+            parts.append(aria_label)
+    except Exception:
+        pass
+
+    return " ".join(parts)
+
+
+def _locator_matches_expected_text(locator: Any, expected_text: str) -> bool:
+    expected = (expected_text or "").strip().lower()
+    if not expected:
+        return True
+
+    actual = _locator_accessible_text(locator).lower()
+    return bool(actual and (expected in actual or actual in expected))
 
 
 def _is_valid_connect_button(locator: Locator) -> bool:
@@ -208,8 +242,8 @@ def get_cached_selector(
         if not locator.is_visible(timeout=500):
             return None
 
-        actual_text = locator.inner_text(timeout=300).strip()
-        if actual_text != expected_text:
+        actual_text = _locator_accessible_text(locator)
+        if not _locator_matches_expected_text(locator, expected_text):
             selector_cache.record_failure(page_variant, expected_text)
             logger.debug(
                 f"Cache miss: expected '{expected_text}', found '{actual_text}'"

@@ -244,6 +244,34 @@ def describe_invite_reason(reason: str) -> str:
     return INVITE_REASON_DESCRIPTIONS.get(reason, reason.replace("_", " "))
 
 
+def _locator_accessible_text(locator: Any, timeout: int = 300) -> str:
+    parts = []
+    try:
+        text = (locator.inner_text(timeout=timeout) or "").strip()
+        if text:
+            parts.append(text)
+    except Exception:
+        pass
+
+    try:
+        aria_label = (locator.get_attribute("aria-label") or "").strip()
+        if aria_label:
+            parts.append(aria_label)
+    except Exception:
+        pass
+
+    return " ".join(parts)
+
+
+def _locator_matches_expected_text(locator: Any, expected_text: str) -> bool:
+    expected = (expected_text or "").strip().lower()
+    if not expected:
+        return True
+
+    actual = _locator_accessible_text(locator).lower()
+    return bool(actual and (expected in actual or actual in expected))
+
+
 def _format_invite_notification(
     title: str,
     *,
@@ -631,6 +659,17 @@ class InviteTask(BaseTask):
             logger.warning(f"Invitation blocked after {source} click: {error}")
             raise TaskSkippedException(error)
 
+        quick_state = detect_connection_state(self.page)
+        if quick_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+            return self._record_confirmed_invite(url, quick_state, None)
+
+        try:
+            if self.page.locator(DROPDOWN_SELECTOR).first.is_visible(timeout=500):
+                logger.info("Dropdown opened after %s click", source)
+                return None
+        except Exception:
+            pass
+
         final_state = self._confirm_invitation_sent(url)
         if final_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
             return self._record_confirmed_invite(url, final_state, None)
@@ -825,11 +864,8 @@ class InviteTask(BaseTask):
                             try:
                                 if not match.is_visible(timeout=300):
                                     continue
-                                text = match.inner_text().strip()
-                                if text and (
-                                    expected_text.lower() in text.lower()
-                                    or text.lower() in expected_text.lower()
-                                ):
+                                text = _locator_accessible_text(match)
+                                if _locator_matches_expected_text(match, expected_text):
                                     target_locator = match
                                     logger.info(
                                         f"Found matching element with text: {text}"
@@ -856,14 +892,25 @@ class InviteTask(BaseTask):
                             continue
                         target_locator = visible_matches[0]
 
-                    button_text = target_locator.inner_text().strip()
+                    button_text = _locator_accessible_text(target_locator)
+
+                    is_dropdown_opener = "more" in button_text.lower()
 
                     target_locator.scroll_into_view_if_needed()
                     self.human.random_sleep(0.3, 0.5)
                     target_locator.click(delay=100)
                     self.human.random_sleep(1.0, 2.0)
 
-                    save_selector_to_cache("profile_card", button_text, selector)
+                    if is_dropdown_opener:
+                        logger.info(
+                            "Opened dropdown via LLM-selected action: %s",
+                            button_text or selector,
+                        )
+                        previous_feedback = None
+                        continue
+
+                    if button_text:
+                        save_selector_to_cache("profile_card", button_text, selector)
                     previous_feedback = None
 
                 except Exception as e:
