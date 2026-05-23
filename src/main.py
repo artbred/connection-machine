@@ -6,16 +6,23 @@ import signal
 import sys
 import threading
 
+from datetime import datetime
+
 from dotenv import load_dotenv
 from patchright.sync_api import sync_playwright
 
 load_dotenv()
 
 from dispatcher import TaskDispatcher  # noqa: E402
-from exceptions import SessionExpiredException  # noqa: E402
+from db import SessionLocal, Task, TaskStatus, TaskType  # noqa: E402
+from exceptions import SessionExpiredException, TaskSkippedException  # noqa: E402
 from metrics import NoopMetrics, create_metrics  # noqa: E402
-from tasks.invite import InviteTask  # noqa: E402
+from tasks.invite import InviteTask, normalize_invite_skip_reason  # noqa: E402
 from tasks.comment import FeedCommentTask  # noqa: E402
+from tasks.notification_reply_invites import (  # noqa: E402
+    NOTIFICATION_REPLY_INVITE_SOURCE,
+    NotificationReplyInviteScanner,
+)
 
 # Global shutdown flag
 shutdown_event = threading.Event()
@@ -134,17 +141,99 @@ def parse_args():
         action="store_true",
         help="Debug mode: generate one feed comment and exit",
     )
+    debug_group.add_argument(
+        "--debug-notification-reply-invites",
+        action="store_true",
+        help="Debug mode: scan LinkedIn notifications for reply-based invite candidates and exit",
+    )
     parser.add_argument(
         "--no-message",
         action="store_true",
-        help="Skip generating personal message (use with --debug-invite)",
+        help="Skip generating personal message (use with --debug-invite or --debug-notification-reply-invites)",
     )
     parser.add_argument(
         "--submit-comment",
         action="store_true",
         help="Actually submit the generated comment when used with --debug-feed-comment",
     )
+    parser.add_argument(
+        "--send-notification-invite",
+        action="store_true",
+        help="Actually send the first queued invite when used with --debug-notification-reply-invites",
+    )
     return parser.parse_args()
+
+
+def get_next_notification_reply_invite_task() -> Task | None:
+    with SessionLocal() as db:
+        pending_tasks = (
+            db.query(Task)
+            .filter(
+                Task.type == TaskType.SEND_INVITE,
+                Task.status == TaskStatus.PENDING,
+            )
+            .order_by(Task.created_at)
+            .all()
+        )
+        for task in pending_tasks:
+            try:
+                payload = json.loads(task.payload)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("source") == NOTIFICATION_REPLY_INVITE_SOURCE:
+                return task
+    return None
+
+
+def run_notification_reply_invite_task(
+    page,
+    task_id: int,
+    *,
+    try_personal_message: bool = True,
+) -> None:
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if not task:
+            logger.info("Notification reply invite task %s no longer exists", task_id)
+            return
+
+        payload = json.loads(task.payload)
+        payload["try_personal_message"] = try_personal_message
+        task.status = TaskStatus.PROCESSING
+        db.commit()
+
+    invite_task = InviteTask(page)
+    try:
+        invite_task.run(payload)
+    except TaskSkippedException as exc:
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if task:
+                task.status = TaskStatus.FAILED
+                task.error = normalize_invite_skip_reason(exc.reason)
+                task.executed_at = datetime.utcnow()
+                db.commit()
+        NotificationReplyInviteScanner(page).mark_task_status(task_id, "failed")
+        raise
+    except Exception as exc:
+        with SessionLocal() as db:
+            task = db.query(Task).filter(Task.id == task_id).first()
+            if task:
+                task.status = TaskStatus.FAILED
+                task.error = normalize_invite_skip_reason(str(exc))
+                task.executed_at = datetime.utcnow()
+                db.commit()
+        NotificationReplyInviteScanner(page).mark_task_status(task_id, "failed")
+        raise
+
+    with SessionLocal() as db:
+        task = db.query(Task).filter(Task.id == task_id).first()
+        if task:
+            task.status = TaskStatus.COMPLETED
+            task.error = None
+            task.executed_at = datetime.utcnow()
+            db.commit()
+    NotificationReplyInviteScanner(page).mark_task_status(task_id, "completed")
 
 
 def launch_browser_context(playwright, user_data_dir: str):
@@ -239,6 +328,47 @@ def main():
                 comment_task = FeedCommentTask(page)
                 comment_task.run({"dry_run": not args.submit_comment})
                 logger.info("Debug feed comment completed.")
+                return
+
+            if args.debug_notification_reply_invites:
+                logger.info(
+                    "Debug mode: scanning notification replies%s",
+                    " and sending first queued invite"
+                    if args.send_notification_invite
+                    else "",
+                )
+                scanner = NotificationReplyInviteScanner(page)
+                queued = scanner.run(
+                    {
+                        "max_to_queue": 1 if args.send_notification_invite else 5,
+                    }
+                )
+                snapshot = scanner.get_metrics_snapshot()
+                metrics.set_notification_reply_invite_scan(
+                    last_scan_timestamp=snapshot["last_scan_timestamp"],
+                    latest_engagement_count=snapshot["latest_engagement_count"],
+                    seen_count=snapshot["seen_count"],
+                    queued_count=snapshot["queued_count"],
+                )
+                logger.info(
+                    "Debug notification reply scan queued %s candidate(s): %s",
+                    len(queued),
+                    [entry.get("profile_url") for entry in queued],
+                )
+                if args.send_notification_invite:
+                    task = get_next_notification_reply_invite_task()
+                    if not task:
+                        logger.info("No queued notification reply invite task to send.")
+                        return
+                    logger.info(
+                        "Debug mode: sending notification reply invite task %s", task.id
+                    )
+                    run_notification_reply_invite_task(
+                        page,
+                        task.id,
+                        try_personal_message=not args.no_message,
+                    )
+                    logger.info("Debug notification reply invite completed.")
                 return
 
             dispatcher = TaskDispatcher(page, metrics=metrics)

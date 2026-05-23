@@ -9,6 +9,7 @@ from db import SessionLocal, Task, TaskType, TaskStatus
 from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
 from metrics import NoopMetrics
 from tasks.invite import InviteTask, normalize_invite_skip_reason
+from tasks.notification_reply_invites import NotificationReplyInviteScanner
 from tasks.comment import FeedCommentTask
 from tasks.post import PostTask
 from exceptions import SessionExpiredException, TaskSkippedException
@@ -28,6 +29,7 @@ AUTONOMOUS_COMMENT_FAILURE_COOLDOWN = timedelta(minutes=30)
 COMMENT_HISTORY_DAYS = 30
 COMMENT_HISTORY_RECENT_ENTRY_LIMIT = 25
 INVITE_HISTORY_RECENT_ENTRY_LIMIT = 25
+NOTIFICATION_REPLY_SCAN_INTERVAL = timedelta(minutes=30)
 
 
 def normalize_skip_reason(task_type: TaskType, reason: str) -> str:
@@ -86,6 +88,7 @@ class TaskDispatcher:
         self.metrics = metrics or NoopMetrics()
         self.invite_state = InviteStateStore()
         self.feed_comment_handler = FeedCommentTask(page)
+        self.notification_reply_invite_scanner = NotificationReplyInviteScanner(page)
         self.handlers = {
             TaskType.SEND_INVITE: InviteTask(page),
             TaskType.CREATE_POST: PostTask(page),
@@ -100,6 +103,7 @@ class TaskDispatcher:
         self.next_execution_at: dict[TaskType, datetime] = {}
         self._previously_blocked: set[TaskType] = set()
         self._last_idle_log: datetime | None = None
+        self._last_notification_reply_scan: datetime | None = None
         self._logged_no_pending: bool = False
         self._init_spacing_from_db()
         self._init_autonomous_spacing()
@@ -109,6 +113,7 @@ class TaskDispatcher:
         self._sync_comment_history_metrics()
         self._sync_invite_history_metrics()
         self._sync_invite_state_metrics()
+        self._sync_notification_reply_invite_metrics()
 
     def _sync_next_execution_metrics(self):
         now = datetime.utcnow().timestamp()
@@ -270,6 +275,21 @@ class TaskDispatcher:
             )
         except Exception as exc:
             logger.warning("Failed to refresh invite state metrics: %s", exc)
+
+    def _sync_notification_reply_invite_metrics(self):
+        try:
+            snapshot = self.notification_reply_invite_scanner.get_metrics_snapshot()
+            self.metrics.set_notification_reply_invite_scan(
+                last_scan_timestamp=snapshot["last_scan_timestamp"],
+                latest_engagement_count=snapshot["latest_engagement_count"],
+                seen_count=snapshot["seen_count"],
+                queued_count=snapshot["queued_count"],
+            )
+        except Exception as exc:
+            logger.warning(
+                "Failed to refresh notification reply invite metrics: %s",
+                exc,
+            )
 
     def _apply_durable_invite_cooldown(self):
         try:
@@ -619,6 +639,28 @@ class TaskDispatcher:
         self._previously_blocked = blocked_set
         return blocked
 
+    def is_task_type_blocked(self, task_type: TaskType) -> bool:
+        last_24h = datetime.utcnow() - timedelta(hours=24)
+        limit = self.rate_limits.get(task_type)
+        if limit is None:
+            return False
+
+        with SessionLocal() as db:
+            count = (
+                db.query(Task)
+                .filter(
+                    Task.type == task_type,
+                    Task.executed_at >= last_24h,
+                    Task.status == TaskStatus.COMPLETED,
+                )
+                .count()
+            )
+            if count >= limit:
+                return True
+
+        next_allowed = self.next_execution_at.get(task_type)
+        return bool(next_allowed and datetime.utcnow() < next_allowed)
+
     def poll(self):
         """Fetch and execute pending tasks."""
         self._apply_durable_invite_cooldown()
@@ -627,6 +669,7 @@ class TaskDispatcher:
         self._sync_comment_history_metrics()
         self._sync_invite_history_metrics()
         self._sync_invite_state_metrics()
+        self._sync_notification_reply_invite_metrics()
 
         # Get distinct pending task types first
         with SessionLocal() as db:
@@ -642,6 +685,21 @@ class TaskDispatcher:
             )
 
         blocked_types = self.get_rate_limited_types(pending_types)
+
+        should_scan_notification_replies = not self.is_task_type_blocked(
+            TaskType.SEND_INVITE
+        ) and (
+            self._last_notification_reply_scan is None
+            or datetime.utcnow() - self._last_notification_reply_scan
+            >= NOTIFICATION_REPLY_SCAN_INTERVAL
+        )
+        if should_scan_notification_replies:
+            self._last_notification_reply_scan = datetime.utcnow()
+            try:
+                self.notification_reply_invite_scanner.run({})
+                self._sync_notification_reply_invite_metrics()
+            except Exception as exc:
+                logger.warning("Notification reply invite scan failed: %s", exc)
 
         with SessionLocal() as db:
             query = db.query(Task).filter(
@@ -786,3 +844,16 @@ class TaskDispatcher:
                 self._sync_comment_history_metrics()
                 self._sync_invite_history_metrics()
                 self._sync_invite_state_metrics()
+                self._sync_notification_reply_invite_metrics()
+                try:
+                    state_payload = json.loads(task_to_run.payload)
+                    if state_payload.get("source") == "notification_reply":
+                        self.notification_reply_invite_scanner.mark_task_status(
+                            task_to_run.id,
+                            task_to_run.status.value,
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to update notification reply task state: %s",
+                        exc,
+                    )

@@ -14,9 +14,9 @@ if str(SRC) not in sys.path:
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
-from metrics import ConnectionMachineMetrics
-from tasks.comment import FeedCommentTask
-from tasks.invite import InviteTask
+from metrics import ConnectionMachineMetrics  # noqa: E402
+from tasks.comment import FeedCommentTask  # noqa: E402
+from tasks.invite import InviteTask  # noqa: E402
 
 
 class CommentHistoryMetricsTests(unittest.TestCase):
@@ -51,7 +51,10 @@ class CommentHistoryMetricsTests(unittest.TestCase):
             with patch("tasks.comment.COMMENT_HISTORY_PATH", history_path):
                 entries = task.get_comment_history_entries()
 
-        self.assertEqual([entry["post_key"] for entry in entries], ["newer-entry", "older-recent-entry"])
+        self.assertEqual(
+            [entry["post_key"] for entry in entries],
+            ["newer-entry", "older-recent-entry"],
+        )
         self.assertEqual(entries[0]["author"], "Newer Author")
         self.assertIsInstance(entries[0]["commented_at"], datetime)
 
@@ -223,6 +226,34 @@ class CommentHistoryMetricsTests(unittest.TestCase):
         )
         self.assertIn(
             'connection_machine_invite_last_event_timestamp_seconds{event_id="evt-123",message_preview="",outcome="skipped",profile_url="https://example.com/profile",reason="weekly_limit_reached",recorded_at="2026-04-19T21:23:00",source="invite_task",status=""} 1776633780.0',
+            rendered,
+        )
+
+    def test_metrics_render_notification_reply_invite_scan_series(self):
+        metrics = ConnectionMachineMetrics(host="127.0.0.1", port=0)
+        metrics.set_notification_reply_invite_scan(
+            last_scan_timestamp=1776633780.0,
+            latest_engagement_count=10,
+            seen_count=10,
+            queued_count=0,
+        )
+
+        rendered = metrics.render()
+
+        self.assertIn(
+            "connection_machine_notification_reply_invite_last_scan_timestamp_seconds 1776633780.0",
+            rendered,
+        )
+        self.assertIn(
+            "connection_machine_notification_reply_invite_latest_engagements 10",
+            rendered,
+        )
+        self.assertIn(
+            "connection_machine_notification_reply_invite_seen 10",
+            rendered,
+        )
+        self.assertIn(
+            "connection_machine_notification_reply_invite_queued 0",
             rendered,
         )
 

@@ -12,14 +12,12 @@ logger = logging.getLogger(__name__)
 
 
 def _escape_label_value(value: str) -> str:
-    return (
-        value.replace("\\", "\\\\")
-        .replace("\n", "\\n")
-        .replace('"', '\\"')
-    )
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
 
 
-def _format_sample(name: str, value: float | int, labels: dict[str, str] | None = None) -> str:
+def _format_sample(
+    name: str, value: float | int, labels: dict[str, str] | None = None
+) -> str:
     if labels:
         label_text = ",".join(
             f'{key}="{_escape_label_value(str(val))}"'
@@ -95,6 +93,15 @@ class NoopMetrics:
     ):
         return None
 
+    def set_notification_reply_invite_scan(
+        self,
+        last_scan_timestamp: float,
+        latest_engagement_count: int,
+        seen_count: int,
+        queued_count: int,
+    ):
+        return None
+
 
 class ConnectionMachineMetrics:
     def __init__(self, host: str, port: int):
@@ -130,6 +137,10 @@ class ConnectionMachineMetrics:
         self._invite_recent_events: list[dict[str, str | float]] = []
         self._invite_event_counts: dict[tuple[str, str], int] = {}
         self._invite_reason_counts: dict[str, int] = {}
+        self._notification_reply_last_scan_timestamp = 0.0
+        self._notification_reply_latest_engagement_count = 0
+        self._notification_reply_seen_count = 0
+        self._notification_reply_queued_count = 0
 
     def start(self):
         metrics = self
@@ -143,7 +154,9 @@ class ConnectionMachineMetrics:
 
                 payload = metrics.render().encode("utf-8")
                 self.send_response(200)
-                self.send_header("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+                self.send_header(
+                    "Content-Type", "text/plain; version=0.0.4; charset=utf-8"
+                )
                 self.send_header("Content-Length", str(len(payload)))
                 self.end_headers()
                 self.wfile.write(payload)
@@ -200,8 +213,12 @@ class ConnectionMachineMetrics:
         key = (task_type, outcome)
         now = time.time()
         with self._lock:
-            self._task_executions_total[key] = self._task_executions_total.get(key, 0) + 1
-            self._task_duration_sum[key] = self._task_duration_sum.get(key, 0.0) + duration_seconds
+            self._task_executions_total[key] = (
+                self._task_executions_total.get(key, 0) + 1
+            )
+            self._task_duration_sum[key] = (
+                self._task_duration_sum.get(key, 0.0) + duration_seconds
+            )
             self._task_duration_count[key] = self._task_duration_count.get(key, 0) + 1
             self._task_last_execution_timestamp[key] = now
 
@@ -216,8 +233,7 @@ class ConnectionMachineMetrics:
             self._comments_sent_total = max(0, int(total_comments))
             self._comments_sent_today = max(0, int(comments_sent_today))
             self._comments_by_day = {
-                str(day): max(0, int(count))
-                for day, count in comments_by_day.items()
+                str(day): max(0, int(count)) for day, count in comments_by_day.items()
             }
             self._recent_comment_entries = [
                 {
@@ -324,6 +340,25 @@ class ConnectionMachineMetrics:
                 for reason, count in reason_counts.items()
             }
 
+    def set_notification_reply_invite_scan(
+        self,
+        last_scan_timestamp: float,
+        latest_engagement_count: int,
+        seen_count: int,
+        queued_count: int,
+    ):
+        with self._lock:
+            self._notification_reply_last_scan_timestamp = max(
+                0.0,
+                float(last_scan_timestamp),
+            )
+            self._notification_reply_latest_engagement_count = max(
+                0,
+                int(latest_engagement_count),
+            )
+            self._notification_reply_seen_count = max(0, int(seen_count))
+            self._notification_reply_queued_count = max(0, int(queued_count))
+
     def render(self) -> str:
         with self._lock:
             up = self._up
@@ -346,13 +381,23 @@ class ConnectionMachineMetrics:
             recent_invite_entries = list(self._recent_invite_entries)
             invites_sent_total = self._invites_sent_total
             invites_sent_today = self._invites_sent_today
-            invite_cooldown = dict(self._invite_cooldown) if self._invite_cooldown else None
+            invite_cooldown = (
+                dict(self._invite_cooldown) if self._invite_cooldown else None
+            )
             invite_last_event = (
                 dict(self._invite_last_event) if self._invite_last_event else None
             )
             invite_recent_events = list(self._invite_recent_events)
             invite_event_counts = dict(self._invite_event_counts)
             invite_reason_counts = dict(self._invite_reason_counts)
+            notification_reply_last_scan_timestamp = (
+                self._notification_reply_last_scan_timestamp
+            )
+            notification_reply_latest_engagement_count = (
+                self._notification_reply_latest_engagement_count
+            )
+            notification_reply_seen_count = self._notification_reply_seen_count
+            notification_reply_queued_count = self._notification_reply_queued_count
 
         lines = [
             "# HELP connection_machine_up Whether the connection-machine process considers itself healthy.",
@@ -360,25 +405,38 @@ class ConnectionMachineMetrics:
             _format_sample("connection_machine_up", up),
             "# HELP connection_machine_started_at_timestamp_seconds Unix timestamp when the process started.",
             "# TYPE connection_machine_started_at_timestamp_seconds gauge",
-            _format_sample("connection_machine_started_at_timestamp_seconds", self.started_at),
+            _format_sample(
+                "connection_machine_started_at_timestamp_seconds", self.started_at
+            ),
             "# HELP connection_machine_linkedin_authenticated Whether LinkedIn auth is currently valid.",
             "# TYPE connection_machine_linkedin_authenticated gauge",
-            _format_sample("connection_machine_linkedin_authenticated", linkedin_authenticated),
+            _format_sample(
+                "connection_machine_linkedin_authenticated", linkedin_authenticated
+            ),
             "# HELP connection_machine_last_login_timestamp_seconds Unix timestamp of the last successful LinkedIn login.",
             "# TYPE connection_machine_last_login_timestamp_seconds gauge",
-            _format_sample("connection_machine_last_login_timestamp_seconds", last_login_timestamp),
+            _format_sample(
+                "connection_machine_last_login_timestamp_seconds", last_login_timestamp
+            ),
             "# HELP connection_machine_last_poll_timestamp_seconds Unix timestamp of the last dispatcher poll.",
             "# TYPE connection_machine_last_poll_timestamp_seconds gauge",
-            _format_sample("connection_machine_last_poll_timestamp_seconds", last_poll_timestamp),
+            _format_sample(
+                "connection_machine_last_poll_timestamp_seconds", last_poll_timestamp
+            ),
             "# HELP connection_machine_login_attempts_total Total LinkedIn login attempts.",
             "# TYPE connection_machine_login_attempts_total counter",
-            _format_sample("connection_machine_login_attempts_total", login_attempts_total),
+            _format_sample(
+                "connection_machine_login_attempts_total", login_attempts_total
+            ),
             "# HELP connection_machine_reauth_total Total LinkedIn re-authentication cycles.",
             "# TYPE connection_machine_reauth_total counter",
             _format_sample("connection_machine_reauth_total", reauth_total),
             "# HELP connection_machine_autonomous_comment_allowed Whether an autonomous feed comment action is currently allowed.",
             "# TYPE connection_machine_autonomous_comment_allowed gauge",
-            _format_sample("connection_machine_autonomous_comment_allowed", autonomous_comment_allowed),
+            _format_sample(
+                "connection_machine_autonomous_comment_allowed",
+                autonomous_comment_allowed,
+            ),
             "# HELP connection_machine_task_executions_total Total task executions partitioned by task type and outcome.",
             "# TYPE connection_machine_task_executions_total counter",
         ]
@@ -428,7 +486,9 @@ class ConnectionMachineMetrics:
                 "# TYPE connection_machine_task_last_execution_timestamp_seconds gauge",
             ]
         )
-        for (task_type, outcome), value in sorted(task_last_execution_timestamp.items()):
+        for (task_type, outcome), value in sorted(
+            task_last_execution_timestamp.items()
+        ):
             lines.append(
                 _format_sample(
                     "connection_machine_task_last_execution_timestamp_seconds",
@@ -504,7 +564,7 @@ class ConnectionMachineMetrics:
             lines.append(
                 _format_sample(
                     "connection_machine_comment_history_entry_timestamp_seconds",
-                    entry["commented_at_timestamp"],
+                    float(entry["commented_at_timestamp"]),
                     {
                         "author": str(entry["author"]),
                         "comment": str(entry["comment"]),
@@ -537,7 +597,7 @@ class ConnectionMachineMetrics:
             lines.append(
                 _format_sample(
                     "connection_machine_invite_history_entry_timestamp_seconds",
-                    entry["sent_at_timestamp"],
+                    float(entry["sent_at_timestamp"]),
                     {
                         "entry_key": str(entry["entry_key"]),
                         "message": str(entry["message"]),
@@ -566,7 +626,7 @@ class ConnectionMachineMetrics:
             lines.append(
                 _format_sample(
                     "connection_machine_invite_cooldown_end_timestamp_seconds",
-                    invite_cooldown["active_until_timestamp"],
+                    float(invite_cooldown["active_until_timestamp"]),
                     {
                         "reason": str(invite_cooldown["reason"]),
                         "source": str(invite_cooldown["source"]),
@@ -642,7 +702,7 @@ class ConnectionMachineMetrics:
             lines.append(
                 _format_sample(
                     "connection_machine_invite_last_event_timestamp_seconds",
-                    invite_last_event["recorded_at_timestamp"],
+                    float(invite_last_event["recorded_at_timestamp"]),
                     {
                         "event_id": str(invite_last_event["event_id"]),
                         "outcome": str(invite_last_event["outcome"]),
@@ -666,7 +726,7 @@ class ConnectionMachineMetrics:
             lines.append(
                 _format_sample(
                     "connection_machine_invite_recent_event_timestamp_seconds",
-                    event["recorded_at_timestamp"],
+                    float(event["recorded_at_timestamp"]),
                     {
                         "event_id": str(event["event_id"]),
                         "outcome": str(event["outcome"]),
@@ -680,6 +740,35 @@ class ConnectionMachineMetrics:
                     },
                 )
             )
+
+        lines.extend(
+            [
+                "# HELP connection_machine_notification_reply_invite_last_scan_timestamp_seconds Unix timestamp of the last LinkedIn notification comment-engagement scan.",
+                "# TYPE connection_machine_notification_reply_invite_last_scan_timestamp_seconds gauge",
+                _format_sample(
+                    "connection_machine_notification_reply_invite_last_scan_timestamp_seconds",
+                    notification_reply_last_scan_timestamp,
+                ),
+                "# HELP connection_machine_notification_reply_invite_latest_engagements Number of latest comment-engagement notifications inspected in the last scan.",
+                "# TYPE connection_machine_notification_reply_invite_latest_engagements gauge",
+                _format_sample(
+                    "connection_machine_notification_reply_invite_latest_engagements",
+                    notification_reply_latest_engagement_count,
+                ),
+                "# HELP connection_machine_notification_reply_invite_seen Number of latest comment-engagement notifications already seen in the last scan.",
+                "# TYPE connection_machine_notification_reply_invite_seen gauge",
+                _format_sample(
+                    "connection_machine_notification_reply_invite_seen",
+                    notification_reply_seen_count,
+                ),
+                "# HELP connection_machine_notification_reply_invite_queued Number of notification-based invite tasks queued in the last scan.",
+                "# TYPE connection_machine_notification_reply_invite_queued gauge",
+                _format_sample(
+                    "connection_machine_notification_reply_invite_queued",
+                    notification_reply_queued_count,
+                ),
+            ]
+        )
 
         return "\n".join(lines) + "\n"
 
