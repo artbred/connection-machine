@@ -31,6 +31,12 @@ COMMENT_EDITOR_RELATIVE_XPATH = (
     "@aria-label='Text editor for creating comment']][1]"
     "//div[@role='textbox' and @aria-label='Text editor for creating comment']"
 )
+# LinkedIn's current feed renders each post as a `role="listitem"` inside the
+# feed list, with no stable data-* attributes left on it. This is the most
+# precise way to scope a lookup (e.g. the post's control menu) to one post.
+POST_CONTAINER_RELATIVE_XPATH = "xpath=ancestor::*[@role='listitem'][1]"
+CONTROL_MENU_BUTTON_SELECTOR = "button[aria-label^='Open control menu for post']"
+COPY_LINK_MENU_ITEM_SELECTOR = "div[role='menuitem']:has-text('Copy link to post')"
 COMMENT_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "feed_comment_history.json"
 )
@@ -234,29 +240,37 @@ class FeedCommentTask(BaseTask):
         data = button.evaluate(
             """
 (btn) => {
-  // Walk up the DOM tree to find the post container.
-  // LinkedIn feed posts are typically wrapped in <article> or <div> with
-  // specific data-test-id or data-id attributes. We look for:
-  // 1. An ancestor with data-test-id="feed-activity" or data-id containing "activity"
-  // 2. OR an ancestor with substantial text (200-15000 chars)
-  // 3. Must contain the button
+  // Walk up the DOM tree to find the post container. LinkedIn's current
+  // feed marks each post as role="listitem" and no longer carries any
+  // data-test-id/data-id/data-urn attributes, so that's checked first.
+  // Older LinkedIn builds are kept as fallbacks for resilience:
+  // 1. An ancestor with role="listitem" (current LinkedIn feed)
+  // 2. OR an ancestor with data-test-id="feed-activity" / data-id or
+  //     data-urn containing "activity" (legacy LinkedIn feed)
+  // 3. OR an ancestor with substantial text (200-15000 chars)
+  // Must contain the button in all cases.
   let container = null;
   let el = btn.parentElement;
   for (let level = 0; level < 25 && el; level++, el = el.parentElement) {
     if (el.tagName === 'BODY' || el.tagName === 'HTML') break;
-    
-    // Prefer LinkedIn's feed post containers by data attributes
+
+    if (el.getAttribute('role') === 'listitem' && el.contains(btn)) {
+      container = el;
+      break;
+    }
+
+    // Legacy: data attributes used by older LinkedIn feed builds
     const dataTestId = el.getAttribute('data-test-id') || '';
     const dataId = el.getAttribute('data-id') || '';
     const dataUrn = el.getAttribute('data-urn') || '';
-    if (dataTestId.includes('feed-activity') || 
-        dataId.includes('activity') || 
+    if (dataTestId.includes('feed-activity') ||
+        dataId.includes('activity') ||
         dataUrn.includes('activity') ||
         dataUrn.includes('urn:li:activity')) {
       container = el;
       break;
     }
-    
+
     // Fallback: structural heuristic
     const textLen = (el.textContent || '').trim().length;
     if (textLen > 200 && textLen < 15000) {
@@ -273,13 +287,17 @@ class FeedCommentTask(BaseTask):
   if (rawText.length < 80) return null;
 
   // Find post href - prioritize timestamp link (has <time> child)
-  // then fall back to feed/update/activity patterns
+  // then fall back to feed/update/activity patterns. LinkedIn's current
+  // feed no longer renders any inline per-post permalink at all (no
+  // <time> link, no /feed/update//activity- href), only a generic
+  // "<author>/posts/" link to the author's full posts listing - the same
+  // URL for every post by that author. We deliberately do NOT treat that
+  // as a postHref: it would collide across an author's posts and corrupt
+  // per-post dedup (post_key). When no specific permalink is found here,
+  // the caller falls back to hashing post content for post_key, and the
+  // real permalink is fetched later via the "Copy link to post" control
+  // menu action (see _extract_shareable_post_link).
   let postHref = null;
-  const allLinks = Array.from(container.querySelectorAll('a[href]'))
-    .map(a => a.href)
-    .filter(Boolean);
-
-  // Try 1: timestamp link is the most reliable permalink
   const timeAnchors = container.querySelectorAll('a:has(time)');
   for (const a of timeAnchors) {
     const h = a.href;
@@ -289,18 +307,12 @@ class FeedCommentTask(BaseTask):
     }
   }
 
-  // Try 2: feed/update, activity, ugcPost patterns
   if (!postHref) {
+    const allLinks = Array.from(container.querySelectorAll('a[href]'))
+      .map(a => a.href)
+      .filter(Boolean);
     postHref = allLinks.find(h =>
       h.includes('/feed/update/') || h.includes('/activity-') || h.includes('/ugcPost')
-    ) || null;
-  }
-
-  // Try 3: posts/ or feed/view patterns. Do not keep the generic feed URL;
-  // it cannot be used to verify or revisit the specific post later.
-  if (!postHref) {
-    postHref = allLinks.find(h =>
-      h.includes('/posts/') || h.includes('/feed/view/')
     ) || null;
   }
 
@@ -622,6 +634,10 @@ class FeedCommentTask(BaseTask):
             debug_info = self.page.evaluate("""
                 () => {
                     const articles = document.querySelectorAll('article');
+                    // role="listitem" is the current feed's post container marker;
+                    // the rest are legacy markers kept for diagnostics in case
+                    // LinkedIn reverts or mixes UI versions.
+                    const listItems = document.querySelectorAll('[role="listitem"]');
                     const feedItems = document.querySelectorAll('[data-test-id="feed-activity"], [data-id*="activity"], [class*="feed-shared"], [class*="update-v2"]');
                     const allButtons = Array.from(document.querySelectorAll('button'));
                     const commentButtons = allButtons.filter(b => {
@@ -635,6 +651,7 @@ class FeedCommentTask(BaseTask):
                     return {
                         url: window.location.href,
                         articleCount: articles.length,
+                        listItemCount: listItems.length,
                         feedItemCount: feedItems.length,
                         totalButtonCount: allButtons.length,
                         commentButtonCount: commentButtons.length,
@@ -647,9 +664,10 @@ class FeedCommentTask(BaseTask):
                 }
             """)
             logger.info(
-                "Feed debug: url=%s articles=%s feedItems=%s totalButtons=%s commentButtons=%s visibleCommentButtons=%s pageHeight=%s viewport=%s scrollY=%s buttonTexts=%s",
+                "Feed debug: url=%s articles=%s listItems=%s feedItems=%s totalButtons=%s commentButtons=%s visibleCommentButtons=%s pageHeight=%s viewport=%s scrollY=%s buttonTexts=%s",
                 debug_info.get("url"),
                 debug_info.get("articleCount"),
+                debug_info.get("listItemCount"),
                 debug_info.get("feedItemCount"),
                 debug_info.get("totalButtonCount"),
                 debug_info.get("commentButtonCount"),
@@ -809,12 +827,67 @@ class FeedCommentTask(BaseTask):
         )
 
     def _extract_shareable_post_link(self, candidate: dict[str, Any]) -> str | None:
-        """Try to extract a proper shareable LinkedIn post link via the share button."""
+        """Try to extract a proper shareable LinkedIn post link.
+
+        LinkedIn's current feed has no inline permalink on a post; the only
+        way to get one is via the post's "..." control menu -> "Copy link to
+        post", which writes the URL to the clipboard. Older LinkedIn builds
+        exposed this through a Share/Repost dialog instead - that path is
+        kept as a fallback in case the UI varies by account or reverts.
+        """
         button = self._find_button_for_post_key(candidate["post_key"])
         if not button:
             logger.info("Could not re-find comment button for share link extraction")
             return None
 
+        link = self._extract_link_via_control_menu(button)
+        if link:
+            return link
+
+        return self._extract_link_via_share_dialog(button)
+
+    def _extract_link_via_control_menu(self, button) -> str | None:
+        post = button.locator(POST_CONTAINER_RELATIVE_XPATH)
+        control_menu = post.locator(CONTROL_MENU_BUTTON_SELECTOR).first
+
+        try:
+            if not control_menu.is_visible(timeout=2000):
+                return None
+
+            self.page.context.grant_permissions(
+                ["clipboard-read", "clipboard-write"],
+                origin="https://www.linkedin.com",
+            )
+
+            control_menu.scroll_into_view_if_needed()
+            self.human.random_sleep(0.5, 1.0)
+            control_menu.click(timeout=3000)
+            self.human.random_sleep(0.5, 1.0)
+
+            copy_link_item = self.page.locator(COPY_LINK_MENU_ITEM_SELECTOR).first
+            if not copy_link_item.is_visible(timeout=2000):
+                self.page.keyboard.press("Escape")
+                return None
+
+            copy_link_item.click(timeout=2000)
+            self.human.random_sleep(0.5, 1.0)
+
+            link = self.page.evaluate("() => navigator.clipboard.readText()")
+            if link and (link.startswith("http://") or link.startswith("https://")):
+                logger.info("Extracted shareable link via control menu: %s", link)
+                return link
+        except Exception as exc:
+            logger.warning("Control-menu share link extraction failed: %s", exc)
+            try:
+                self.page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+        return None
+
+    def _extract_link_via_share_dialog(self, button) -> str | None:
+        """Legacy fallback: older LinkedIn builds exposed a copy-link input
+        or "Copy link to post" action inside a Share/Repost dialog."""
         try:
             share_btn = self.page.locator(
                 "button:has-text('Share'), button:has-text('Repost')"
@@ -836,7 +909,7 @@ class FeedCommentTask(BaseTask):
                     if link and (
                         link.startswith("http://") or link.startswith("https://")
                     ):
-                        logger.info("Extracted shareable link: %s", link)
+                        logger.info("Extracted shareable link via share dialog: %s", link)
                         self._dismiss_share_dialog(button)
                         return link
 
@@ -852,7 +925,7 @@ class FeedCommentTask(BaseTask):
 
                 self._dismiss_share_dialog(button)
         except Exception as exc:
-            logger.warning("Failed to extract shareable post link: %s", exc)
+            logger.warning("Failed to extract shareable post link via share dialog: %s", exc)
             try:
                 self._dismiss_share_dialog(button)
             except Exception:
