@@ -31,6 +31,14 @@ COMMENT_HISTORY_RECENT_ENTRY_LIMIT = 25
 INVITE_HISTORY_RECENT_ENTRY_LIMIT = 25
 NOTIFICATION_REPLY_SCAN_INTERVAL = timedelta(minutes=30)
 
+# Minimum gap between SEND_INVITE profile visits, regardless of outcome.
+# Skips (audience-filter rejections, already-connected, etc.) do not consume
+# the daily spacing, so without a throttle the dispatcher would burst through
+# the queue one profile visit per poll while hunting for a prospect that clears
+# the filter. That profile-view velocity trips LinkedIn's bot detection.
+INVITE_VISIT_THROTTLE_ENV = "INVITE_MIN_VISIT_INTERVAL_SECONDS"
+DEFAULT_INVITE_VISIT_THROTTLE_SECONDS = 90.0
+
 
 def normalize_skip_reason(task_type: TaskType, reason: str) -> str:
     if task_type == TaskType.SEND_INVITE:
@@ -40,6 +48,30 @@ def normalize_skip_reason(task_type: TaskType, reason: str) -> str:
 
 def remaining_minutes(delta: timedelta) -> int:
     return max(0, int(delta.total_seconds() // 60))
+
+
+def get_invite_visit_throttle_interval() -> timedelta | None:
+    """Randomized minimum gap between SEND_INVITE profile visits.
+
+    Read from the env on every call (0 or negative disables the throttle) so
+    it can be tuned via .env without touching code. Returns None when disabled.
+    """
+    raw = os.getenv(INVITE_VISIT_THROTTLE_ENV, "").strip()
+    base = DEFAULT_INVITE_VISIT_THROTTLE_SECONDS
+    if raw:
+        try:
+            base = float(raw)
+        except ValueError:
+            logger.warning(
+                "Invalid %s=%r; using default %ss",
+                INVITE_VISIT_THROTTLE_ENV,
+                raw,
+                DEFAULT_INVITE_VISIT_THROTTLE_SECONDS,
+            )
+            base = DEFAULT_INVITE_VISIT_THROTTLE_SECONDS
+    if base <= 0:
+        return None
+    return timedelta(seconds=base * random.uniform(0.7, 1.3))
 
 
 def build_cooldown_notification(
@@ -101,6 +133,7 @@ class TaskDispatcher:
             TaskType.COMMENT_FEED_POST: 12,
         }
         self.next_execution_at: dict[TaskType, datetime] = {}
+        self._invite_visit_throttle_until: datetime | None = None
         self._previously_blocked: set[TaskType] = set()
         self._last_idle_log: datetime | None = None
         self._last_notification_reply_scan: datetime | None = None
@@ -486,6 +519,35 @@ class TaskDispatcher:
         )
         self._sync_next_execution_metrics()
 
+    def _apply_invite_visit_throttle(self):
+        """Impose a short gap before the next SEND_INVITE attempt.
+
+        Called after a profile-visiting skip/failure. Skips do not consume the
+        daily spacing, so without this the dispatcher bursts through the queue
+        while hunting for a prospect that clears the audience filter. Only ever
+        extends the block: a longer real cooldown/spacing is left untouched.
+        """
+        interval = get_invite_visit_throttle_interval()
+        if interval is None:
+            return
+        throttled_until = datetime.utcnow() + interval
+        spacing = self.next_execution_at.get(TaskType.SEND_INVITE)
+        if spacing and spacing >= throttled_until:
+            return
+        if (
+            self._invite_visit_throttle_until
+            and self._invite_visit_throttle_until >= throttled_until
+        ):
+            return
+        self._invite_visit_throttle_until = throttled_until
+
+    def _invite_visit_throttle_active(self) -> bool:
+        """Whether a recent invite profile visit is still cooling off."""
+        return (
+            self._invite_visit_throttle_until is not None
+            and datetime.utcnow() < self._invite_visit_throttle_until
+        )
+
     def schedule_skip_cooldown(self, task_type: TaskType, reason: str):
         """Apply a temporary task-type cooldown for skip reasons that indicate platform limits."""
         reason = normalize_skip_reason(task_type, reason)
@@ -686,6 +748,16 @@ class TaskDispatcher:
 
         blocked_types = self.get_rate_limited_types(pending_types)
 
+        # Short per-visit throttle: block SEND_INVITE while a recent profile
+        # visit is cooling off. Kept out of get_rate_limited_types so it does
+        # not spam the block/unblock log on every cycle.
+        if (
+            TaskType.SEND_INVITE in pending_types
+            and TaskType.SEND_INVITE not in blocked_types
+            and self._invite_visit_throttle_active()
+        ):
+            blocked_types = [*blocked_types, TaskType.SEND_INVITE]
+
         should_scan_notification_replies = not self.is_task_type_blocked(
             TaskType.SEND_INVITE
         ) and (
@@ -784,6 +856,8 @@ class TaskDispatcher:
                     if e.cooldown_eligible:
                         self.schedule_skip_cooldown(task_to_run.type, normalized_reason)
                     # Most skips do not count toward rate limits; platform-limit skips may set a cooldown
+                    if task_to_run.type == TaskType.SEND_INVITE:
+                        self._apply_invite_visit_throttle()
                     outcome = "skipped"
 
             except SessionExpiredException as e:
@@ -831,6 +905,8 @@ class TaskDispatcher:
                 task_to_run.status = TaskStatus.FAILED
                 task_to_run.error = normalize_skip_reason(task_to_run.type, str(e))
                 task_to_run.executed_at = datetime.utcnow()
+                if task_to_run.type == TaskType.SEND_INVITE:
+                    self._apply_invite_visit_throttle()
                 outcome = "failed"
 
             finally:
