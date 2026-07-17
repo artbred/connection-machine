@@ -2,6 +2,7 @@ import base64
 import hashlib
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -12,7 +13,6 @@ from playwright.sync_api import Locator
 from .base import BaseTask
 from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
 from llm import generate_connection_message, get_next_connect_action
-from markdownify import markdownify as md
 from notifications import escape_html_text, send_notification
 from connection_state import detect_connection_state, ConnectionState
 from connect_heuristics import (
@@ -28,6 +28,90 @@ MAX_CONNECT_ITERATIONS = 5
 INVITE_HISTORY_RETENTION_DAYS = 30
 WEEKLY_LIMIT_CONFIRMATION_WINDOW = timedelta(minutes=15)
 MAX_INVITE_MESSAGE_LENGTH = 200
+MAX_PROFILE_CONTENT_LENGTH = 15000
+MIN_PROFILE_CONTENT_LENGTH = 200
+PROFILE_HYDRATION_TIMEOUT_SECONDS = 8.0
+
+# LinkedIn renders these recommendation/ad modules inside <main> on profile
+# pages. They are full of OTHER people's names and headlines and must never
+# reach the message-generation LLM.
+PROFILE_FOREIGN_MODULE_HEADINGS = [
+    "more profiles for you",
+    "people also viewed",
+    "explore premium profiles",
+    "people you may know",
+    "you might like",
+    "pages for you",
+    "more posts",
+    "promoted",
+    "advertisement",
+]
+
+# Extracts only the prospect's own content from the profile page. LinkedIn's
+# SDUI serves structurally different renders per load (hashed class names,
+# varying section nesting, sometimes no <h1>), so selection is by tag/role and
+# heading text only. Subtrees are hidden, main.innerText is read (innerText
+# honors display:none and skips collapsed junk), then styles are restored —
+# all synchronous, so the page never observably changes.
+PROFILE_CONTENT_EXTRACTION_JS = """
+(blockedHeadings) => {
+  const main = document.querySelector('main');
+  if (!main) return null;
+  const isBlocked = (text) => {
+    const t = (text || '').trim().toLowerCase();
+    return blockedHeadings.some((h) => t.startsWith(h));
+  };
+  const nameEl =
+    main.querySelector('h1') ||
+    main.querySelector('section h2') ||
+    main.querySelector('h2');
+  const profileName = nameEl
+    ? (nameEl.innerText || '').trim().split('\\n')[0].trim()
+    : '';
+  const hidden = [];
+  const hide = (el) => {
+    if (!el || hidden.some((entry) => entry[0] === el)) return;
+    hidden.push([el, el.style.display]);
+    el.style.display = 'none';
+  };
+  try {
+    main
+      .querySelectorAll('aside, footer, [role="dialog"], button, form')
+      .forEach(hide);
+    for (const heading of main.querySelectorAll('h2, h3')) {
+      if (isBlocked(heading.innerText)) {
+        hide(heading.closest('section') || heading.parentElement);
+      }
+    }
+    for (const section of main.querySelectorAll('section')) {
+      const heading = section.querySelector('h2, h3');
+      if (!heading || !/^activity/i.test((heading.innerText || '').trim())) {
+        continue;
+      }
+      for (const item of section.querySelectorAll('li')) {
+        const text = (item.innerText || '').trim();
+        if (!text) continue;
+        // Own posts are headed by the bare name; any trailing words mean a
+        // verb banner ("NAME commented on this" / "likes this" / "reposted
+        // this") whose body is ANOTHER person's post.
+        const first = text.split('\\n')[0].trim();
+        const rest = first.slice(profileName.length).trim();
+        const authored =
+          profileName &&
+          first.toLowerCase().startsWith(profileName.toLowerCase()) &&
+          (rest === '' || /^[·•\\s]*(1st|2nd|3rd\\+?)$/i.test(rest));
+        const repost = /reposted this/i.test(text.slice(0, 300));
+        if (!authored || repost) hide(item);
+      }
+    }
+    return { name: profileName, content: main.innerText };
+  } finally {
+    for (const [el, previous] of hidden) {
+      el.style.display = previous;
+    }
+  }
+}
+"""
 ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a note')"
 SEND_INVITATION_SELECTOR = (
     "button[aria-label*='Send invitation' i], "
@@ -78,6 +162,22 @@ INVITE_REASON_DESCRIPTIONS = {
 
 def _normalize_feedback_text(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def sanitize_profile_content(name: Any, content: Any) -> Tuple[str, str]:
+    """Normalize extracted profile data; drop content too thin to personalize.
+
+    Generating a message from a barely-loaded page makes the LLM invent or
+    latch onto stray text, so below the minimum we return no content and the
+    invite goes out without a note instead.
+    """
+    clean_name = " ".join(str(name or "").split())
+    clean_content = str(content or "").strip()
+    if len(clean_content) > MAX_PROFILE_CONTENT_LENGTH:
+        clean_content = clean_content[:MAX_PROFILE_CONTENT_LENGTH]
+    if len(clean_content) < MIN_PROFILE_CONTENT_LENGTH:
+        return clean_name, ""
+    return clean_name, clean_content
 
 
 def classify_invitation_feedback(text: str) -> Optional[str]:
@@ -467,22 +567,67 @@ class InviteTask(BaseTask):
 
         return False
 
-    def get_profile_content(self) -> str:
+    def _wait_for_profile_hydration(self):
+        """Nudge lazy modules to load, then wait for main's text to stabilize.
+
+        Some SDUI renders stream sections (About, Experience) seconds after
+        domcontentloaded; capturing before that leaves the LLM with little
+        besides recommendation modules.
+        """
+        try:
+            for fraction in (0.35, 0.7):
+                self.page.evaluate(
+                    "fraction => window.scrollTo(0, Math.floor(document.body.scrollHeight * fraction))",
+                    fraction,
+                )
+                self.human.random_sleep(0.8, 1.4)
+            self.page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception as exc:
+            logger.debug("Profile hydration scroll failed: %s", exc)
+
+        deadline = time.monotonic() + PROFILE_HYDRATION_TIMEOUT_SECONDS
+        previous_length = -1
+        while time.monotonic() < deadline:
+            try:
+                length = self.page.evaluate(
+                    "() => { const main = document.querySelector('main'); return main ? main.innerText.length : 0; }"
+                )
+            except Exception:
+                return
+            if length and length == previous_length:
+                return
+            previous_length = length
+            self.human.random_sleep(0.6, 1.0)
+
+    def get_profile_content(self) -> Tuple[str, str]:
+        """Return (profile_name, content) with only the prospect's own content.
+
+        Excludes recommendation modules, other authors' reposts, footer and
+        dialogs so the generated note can only be grounded in the prospect's
+        page. Content is empty when extraction fails or yields too little.
+        """
         try:
             self.page.wait_for_selector("main", state="attached", timeout=5000)
+            self._wait_for_profile_hydration()
 
-            self.human.random_sleep(1.0, 2.5)
-            self.human.random_hover()
+            result = self.page.evaluate(
+                PROFILE_CONTENT_EXTRACTION_JS,
+                PROFILE_FOREIGN_MODULE_HEADINGS,
+            )
+            if not result:
+                return "", ""
 
-            if self.page.locator("main").count() > 0:
-                html = self.page.locator("main").inner_html()
-            else:
-                html = self.page.content()
-
-            return md(html)
+            name, content = sanitize_profile_content(
+                result.get("name"), result.get("content")
+            )
+            if not content:
+                logger.warning(
+                    "Profile content too thin to personalize the invite note"
+                )
+            return name, content
         except Exception as e:
             logger.error(f"Error getting profile content: {e}")
-            return ""
+            return "", ""
 
     def _wait_for_add_note(self, timeout: int = 2000) -> bool:
         try:
@@ -917,6 +1062,8 @@ class InviteTask(BaseTask):
         try_personal_message: bool,
         url: str,
         source: str,
+        profile_name: str = "",
+        profile_content: str = "",
     ) -> Optional[dict]:
         error = self._check_invitation_error()
         if error:
@@ -925,7 +1072,9 @@ class InviteTask(BaseTask):
 
         if self._wait_for_invite_modal():
             logger.info("Invite modal opened via %s", source)
-            return self._complete_connection(try_personal_message, url)
+            return self._complete_connection(
+                try_personal_message, url, profile_name, profile_content
+            )
 
         error = self._check_invitation_error()
         if error:
@@ -949,13 +1098,25 @@ class InviteTask(BaseTask):
 
         return None
 
-    def _complete_connection(self, try_personal_message: bool, url: str) -> dict:
+    def _complete_connection(
+        self,
+        try_personal_message: bool,
+        url: str,
+        profile_name: str = "",
+        profile_content: str = "",
+    ) -> dict:
         connection_message: Optional[str] = None
 
         if try_personal_message:
-            profile_content = self.get_profile_content()
-            if len(profile_content) > 0:
-                connection_message = generate_connection_message(profile_content)
+            if not profile_content:
+                # Fallback: content was not captured before the Connect click.
+                # The extractor hides open dialogs, so the invite modal cannot
+                # leak into the content here.
+                profile_name, profile_content = self.get_profile_content()
+            if profile_content:
+                connection_message = generate_connection_message(
+                    profile_content, profile_name
+                )
                 if connection_message:
                     connection_message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
                     logger.info(f"Generated connection message: {connection_message}")
@@ -1050,6 +1211,14 @@ class InviteTask(BaseTask):
                 logger.info("Already connected, skipping")
                 raise TaskSkippedException("already_connected")
 
+            # Capture the prospect's content before any click: the page is
+            # still scrollable (no modal), so lazy sections can hydrate, and
+            # the note is guaranteed to be grounded in this profile.
+            profile_name = ""
+            profile_content = ""
+            if try_personal_message:
+                profile_name, profile_content = self.get_profile_content()
+
             if try_heuristic_connect(self.page, self.human):
                 logger.info("Clicked Connect via heuristics (no LLM needed)")
                 self.human.random_sleep(1.0, 2.0)
@@ -1058,6 +1227,8 @@ class InviteTask(BaseTask):
                     try_personal_message,
                     url,
                     "heuristic",
+                    profile_name,
+                    profile_content,
                 )
                 if result:
                     return result
@@ -1076,6 +1247,8 @@ class InviteTask(BaseTask):
                         try_personal_message,
                         url,
                         "cached selector",
+                        profile_name,
+                        profile_content,
                     )
                     if result:
                         return result
@@ -1190,6 +1363,8 @@ class InviteTask(BaseTask):
                     try_personal_message,
                     url,
                     "LLM-selected action",
+                    profile_name,
+                    profile_content,
                 )
                 if result:
                     return result
