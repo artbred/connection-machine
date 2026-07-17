@@ -8,10 +8,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-NOTIFICATIONS_URL = os.getenv("TELEGRAM_NOTIFICATIONS_URL")
-CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-API_KEY = os.getenv("TELEGRAM_API_KEY")
-
 logger = logging.getLogger(__name__)
 HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
 
@@ -24,12 +20,26 @@ def _strip_html(value: str) -> str:
     return html.unescape(HTML_TAG_PATTERN.sub("", value or ""))
 
 
-def _post_notification(payload: dict) -> None:
+def _telegram_config() -> tuple[str | None, str | None, str | None]:
+    """Read Telegram config at call time.
+
+    Capturing these at import made it impossible to disable notifications once
+    the module was loaded — a test run with real creds in .env would send live
+    messages. Reading per call lets tests (and any runtime change) blank them.
+    """
+    return (
+        os.getenv("TELEGRAM_NOTIFICATIONS_URL"),
+        os.getenv("TELEGRAM_CHAT_ID"),
+        os.getenv("TELEGRAM_API_KEY"),
+    )
+
+
+def _post_notification(url: str, api_key: str, payload: dict) -> None:
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
     }
-    response = httpx.post(NOTIFICATIONS_URL, headers=headers, json=payload, timeout=30)
+    response = httpx.post(url, headers=headers, json=payload, timeout=30)
     try:
         response.raise_for_status()
     except Exception as exc:
@@ -38,11 +48,12 @@ def _post_notification(payload: dict) -> None:
 
 
 def send_notification(message: str, *, parse_mode: str = "HTML") -> bool:
-    if not NOTIFICATIONS_URL or not CHAT_ID or not API_KEY:
+    url, chat_id, api_key = _telegram_config()
+    if not url or not chat_id or not api_key:
         return False
 
     payload = {
-        "chat_id": CHAT_ID,
+        "chat_id": chat_id,
         "messages": [message],
         "disable_notification": False,
         "disable_web_page_preview": True,
@@ -51,7 +62,7 @@ def send_notification(message: str, *, parse_mode: str = "HTML") -> bool:
         payload["parse_mode"] = parse_mode
 
     try:
-        _post_notification(payload)
+        _post_notification(url, api_key, payload)
         return True
     except Exception as exc:
         if parse_mode != "HTML":
@@ -60,13 +71,13 @@ def send_notification(message: str, *, parse_mode: str = "HTML") -> bool:
 
         logger.warning("HTML notification failed, retrying without parse mode: %s", exc)
         fallback_payload = {
-            "chat_id": CHAT_ID,
+            "chat_id": chat_id,
             "messages": [_strip_html(message)],
             "disable_notification": False,
             "disable_web_page_preview": True,
         }
         try:
-            _post_notification(fallback_payload)
+            _post_notification(url, api_key, fallback_payload)
             return True
         except Exception as fallback_exc:
             logger.error("Failed to send notification: %s", fallback_exc)

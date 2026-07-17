@@ -12,6 +12,13 @@ if str(SRC) not in sys.path:
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
+# This module drives InviteTask.run() through the weekly-limit cooldown path,
+# which calls send_notification. tests/__init__.py blanks these under discovery,
+# but a direct `python tests/test_invite_state.py` run skips the package init —
+# so blank them here too, or a real Telegram message goes out.
+for _var in ("TELEGRAM_NOTIFICATIONS_URL", "TELEGRAM_CHAT_ID", "TELEGRAM_API_KEY"):
+    os.environ[_var] = ""
+
 from db import TaskType  # noqa: E402
 from dispatcher import TaskDispatcher  # noqa: E402
 from exceptions import TaskSkippedException  # noqa: E402
