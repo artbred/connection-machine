@@ -2,6 +2,9 @@ import base64
 import hashlib
 import json
 import logging
+import os
+import re
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
@@ -12,7 +15,6 @@ from playwright.sync_api import Locator
 from .base import BaseTask
 from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
 from llm import generate_connection_message, get_next_connect_action
-from markdownify import markdownify as md
 from notifications import escape_html_text, send_notification
 from connection_state import detect_connection_state, ConnectionState
 from connect_heuristics import (
@@ -28,6 +30,112 @@ MAX_CONNECT_ITERATIONS = 5
 INVITE_HISTORY_RETENTION_DAYS = 30
 WEEKLY_LIMIT_CONFIRMATION_WINDOW = timedelta(minutes=15)
 MAX_INVITE_MESSAGE_LENGTH = 200
+MAX_PROFILE_CONTENT_LENGTH = 15000
+MIN_PROFILE_CONTENT_LENGTH = 200
+PROFILE_HYDRATION_TIMEOUT_SECONDS = 8.0
+
+# Audience filter (configured via .env). Followers/connections are read from
+# the topcard, which occupies the start of <main>'s text in every observed
+# SDUI render; the slice keeps stranger counts from recommendation modules
+# further down the page out of scope.
+AUDIENCE_FILTER_MIN_FOLLOWERS_ENV = "INVITE_MIN_FOLLOWERS"
+AUDIENCE_FILTER_REQUIRE_500_CONNECTIONS_ENV = "INVITE_REQUIRE_500_CONNECTIONS"
+AUDIENCE_STATS_TOPCARD_SLICE = 3000
+AUDIENCE_STATS_MAX_ATTEMPTS = 4
+CONNECTIONS_DISPLAY_CAP = 500
+
+# A stats line consists ONLY of counts + keywords + separators ("3,348
+# followers", "20,683 followers \u00b7 500+ connections"). Prose that merely
+# mentions counts ("I help founders gain 100K followers") never qualifies,
+# so it cannot shadow the real stat.
+_STAT_PHRASE_RE = re.compile(
+    r"(\d[\d.,]*)\s*([KkMm]?)\s*(\+)?\s*(followers|connections?)\b",
+    re.IGNORECASE,
+)
+_STAT_LINE_LEFTOVER_RE = re.compile(r"[\s\u00b7\u2022|+\-]*")
+_BARE_COUNT_LINE_RE = re.compile(r"(\d[\d.,]*)\s*([KkMm]?)\s*(\+)?")
+_KEYWORD_LINE_RE = re.compile(r"(followers|connections?)", re.IGNORECASE)
+
+# LinkedIn renders these recommendation/ad modules inside <main> on profile
+# pages. They are full of OTHER people's names and headlines and must never
+# reach the message-generation LLM.
+PROFILE_FOREIGN_MODULE_HEADINGS = [
+    "more profiles for you",
+    "people also viewed",
+    "explore premium profiles",
+    "people you may know",
+    "you might like",
+    "pages for you",
+    "more posts",
+    "promoted",
+    "advertisement",
+]
+
+# Extracts only the prospect's own content from the profile page. LinkedIn's
+# SDUI serves structurally different renders per load (hashed class names,
+# varying section nesting, sometimes no <h1>), so selection is by tag/role and
+# heading text only. Subtrees are hidden, main.innerText is read (innerText
+# honors display:none and skips collapsed junk), then styles are restored —
+# all synchronous, so the page never observably changes.
+PROFILE_CONTENT_EXTRACTION_JS = """
+(blockedHeadings) => {
+  const main = document.querySelector('main');
+  if (!main) return null;
+  const isBlocked = (text) => {
+    const t = (text || '').trim().toLowerCase();
+    return blockedHeadings.some((h) => t.startsWith(h));
+  };
+  const nameEl =
+    main.querySelector('h1') ||
+    main.querySelector('section h2') ||
+    main.querySelector('h2');
+  const profileName = nameEl
+    ? (nameEl.innerText || '').trim().split('\\n')[0].trim()
+    : '';
+  const hidden = [];
+  const hide = (el) => {
+    if (!el || hidden.some((entry) => entry[0] === el)) return;
+    hidden.push([el, el.style.display]);
+    el.style.display = 'none';
+  };
+  try {
+    main
+      .querySelectorAll('aside, footer, [role="dialog"], button, form')
+      .forEach(hide);
+    for (const heading of main.querySelectorAll('h2, h3')) {
+      if (isBlocked(heading.innerText)) {
+        hide(heading.closest('section') || heading.parentElement);
+      }
+    }
+    for (const section of main.querySelectorAll('section')) {
+      const heading = section.querySelector('h2, h3');
+      if (!heading || !/^activity/i.test((heading.innerText || '').trim())) {
+        continue;
+      }
+      for (const item of section.querySelectorAll('li')) {
+        const text = (item.innerText || '').trim();
+        if (!text) continue;
+        // Own posts are headed by the bare name; any trailing words mean a
+        // verb banner ("NAME commented on this" / "likes this" / "reposted
+        // this") whose body is ANOTHER person's post.
+        const first = text.split('\\n')[0].trim();
+        const rest = first.slice(profileName.length).trim();
+        const authored =
+          profileName &&
+          first.toLowerCase().startsWith(profileName.toLowerCase()) &&
+          (rest === '' || /^[·•\\s]*(1st|2nd|3rd\\+?)$/i.test(rest));
+        const repost = /reposted this/i.test(text.slice(0, 300));
+        if (!authored || repost) hide(item);
+      }
+    }
+    return { name: profileName, content: main.innerText };
+  } finally {
+    for (const [el, previous] of hidden) {
+      el.style.display = previous;
+    }
+  }
+}
+"""
 ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a note')"
 SEND_INVITATION_SELECTOR = (
     "button[aria-label*='Send invitation' i], "
@@ -68,6 +176,7 @@ INVITE_REASON_DESCRIPTIONS = {
     "memorialized_account": "Profile appears to be memorialized",
     "security_checkpoint": "LinkedIn presented a security checkpoint",
     "profile_unavailable": "Profile page content was unavailable",
+    "audience_filter": "Profile does not meet follower/connection filters",
     "navigation_timeout": "Profile navigation timed out",
     "navigation_error": "Profile navigation failed",
     "send_button_timeout": "Send invitation button timed out",
@@ -78,6 +187,164 @@ INVITE_REASON_DESCRIPTIONS = {
 
 def _normalize_feedback_text(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _env_flag(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw.replace(",", "").replace("_", "")))
+    except ValueError:
+        logger.warning("Invalid integer in %s: %r; treating as 0", name, raw)
+        return 0
+
+
+def get_invite_audience_filter() -> Tuple[int, bool]:
+    """Return (min_followers, require_500_connections) from the environment."""
+    return (
+        _env_int(AUDIENCE_FILTER_MIN_FOLLOWERS_ENV),
+        _env_flag(AUDIENCE_FILTER_REQUIRE_500_CONNECTIONS_ENV),
+    )
+
+
+def parse_count_token(digits: str, suffix: str) -> Optional[int]:
+    cleaned = re.sub(r"[,\s]", "", digits)
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    multiplier = {"k": 1_000, "m": 1_000_000}.get(suffix.lower(), 1)
+    return int(value * multiplier)
+
+
+def _merge_split_stat_lines(lines: list[str]) -> list[str]:
+    """Join a bare-count line with a following keyword line.
+
+    Sparse profiles render "49" and "connections" on separate lines
+    (observed live 2026-07-17); rejoining them lets the stats-line check
+    see the full phrase without any cross-line number merging.
+    """
+    merged: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line and _BARE_COUNT_LINE_RE.fullmatch(line):
+            lookahead = index + 1
+            while lookahead < len(lines) and not lines[lookahead]:
+                lookahead += 1
+            if lookahead < len(lines) and _KEYWORD_LINE_RE.fullmatch(
+                lines[lookahead]
+            ):
+                merged.append(f"{line} {lines[lookahead]}")
+                index = lookahead + 1
+                continue
+        merged.append(line)
+        index += 1
+    return merged
+
+
+def parse_audience_stats(profile_text: str) -> dict:
+    """Parse follower/connection counts from the topcard region of a profile.
+
+    Line-based: a count is accepted only from a line that consists purely of
+    stat phrases and separators, so prose counts ("gain 100K followers"),
+    lines ending in digits above the stats, and mutual-connection phrases
+    never parse. Scanning stops at the first foreign-module heading line, so
+    a stranger's or Page's count can never win even on sparse profiles where
+    those modules start early. First qualifying line per stat wins (the
+    prospect's own stats lead <main>'s text).
+    """
+    text = (profile_text or "")[:AUDIENCE_STATS_TOPCARD_SLICE]
+    blocked_headings = set(PROFILE_FOREIGN_MODULE_HEADINGS)
+
+    followers = None
+    connections = None
+    connections_capped = False
+
+    lines = [line.strip() for line in text.splitlines()]
+    for line in _merge_split_stat_lines(lines):
+        if not line:
+            continue
+        if line.lower() in blocked_headings:
+            break
+
+        phrases = list(_STAT_PHRASE_RE.finditer(line))
+        if not phrases:
+            continue
+        leftover = _STAT_PHRASE_RE.sub(" ", line)
+        if not _STAT_LINE_LEFTOVER_RE.fullmatch(leftover):
+            continue
+
+        for match in phrases:
+            value = parse_count_token(match.group(1), match.group(2))
+            keyword = match.group(4).lower()
+            if keyword.startswith("follower"):
+                if followers is None:
+                    followers = value
+            elif connections is None:
+                connections = value
+                connections_capped = bool(match.group(3))
+
+        if followers is not None and connections is not None:
+            break
+
+    return {
+        "followers": followers,
+        "connections": connections,
+        "connections_capped": connections_capped,
+    }
+
+
+def audience_filter_rejection(
+    stats: dict,
+    min_followers: int,
+    require_500_connections: bool,
+) -> Optional[str]:
+    """Return a rejection reason, or None when the profile passes the filter.
+
+    Fails closed: when a threshold is configured and the corresponding stat is
+    not visible on the profile, the profile is rejected. LinkedIn surfaces
+    these numbers on virtually every real profile's topcard, so a missing stat
+    usually means a small account (or an unusual render worth skipping).
+    """
+    if min_followers > 0:
+        followers = stats.get("followers")
+        if followers is None:
+            return "follower count not visible on profile"
+        if followers < min_followers:
+            return f"{followers} followers < required {min_followers}"
+
+    if require_500_connections:
+        connections = stats.get("connections")
+        if connections is None:
+            return "connection count not visible on profile"
+        if connections < CONNECTIONS_DISPLAY_CAP:
+            return f"{connections} connections < required {CONNECTIONS_DISPLAY_CAP}+"
+
+    return None
+
+
+def sanitize_profile_content(name: Any, content: Any) -> Tuple[str, str]:
+    """Normalize extracted profile data; drop content too thin to personalize.
+
+    Generating a message from a barely-loaded page makes the LLM invent or
+    latch onto stray text, so below the minimum we return no content and the
+    invite goes out without a note instead.
+    """
+    clean_name = " ".join(str(name or "").split())
+    clean_content = str(content or "").strip()
+    if len(clean_content) > MAX_PROFILE_CONTENT_LENGTH:
+        clean_content = clean_content[:MAX_PROFILE_CONTENT_LENGTH]
+    if len(clean_content) < MIN_PROFILE_CONTENT_LENGTH:
+        return clean_name, ""
+    return clean_name, clean_content
 
 
 def classify_invitation_feedback(text: str) -> Optional[str]:
@@ -190,6 +457,7 @@ def normalize_invite_skip_reason(reason: str) -> str:
         "memorialized_account",
         "security_checkpoint",
         "profile_unavailable",
+        "audience_filter",
         "weekly_limit_reached",
         "withdrawal_cooldown",
     }:
@@ -326,6 +594,7 @@ def _format_invite_notification(
     reason: str = "",
     message: str = "",
     cooldown_until: datetime | None = None,
+    audience_stats: dict | None = None,
 ) -> str:
     lines = [f"<b>{escape_html_text(title)}</b>"]
     if profile_url:
@@ -334,6 +603,14 @@ def _format_invite_notification(
         lines.append(f"State: {escape_html_text(state)}")
     if reason:
         lines.append(f"Reason: {escape_html_text(describe_invite_reason(reason))}")
+    if audience_stats:
+        followers = audience_stats.get("followers")
+        if followers is not None:
+            lines.append(f"Followers: {escape_html_text(f'{followers:,}')}")
+        connections = audience_stats.get("connections")
+        if connections is not None:
+            capped = "+" if audience_stats.get("connections_capped") else ""
+            lines.append(f"Connections: {escape_html_text(f'{connections:,}{capped}')}")
     if cooldown_until:
         lines.append(
             f"Resume after: {escape_html_text(cooldown_until.strftime('%Y-%m-%d %H:%M UTC'))}"
@@ -467,22 +744,120 @@ class InviteTask(BaseTask):
 
         return False
 
-    def get_profile_content(self) -> str:
+    def _enforce_audience_filter(self, url: str) -> Optional[dict]:
+        """Skip the invite when the profile fails the configured audience filter.
+
+        Runs at visit time on every invite — a queued DB task for a person who
+        turns out not to qualify is skipped all the same. Returns the parsed
+        stats when the filter is enabled so notifications can include them.
+        """
+        min_followers, require_500_connections = get_invite_audience_filter()
+        if min_followers <= 0 and not require_500_connections:
+            return None
+
+        stats = {"followers": None, "connections": None, "connections_capped": False}
+        for _ in range(AUDIENCE_STATS_MAX_ATTEMPTS):
+            try:
+                text = self.page.evaluate(
+                    "() => { const main = document.querySelector('main'); return main ? main.innerText : ''; }"
+                )
+            except Exception as exc:
+                logger.warning("Could not read profile text for audience filter: %s", exc)
+                break
+            stats = parse_audience_stats(text)
+            has_needed_stats = (
+                min_followers <= 0 or stats["followers"] is not None
+            ) and (
+                not require_500_connections or stats["connections"] is not None
+            )
+            if has_needed_stats:
+                break
+            self.human.random_sleep(0.7, 1.1)
+
+        rejection = audience_filter_rejection(
+            stats, min_followers, require_500_connections
+        )
+        if rejection:
+            logger.info(
+                "Audience filter rejected %s: %s (followers=%s, connections=%s%s)",
+                url,
+                rejection,
+                stats.get("followers"),
+                stats.get("connections"),
+                "+" if stats.get("connections_capped") else "",
+            )
+            raise TaskSkippedException("audience_filter", cooldown_eligible=False)
+
+        logger.info(
+            "Audience filter passed for %s (followers=%s, connections=%s%s)",
+            url,
+            stats.get("followers"),
+            stats.get("connections"),
+            "+" if stats.get("connections_capped") else "",
+        )
+        return stats
+
+    def _wait_for_profile_hydration(self):
+        """Nudge lazy modules to load, then wait for main's text to stabilize.
+
+        Some SDUI renders stream sections (About, Experience) seconds after
+        domcontentloaded; capturing before that leaves the LLM with little
+        besides recommendation modules.
+        """
+        try:
+            for fraction in (0.35, 0.7):
+                self.page.evaluate(
+                    "fraction => window.scrollTo(0, Math.floor(document.body.scrollHeight * fraction))",
+                    fraction,
+                )
+                self.human.random_sleep(0.8, 1.4)
+            self.page.evaluate("() => window.scrollTo(0, 0)")
+        except Exception as exc:
+            logger.debug("Profile hydration scroll failed: %s", exc)
+
+        deadline = time.monotonic() + PROFILE_HYDRATION_TIMEOUT_SECONDS
+        previous_length = -1
+        while time.monotonic() < deadline:
+            try:
+                length = self.page.evaluate(
+                    "() => { const main = document.querySelector('main'); return main ? main.innerText.length : 0; }"
+                )
+            except Exception:
+                return
+            if length and length == previous_length:
+                return
+            previous_length = length
+            self.human.random_sleep(0.6, 1.0)
+
+    def get_profile_content(self) -> Tuple[str, str]:
+        """Return (profile_name, content) with only the prospect's own content.
+
+        Excludes recommendation modules, other authors' reposts, footer and
+        dialogs so the generated note can only be grounded in the prospect's
+        page. Content is empty when extraction fails or yields too little.
+        """
         try:
             self.page.wait_for_selector("main", state="attached", timeout=5000)
+            self._wait_for_profile_hydration()
 
-            self.human.random_sleep(1.0, 2.5)
-            self.human.random_hover()
+            result = self.page.evaluate(
+                PROFILE_CONTENT_EXTRACTION_JS,
+                PROFILE_FOREIGN_MODULE_HEADINGS,
+            )
+            if not result:
+                return "", ""
 
-            if self.page.locator("main").count() > 0:
-                html = self.page.locator("main").inner_html()
-            else:
-                html = self.page.content()
-
-            return md(html)
+            name, content = sanitize_profile_content(
+                result.get("name"), result.get("content")
+            )
+            if not content:
+                logger.warning(
+                    "Profile content too thin to personalize the invite note"
+                )
+            return name, content
         except Exception as e:
             logger.error(f"Error getting profile content: {e}")
-            return ""
+            return "", ""
 
     def _wait_for_add_note(self, timeout: int = 2000) -> bool:
         try:
@@ -819,6 +1194,7 @@ class InviteTask(BaseTask):
                 profile_url=url,
                 state=confirmed_state.value,
                 message=connection_message or "None",
+                audience_stats=getattr(self, "_last_audience_stats", None),
             )
         )
 
@@ -917,6 +1293,8 @@ class InviteTask(BaseTask):
         try_personal_message: bool,
         url: str,
         source: str,
+        profile_name: str = "",
+        profile_content: str = "",
     ) -> Optional[dict]:
         error = self._check_invitation_error()
         if error:
@@ -925,7 +1303,9 @@ class InviteTask(BaseTask):
 
         if self._wait_for_invite_modal():
             logger.info("Invite modal opened via %s", source)
-            return self._complete_connection(try_personal_message, url)
+            return self._complete_connection(
+                try_personal_message, url, profile_name, profile_content
+            )
 
         error = self._check_invitation_error()
         if error:
@@ -949,13 +1329,25 @@ class InviteTask(BaseTask):
 
         return None
 
-    def _complete_connection(self, try_personal_message: bool, url: str) -> dict:
+    def _complete_connection(
+        self,
+        try_personal_message: bool,
+        url: str,
+        profile_name: str = "",
+        profile_content: str = "",
+    ) -> dict:
         connection_message: Optional[str] = None
 
         if try_personal_message:
-            profile_content = self.get_profile_content()
-            if len(profile_content) > 0:
-                connection_message = generate_connection_message(profile_content)
+            if not profile_content:
+                # Fallback: content was not captured before the Connect click.
+                # The extractor hides open dialogs, so the invite modal cannot
+                # leak into the content here.
+                profile_name, profile_content = self.get_profile_content()
+            if profile_content:
+                connection_message = generate_connection_message(
+                    profile_content, profile_name
+                )
                 if connection_message:
                     connection_message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
                     logger.info(f"Generated connection message: {connection_message}")
@@ -1050,6 +1442,19 @@ class InviteTask(BaseTask):
                 logger.info("Already connected, skipping")
                 raise TaskSkippedException("already_connected")
 
+            # Reset per-task so a previous prospect's stats can never leak
+            # into this invite's notification.
+            self._last_audience_stats = None
+            self._last_audience_stats = self._enforce_audience_filter(url)
+
+            # Capture the prospect's content before any click: the page is
+            # still scrollable (no modal), so lazy sections can hydrate, and
+            # the note is guaranteed to be grounded in this profile.
+            profile_name = ""
+            profile_content = ""
+            if try_personal_message:
+                profile_name, profile_content = self.get_profile_content()
+
             if try_heuristic_connect(self.page, self.human):
                 logger.info("Clicked Connect via heuristics (no LLM needed)")
                 self.human.random_sleep(1.0, 2.0)
@@ -1058,6 +1463,8 @@ class InviteTask(BaseTask):
                     try_personal_message,
                     url,
                     "heuristic",
+                    profile_name,
+                    profile_content,
                 )
                 if result:
                     return result
@@ -1076,6 +1483,8 @@ class InviteTask(BaseTask):
                         try_personal_message,
                         url,
                         "cached selector",
+                        profile_name,
+                        profile_content,
                     )
                     if result:
                         return result
@@ -1190,6 +1599,8 @@ class InviteTask(BaseTask):
                     try_personal_message,
                     url,
                     "LLM-selected action",
+                    profile_name,
+                    profile_content,
                 )
                 if result:
                     return result

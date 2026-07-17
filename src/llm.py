@@ -25,7 +25,7 @@ Return ONLY the shortened {content_label}, nothing else. No quotes, no explanati
 CONNECTION_MESSAGE_PROMPT = """
 You are an expert human-to-human communication specialist, crafting highly personalized, authentic connection messages for LinkedIn.
 
-Task: Generate a unique, professional LinkedIn connection message (maximum {max_message_length} characters) based only on the provided Profile Content.
+Task: Generate a unique, professional LinkedIn connection message (maximum {max_message_length} characters) for {prospect_label}, based only on the provided Profile Content.
 
 **Core Rules for the Output Message:**
 1.  **Strict Length Limit:** The message **must not exceed** {max_message_length} characters.
@@ -37,8 +37,9 @@ Task: Generate a unique, professional LinkedIn connection message (maximum {max_
 7.  DO NOT WRITE amount of character in the message, output ONLY THE MESSAGE
 8.  Make sure the text does not look AI generated, it should be human-like. If the person is well-known, make sure you adapt to this and your main goal everytime is to try to slightly praise them.
 9.  Never touch politics or anything related to it, never touch military, war, religion, etc.
+10. **Only the prospect's own details:** The Profile Content is scraped from {prospect_label}'s profile page and may still contain stray site navigation or snippets about OTHER people (recommended profiles, mutual connections, reposts). Base the message ONLY on details that belong to {prospect_label}. Never reference another person's name, headline, or achievements as if they were {prospect_label}'s.
 
-**Profile Content:**
+**Profile Content for {prospect_label}:**
 {profile_content}
 """
 
@@ -159,7 +160,9 @@ def _refine_text_length(
     return None
 
 
-def generate_connection_message(profile_content: str) -> str | None:
+def generate_connection_message(
+    profile_content: str, profile_name: str = ""
+) -> str | None:
     api_key = os.getenv("OPENROUTER_API_KEY")
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping message generation.")
@@ -173,6 +176,7 @@ def generate_connection_message(profile_content: str) -> str | None:
         "X-Title": "LinkedIn Auto-Connector",
     }
 
+    prospect_label = profile_name.strip() or "the prospect"
     payload = {
         "model": "google/gemini-3-flash-preview",
         "messages": [
@@ -181,6 +185,7 @@ def generate_connection_message(profile_content: str) -> str | None:
                 "content": CONNECTION_MESSAGE_PROMPT.format(
                     profile_content=profile_content,
                     max_message_length=MAX_MESSAGE_LENGTH,
+                    prospect_label=prospect_label,
                 ),
             }
         ],
