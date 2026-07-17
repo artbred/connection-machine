@@ -2,6 +2,8 @@ import base64
 import hashlib
 import json
 import logging
+import os
+import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -31,6 +33,28 @@ MAX_INVITE_MESSAGE_LENGTH = 200
 MAX_PROFILE_CONTENT_LENGTH = 15000
 MIN_PROFILE_CONTENT_LENGTH = 200
 PROFILE_HYDRATION_TIMEOUT_SECONDS = 8.0
+
+# Audience filter (configured via .env). Followers/connections are read from
+# the topcard, which occupies the start of <main>'s text in every observed
+# SDUI render; the slice keeps stranger counts from recommendation modules
+# further down the page out of scope.
+AUDIENCE_FILTER_MIN_FOLLOWERS_ENV = "INVITE_MIN_FOLLOWERS"
+AUDIENCE_FILTER_REQUIRE_500_CONNECTIONS_ENV = "INVITE_REQUIRE_500_CONNECTIONS"
+AUDIENCE_STATS_TOPCARD_SLICE = 3000
+AUDIENCE_STATS_MAX_ATTEMPTS = 4
+CONNECTIONS_DISPLAY_CAP = 500
+
+# A stats line consists ONLY of counts + keywords + separators ("3,348
+# followers", "20,683 followers \u00b7 500+ connections"). Prose that merely
+# mentions counts ("I help founders gain 100K followers") never qualifies,
+# so it cannot shadow the real stat.
+_STAT_PHRASE_RE = re.compile(
+    r"(\d[\d.,]*)\s*([KkMm]?)\s*(\+)?\s*(followers|connections?)\b",
+    re.IGNORECASE,
+)
+_STAT_LINE_LEFTOVER_RE = re.compile(r"[\s\u00b7\u2022|+\-]*")
+_BARE_COUNT_LINE_RE = re.compile(r"(\d[\d.,]*)\s*([KkMm]?)\s*(\+)?")
+_KEYWORD_LINE_RE = re.compile(r"(followers|connections?)", re.IGNORECASE)
 
 # LinkedIn renders these recommendation/ad modules inside <main> on profile
 # pages. They are full of OTHER people's names and headlines and must never
@@ -152,6 +176,7 @@ INVITE_REASON_DESCRIPTIONS = {
     "memorialized_account": "Profile appears to be memorialized",
     "security_checkpoint": "LinkedIn presented a security checkpoint",
     "profile_unavailable": "Profile page content was unavailable",
+    "audience_filter": "Profile does not meet follower/connection filters",
     "navigation_timeout": "Profile navigation timed out",
     "navigation_error": "Profile navigation failed",
     "send_button_timeout": "Send invitation button timed out",
@@ -162,6 +187,148 @@ INVITE_REASON_DESCRIPTIONS = {
 
 def _normalize_feedback_text(text: str) -> str:
     return " ".join(text.lower().split())
+
+
+def _env_flag(name: str) -> bool:
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str) -> int:
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw.replace(",", "").replace("_", "")))
+    except ValueError:
+        logger.warning("Invalid integer in %s: %r; treating as 0", name, raw)
+        return 0
+
+
+def get_invite_audience_filter() -> Tuple[int, bool]:
+    """Return (min_followers, require_500_connections) from the environment."""
+    return (
+        _env_int(AUDIENCE_FILTER_MIN_FOLLOWERS_ENV),
+        _env_flag(AUDIENCE_FILTER_REQUIRE_500_CONNECTIONS_ENV),
+    )
+
+
+def parse_count_token(digits: str, suffix: str) -> Optional[int]:
+    cleaned = re.sub(r"[,\s]", "", digits)
+    if not cleaned:
+        return None
+    try:
+        value = float(cleaned)
+    except ValueError:
+        return None
+    multiplier = {"k": 1_000, "m": 1_000_000}.get(suffix.lower(), 1)
+    return int(value * multiplier)
+
+
+def _merge_split_stat_lines(lines: list[str]) -> list[str]:
+    """Join a bare-count line with a following keyword line.
+
+    Sparse profiles render "49" and "connections" on separate lines
+    (observed live 2026-07-17); rejoining them lets the stats-line check
+    see the full phrase without any cross-line number merging.
+    """
+    merged: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        if line and _BARE_COUNT_LINE_RE.fullmatch(line):
+            lookahead = index + 1
+            while lookahead < len(lines) and not lines[lookahead]:
+                lookahead += 1
+            if lookahead < len(lines) and _KEYWORD_LINE_RE.fullmatch(
+                lines[lookahead]
+            ):
+                merged.append(f"{line} {lines[lookahead]}")
+                index = lookahead + 1
+                continue
+        merged.append(line)
+        index += 1
+    return merged
+
+
+def parse_audience_stats(profile_text: str) -> dict:
+    """Parse follower/connection counts from the topcard region of a profile.
+
+    Line-based: a count is accepted only from a line that consists purely of
+    stat phrases and separators, so prose counts ("gain 100K followers"),
+    lines ending in digits above the stats, and mutual-connection phrases
+    never parse. Scanning stops at the first foreign-module heading line, so
+    a stranger's or Page's count can never win even on sparse profiles where
+    those modules start early. First qualifying line per stat wins (the
+    prospect's own stats lead <main>'s text).
+    """
+    text = (profile_text or "")[:AUDIENCE_STATS_TOPCARD_SLICE]
+    blocked_headings = set(PROFILE_FOREIGN_MODULE_HEADINGS)
+
+    followers = None
+    connections = None
+    connections_capped = False
+
+    lines = [line.strip() for line in text.splitlines()]
+    for line in _merge_split_stat_lines(lines):
+        if not line:
+            continue
+        if line.lower() in blocked_headings:
+            break
+
+        phrases = list(_STAT_PHRASE_RE.finditer(line))
+        if not phrases:
+            continue
+        leftover = _STAT_PHRASE_RE.sub(" ", line)
+        if not _STAT_LINE_LEFTOVER_RE.fullmatch(leftover):
+            continue
+
+        for match in phrases:
+            value = parse_count_token(match.group(1), match.group(2))
+            keyword = match.group(4).lower()
+            if keyword.startswith("follower"):
+                if followers is None:
+                    followers = value
+            elif connections is None:
+                connections = value
+                connections_capped = bool(match.group(3))
+
+        if followers is not None and connections is not None:
+            break
+
+    return {
+        "followers": followers,
+        "connections": connections,
+        "connections_capped": connections_capped,
+    }
+
+
+def audience_filter_rejection(
+    stats: dict,
+    min_followers: int,
+    require_500_connections: bool,
+) -> Optional[str]:
+    """Return a rejection reason, or None when the profile passes the filter.
+
+    Fails closed: when a threshold is configured and the corresponding stat is
+    not visible on the profile, the profile is rejected. LinkedIn surfaces
+    these numbers on virtually every real profile's topcard, so a missing stat
+    usually means a small account (or an unusual render worth skipping).
+    """
+    if min_followers > 0:
+        followers = stats.get("followers")
+        if followers is None:
+            return "follower count not visible on profile"
+        if followers < min_followers:
+            return f"{followers} followers < required {min_followers}"
+
+    if require_500_connections:
+        connections = stats.get("connections")
+        if connections is None:
+            return "connection count not visible on profile"
+        if connections < CONNECTIONS_DISPLAY_CAP:
+            return f"{connections} connections < required {CONNECTIONS_DISPLAY_CAP}+"
+
+    return None
 
 
 def sanitize_profile_content(name: Any, content: Any) -> Tuple[str, str]:
@@ -290,6 +457,7 @@ def normalize_invite_skip_reason(reason: str) -> str:
         "memorialized_account",
         "security_checkpoint",
         "profile_unavailable",
+        "audience_filter",
         "weekly_limit_reached",
         "withdrawal_cooldown",
     }:
@@ -426,6 +594,7 @@ def _format_invite_notification(
     reason: str = "",
     message: str = "",
     cooldown_until: datetime | None = None,
+    audience_stats: dict | None = None,
 ) -> str:
     lines = [f"<b>{escape_html_text(title)}</b>"]
     if profile_url:
@@ -434,6 +603,14 @@ def _format_invite_notification(
         lines.append(f"State: {escape_html_text(state)}")
     if reason:
         lines.append(f"Reason: {escape_html_text(describe_invite_reason(reason))}")
+    if audience_stats:
+        followers = audience_stats.get("followers")
+        if followers is not None:
+            lines.append(f"Followers: {escape_html_text(f'{followers:,}')}")
+        connections = audience_stats.get("connections")
+        if connections is not None:
+            capped = "+" if audience_stats.get("connections_capped") else ""
+            lines.append(f"Connections: {escape_html_text(f'{connections:,}{capped}')}")
     if cooldown_until:
         lines.append(
             f"Resume after: {escape_html_text(cooldown_until.strftime('%Y-%m-%d %H:%M UTC'))}"
@@ -566,6 +743,59 @@ class InviteTask(BaseTask):
             return True
 
         return False
+
+    def _enforce_audience_filter(self, url: str) -> Optional[dict]:
+        """Skip the invite when the profile fails the configured audience filter.
+
+        Runs at visit time on every invite — a queued DB task for a person who
+        turns out not to qualify is skipped all the same. Returns the parsed
+        stats when the filter is enabled so notifications can include them.
+        """
+        min_followers, require_500_connections = get_invite_audience_filter()
+        if min_followers <= 0 and not require_500_connections:
+            return None
+
+        stats = {"followers": None, "connections": None, "connections_capped": False}
+        for _ in range(AUDIENCE_STATS_MAX_ATTEMPTS):
+            try:
+                text = self.page.evaluate(
+                    "() => { const main = document.querySelector('main'); return main ? main.innerText : ''; }"
+                )
+            except Exception as exc:
+                logger.warning("Could not read profile text for audience filter: %s", exc)
+                break
+            stats = parse_audience_stats(text)
+            has_needed_stats = (
+                min_followers <= 0 or stats["followers"] is not None
+            ) and (
+                not require_500_connections or stats["connections"] is not None
+            )
+            if has_needed_stats:
+                break
+            self.human.random_sleep(0.7, 1.1)
+
+        rejection = audience_filter_rejection(
+            stats, min_followers, require_500_connections
+        )
+        if rejection:
+            logger.info(
+                "Audience filter rejected %s: %s (followers=%s, connections=%s%s)",
+                url,
+                rejection,
+                stats.get("followers"),
+                stats.get("connections"),
+                "+" if stats.get("connections_capped") else "",
+            )
+            raise TaskSkippedException("audience_filter", cooldown_eligible=False)
+
+        logger.info(
+            "Audience filter passed for %s (followers=%s, connections=%s%s)",
+            url,
+            stats.get("followers"),
+            stats.get("connections"),
+            "+" if stats.get("connections_capped") else "",
+        )
+        return stats
 
     def _wait_for_profile_hydration(self):
         """Nudge lazy modules to load, then wait for main's text to stabilize.
@@ -964,6 +1194,7 @@ class InviteTask(BaseTask):
                 profile_url=url,
                 state=confirmed_state.value,
                 message=connection_message or "None",
+                audience_stats=getattr(self, "_last_audience_stats", None),
             )
         )
 
@@ -1210,6 +1441,11 @@ class InviteTask(BaseTask):
             if state == ConnectionState.CONNECTED:
                 logger.info("Already connected, skipping")
                 raise TaskSkippedException("already_connected")
+
+            # Reset per-task so a previous prospect's stats can never leak
+            # into this invite's notification.
+            self._last_audience_stats = None
+            self._last_audience_stats = self._enforce_audience_filter(url)
 
             # Capture the prospect's content before any click: the page is
             # still scrollable (no modal), so lazy sections can hydrate, and
