@@ -112,6 +112,8 @@ Required for a normal worker run:
 Optional but important:
 
 - `OPENROUTER_API_KEY`: enables AI-generated invite notes, connect-action detection, and autonomous feed comments
+- `LLM_MODEL`: OpenRouter model slug used by every LLM module. Defaults to `google/gemini-3.7-flash`
+- `LLM_MODEL_CONNECTION_MESSAGE`, `LLM_MODEL_REFINE_TEXT`, `LLM_MODEL_FEED_COMMENT`, `LLM_MODEL_CONNECT_ACTION`: per-module overrides. Each falls back to `LLM_MODEL`, then to the built-in default
 - `HEADLESS`: browser visibility toggle. Defaults to `true`
 - `TELEGRAM_NOTIFICATIONS_URL`: notification endpoint
 - `TELEGRAM_CHAT_ID`: notification target
@@ -121,6 +123,8 @@ Behavior notes:
 
 - invite tasks still work without `OPENROUTER_API_KEY`, but personalized notes and some selector-detection behavior degrade
 - autonomous feed comments require `OPENROUTER_API_KEY`
+- model selection is resolved per request in `src/llm.py:resolve_model`, so changing `LLM_MODEL*` only needs a worker restart
+- `LLM_MODEL_CONNECT_ACTION` must name a vision-capable model; that module sends a screenshot
 - notifications are silently skipped unless all three Telegram-related variables are set
 
 ## Local Development

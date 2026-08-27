@@ -14,6 +14,33 @@ MAX_MESSAGE_LENGTH = 200
 MAX_COMMENT_LENGTH = 180
 MAX_REFINEMENT_ATTEMPTS = 3
 
+# Model used by every LLM module unless that module is overridden below.
+DEFAULT_LLM_MODEL = "google/gemini-3.7-flash"
+
+# Fallback override for all modules at once.
+LLM_MODEL_ENV = "LLM_MODEL"
+
+# Per-module overrides. Each falls back to LLM_MODEL, then DEFAULT_LLM_MODEL.
+CONNECTION_MESSAGE_MODEL_ENV = "LLM_MODEL_CONNECTION_MESSAGE"
+REFINE_TEXT_MODEL_ENV = "LLM_MODEL_REFINE_TEXT"
+FEED_COMMENT_MODEL_ENV = "LLM_MODEL_FEED_COMMENT"
+CONNECT_ACTION_MODEL_ENV = "LLM_MODEL_CONNECT_ACTION"
+
+
+def resolve_model(env_name: str) -> str:
+    """Return the OpenRouter model slug for one LLM module.
+
+    Resolved per call so a .env edit takes effect on restart without any
+    import-order surprises: the module's own env var wins, then the global
+    LLM_MODEL, then DEFAULT_LLM_MODEL.
+    """
+    for name in (env_name, LLM_MODEL_ENV):
+        value = (os.getenv(name) or "").strip()
+        if value:
+            return value
+    return DEFAULT_LLM_MODEL
+
+
 REFINE_TEXT_PROMPT = """Your {content_label} is {current_length} characters but must be {max_length} characters or less.
 
 Shorten this text while preserving its core meaning and human tone:
@@ -132,7 +159,7 @@ def _refine_text_length(
     }
 
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": resolve_model(REFINE_TEXT_MODEL_ENV),
         "messages": [
             {
                 "role": "user",
@@ -178,7 +205,7 @@ def generate_connection_message(
 
     prospect_label = profile_name.strip() or "the prospect"
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": resolve_model(CONNECTION_MESSAGE_MODEL_ENV),
         "messages": [
             {
                 "role": "user",
@@ -257,7 +284,7 @@ def generate_feed_comment(post_content: str) -> dict | None:
     }
 
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": resolve_model(FEED_COMMENT_MODEL_ENV),
         "messages": [
             {
                 "role": "user",
@@ -366,7 +393,7 @@ def get_next_connect_action(
     }
 
     payload = {
-        "model": "google/gemini-3-flash-preview",
+        "model": resolve_model(CONNECT_ACTION_MODEL_ENV),
         "messages": [
             {
                 "role": "user",
