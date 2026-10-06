@@ -11,6 +11,7 @@ from linkedin_profile import (
     assert_profile_identity,
     canonical_profile_url,
     get_profile_topcard,
+    is_profile_owned_element,
     read_profile_snapshot,
     wait_for_profile,
 )
@@ -38,6 +39,32 @@ SECTIONS = f"""<section id="about"><h2>About</h2><p>{ABOUT}</p></section>
 
 def profile_html(sections=SECTIONS, topcard=TOPCARD, extra=""):
     return f"<!doctype html><html><body><main>{topcard}{sections}{extra}</main></body></html>"
+
+
+def sdui_profile_html():
+    # Production SDUI uses a layout section around a LazyColumn, then keyed
+    # cards inside wrapper groups; the nearest section is not the whole column.
+    prefix = "com.linkedin.sdui.profile.card.refTARGET"
+    return f"""<main><section><div data-component-type="LazyColumn">
+      <div componentkey="{prefix}Topcard"><div><section id="target-card">
+        <div><div><a href="{URL}"><div><div><h2>Jane Prospect</h2></div></div></a></div>
+          <p>· 2nd</p></div>
+        <p>Building data platforms at Orchard Analytics</p>
+        <div><a href="{URL}overlay/contact-info/">Contact info</a></div>
+        <p>5,000 followers</p><div><p>500+</p><p>connections</p></div>
+        <button id="target-connect">Connect</button>
+      </section></div></div>
+      <div componentkey="profileCardsAboveActivity">
+        <div componentkey="{prefix}Highlights"><section><h2>Highlights</h2>
+          <a href="/in/mutual-person/">Mutual Person</a></section></div>
+        <div componentkey="{prefix}About"><div><section><h2>About</h2>
+          <p>{ABOUT}</p></section></div></div>
+      </div>
+      <div componentkey="{prefix}Activity"><section><h2>Activity</h2>
+        <p>Unrelated shared post content must not personalize an invitation.</p>
+        <a href="/in/foreign/">Foreign Person</a><button id="foreign-connect">Connect</button>
+      </section></div>
+    </div></section></main>"""
 
 
 class CanonicalProfileUrlTests(unittest.TestCase):
@@ -189,6 +216,77 @@ class ProfileIdentityBrowserTests(OfflineBrowserTestCase):
             )
         )
         self.assert_skipped("profile_not_ready")
+
+
+class SduiProfileBrowserTests(OfflineBrowserTestCase):
+    def test_nested_layout_preserves_identity_owned_content_and_actions(self):
+        self.load_html(sdui_profile_html())
+        snapshot = wait_for_profile(self.page, URL, timeout_ms=1200)
+        self.assertEqual(
+            snapshot.identity, ProfileIdentity(URL, "jane-prospect", "Jane Prospect")
+        )
+        self.assertEqual(snapshot.about, ABOUT)
+        self.assertNotIn("shared post", snapshot.content)
+        self.assertNotIn("Mutual Person", snapshot.content)
+        self.assertEqual(
+            get_profile_topcard(self.page, snapshot.identity).get_attribute("id"),
+            "target-card",
+        )
+        self.assertTrue(
+            is_profile_owned_element(
+                self.page.locator("#target-connect"), self.page, snapshot.identity
+            )
+        )
+        self.assertFalse(
+            is_profile_owned_element(
+                self.page.locator("#foreign-connect"), self.page, snapshot.identity
+            )
+        )
+        self.assertIn("5,000 followers", snapshot.audience_text)
+        self.assertIn("500+", snapshot.audience_text)
+
+    def test_card_marker_alone_does_not_prove_recipient(self):
+        self.load_html(sdui_profile_html().replace(f'href="{URL}', 'href="/unknown/'))
+        with self.assertRaises(TaskSkippedException) as raised:
+            wait_for_profile(self.page, URL, timeout_ms=200)
+        self.assertEqual(raised.exception.reason, "profile_not_ready")
+
+    def test_stale_sdui_identity_is_rejected(self):
+        self.load_html(
+            sdui_profile_html().replace(URL, "https://www.linkedin.com/in/old-person/")
+        )
+        with self.assertRaises(TaskSkippedException) as raised:
+            wait_for_profile(self.page, URL, timeout_ms=200)
+        self.assertEqual(raised.exception.reason, "profile_identity_mismatch")
+
+    def test_foreign_keyed_about_is_not_owned(self):
+        self.load_html(
+            sdui_profile_html().replace("card.refTARGETAbout", "card.refOTHERAbout")
+        )
+        snapshot = wait_for_profile(self.page, URL, timeout_ms=200)
+        self.assertEqual(snapshot.identity.name, "Jane Prospect")
+        self.assertEqual(snapshot.about, "")
+        self.assertEqual(snapshot.content, "")
+
+    def test_topcard_inside_recommendation_module_is_not_primary(self):
+        self.load_html(
+            sdui_profile_html().replace(
+                "<main><section>", "<main><section><h2>People you may know</h2>"
+            )
+        )
+        with self.assertRaises(TaskSkippedException) as raised:
+            wait_for_profile(self.page, URL, timeout_ms=200)
+        self.assertEqual(raised.exception.reason, "profile_not_ready")
+
+    def test_about_inside_foreign_module_is_not_owned(self):
+        html = sdui_profile_html().replace(
+            '<div componentkey="profileCardsAboveActivity">',
+            '<div componentkey="profileCardsAboveActivity"><h2>Other Person</h2>',
+        )
+        self.load_html(html)
+        snapshot = wait_for_profile(self.page, URL, timeout_ms=200)
+        self.assertEqual(snapshot.about, "")
+        self.assertEqual(snapshot.content, "")
 
 
 class ProfileReadinessBrowserTests(OfflineBrowserTestCase):

@@ -73,6 +73,8 @@ _PROFILE_DOM_JS = r"""
 (args) => {
   const clean = value => (value || '').replace(/\s+/g, ' ').trim();
   const headings = 'h1,h2,h3,[role="heading"]';
+  const sduiCards = '[componentkey^="com.linkedin.sdui.profile.card."]';
+  const lazyColumn = '[data-component-type="LazyColumn"]';
   const noise = 'aside,nav,footer,[role="dialog"],[role="complementary"]';
   const visible = el => !!el && el.getClientRects().length > 0 &&
     getComputedStyle(el).visibility !== 'hidden';
@@ -174,7 +176,13 @@ _PROFILE_DOM_JS = r"""
       root = root.parentElement;
     }
     if (!root || root === main || root.closest(noise)) continue;
-    if (root.parentElement?.closest('section,article')) continue;
+    const sduiCard = root.closest(sduiCards);
+    const sduiKey = sduiCard?.getAttribute('componentkey') || '';
+    const sduiColumn = sduiKey.endsWith('Topcard') &&
+      sduiCard.parentElement?.matches(lazyColumn) ? sduiCard.parentElement : null;
+    // SDUI nests keyed cards inside a layout section. Only its explicit
+    // topcard/column relationship may cross that otherwise unsafe boundary.
+    if (root.parentElement?.closest('section,article') && !sduiColumn) continue;
     let enclosed = false;
     for (let ancestor = root.parentElement; ancestor && ancestor !== main; ancestor = ancestor.parentElement) {
       if ([...ancestor.querySelectorAll(headings)].some(h => !root.contains(h) &&
@@ -206,17 +214,18 @@ _PROFILE_DOM_JS = r"""
       else if (/\/in\//i.test(href)) markers.push('invalid');
     }
     if (!markers.length) continue;
-    candidates.push({root, heading, name, markers, excluded});
+    candidates.push({root, heading, name, markers, excluded,
+      primary: sduiColumn || root.parentElement,
+      cardPrefix: sduiColumn ? sduiKey.slice(0, -'Topcard'.length) : ''});
   }
   // Multiple apparent owners are unsafe even when one matches the queue.
   const unique = candidates.filter((item, i) => candidates.findIndex(c => c.root === item.root) === i);
   if (!unique.length) return {status: 'not_ready'};
   if (unique.length !== 1 || unique[0].markers.some(url => url !== expected)) return {status: 'mismatch'};
-  const {root, heading, name, excluded} = unique[0];
+  const {root, heading, name, excluded, primary, cardPrefix} = unique[0];
   if (ownHeadings(main)[0] !== heading) return {status: 'not_ready'};
   if (args.name && name !== args.name) return {status: 'mismatch'};
   if (busy(root, excluded)) return {status: 'not_ready'};
-  const primary = root.parentElement;
   // The owning column must not itself be a foreign module.
   if (primary !== main && (!main.contains(primary) || primary.closest(noise))) return {status: 'not_ready'};
   const owned = el => {
@@ -270,12 +279,23 @@ _PROFILE_DOM_JS = r"""
       section = section.parentElement;
     }
     if (!section || section === primary || section.contains(root)) continue;
+    const sectionCard = h.closest(sduiCards);
+    if (cardPrefix && (!sectionCard?.contains(section) ||
+        sectionCard.getAttribute('componentkey') !== cardPrefix + key[0].toUpperCase() + key.slice(1) ||
+        sectionCard.closest(lazyColumn) !== primary)) continue;
+    // Keyed sibling cards share SDUI wrapper groups, not each other's prose.
+    // Unkeyed foreign modules still invalidate an enclosing branch.
+    const inSiblingCard = node => {
+      const card = node.closest(sduiCards);
+      return cardPrefix && card && card !== sectionCard && primary.contains(card);
+    };
     let nestedModule = false;
     for (let ancestor = section.parentElement; ancestor && ancestor !== primary; ancestor = ancestor.parentElement) {
       if (ancestor.matches('section,article,li') ||
-          [...ancestor.querySelectorAll(headings)].some(other => !section.contains(other)) ||
+          [...ancestor.querySelectorAll(headings)].some(other => !section.contains(other) && !inSiblingCard(other)) ||
           [...ancestor.querySelectorAll('a[href]')].some(a => {
-            const target = profile(a.href, true); return target && target !== expected;
+            const target = profile(a.href, true);
+            return target && target !== expected && !inSiblingCard(a);
           })) nestedModule = true;
     }
     if (nestedModule) continue;
