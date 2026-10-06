@@ -37,6 +37,7 @@ TaskDispatcher
 - `src/main.py`: entry point, browser startup, LinkedIn auth recovery, debug CLI modes, graceful shutdown
 - `src/dispatcher.py`: polling loop, task selection, spacing windows, zombie cleanup, autonomous comment scheduling
 - `src/db.py`: SQLAlchemy engine, `linkedin_tasks` table, enums, DB initialization
+- `src/invite_schedule.py`: deterministic rolling-quota slots and minimum invitation spacing
 - `src/tasks/invite.py`: profile visit, connect-button discovery, optional AI-generated note, invitation confirmation
 - `src/linkedin_profile.py`: canonical target identity, shared topcard ownership, allowlisted profile sections, bounded readiness checks
 - `src/invite_modal.py`: recipient-verified invitation dialogs and scoped note/send controls
@@ -73,17 +74,22 @@ Task statuses:
 ### Dispatcher cadence
 
 - Poll interval is 10 seconds
-- Stuck `processing` tasks are reset to `pending` on startup
+- Interrupted `processing` invitations are held as `failed` / `invite_not_confirmed` for reconciliation, never blindly replayed; other stuck task types are reset to `pending`
 - stale pending `create_post` tasks older than one hour are deleted
 - legacy DB-backed feed-comment tasks are deleted
+- Runnable invitations take priority over other queued task types and notification scans
+- New notification scans/comments do not start within 15 minutes of a pending invitation becoming eligible; already-running synchronous actions are not forcibly interrupted
+- Notification discovery runs in available idle windows, with its existing 30-minute minimum interval. With recent invite history and a backlog, it runs at most once per quota event; it never runs during a durable invite cooldown or exhausted invite quota.
 
 ### Invitation identity and personalization
 
 - Every invite requires the queued URL, loaded profile, Connect target, and invitation dialog recipient to agree. Profile URLs are canonicalized; a canonical page link alone is not enough to prove the visible topcard belongs to the target.
 - Personalization uses only the verified prospect's headline, About, and Experience sections. Activity, reposts, recommendations, and unbounded/ambiguous modules are excluded rather than sent to the LLM.
 - Readiness waits up to eight seconds for substantive owned content and 600 ms of stable identity/fields. At least one substantive About/Experience section is required; absent sections are optional, but discovered empty/loading sections prevent early personalization. Headline-only or insufficient content produces an invitation without a note, never a whole-page fallback.
-- Unknown or contradictory profile identity aborts with `profile_not_ready` or `profile_identity_mismatch`. An ambiguous/wrong invitation recipient aborts with `modal_recipient_mismatch`; a first name alone without an exact target profile link is insufficient.
-- Audience filtering reads only the verified topcard. Required counts that remain unreadable produce `audience_unavailable`; genuinely below-threshold counts produce `audience_filter`. Both remain conservative skips, not automatic retries.
+- Unknown or contradictory profile identity aborts with `profile_not_ready` or `profile_identity_mismatch`. An ambiguous/wrong invitation recipient aborts with `modal_recipient_mismatch`; a first name alone without an exact target profile link is insufficient. Once Connect may have been dispatched, non-platform confirmation errors are logged with their original cause and held as `invite_not_confirmed`.
+- Audience filtering reads only the verified topcard. Required counts that remain unreadable produce `audience_unavailable`; genuinely below-threshold counts produce `audience_filter`.
+- Only explicitly marked **pre-send** `profile_not_ready` and `audience_unavailable` outcomes can be deferred: at most two retries, no earlier than 30 minutes and then six hours. Their `not_before` and `preflight_retries` fields survive restarts. A reason string alone never authorizes retry.
+- Audience rejections, identity/modal mismatches, generic navigation/selector failures, exhausted preflight retries, and uncertain sends remain terminal. Notification engagement cannot resurrect terminal tasks or reset deferred retry budgets.
 - Note and Send controls are scoped to the verified invitation dialog; stale text is cleared on the no-note path. Note readback must exactly match the generated note.
 - A potentially dispatched Connect/Send click is never blindly retried. Completion requires the verified target to show Pending/Connected; an unrelated success toast is not enough.
 - `completed` means an invitation workflow was confirmed, not that the recipient later accepted. Acceptance is not tracked.
@@ -91,13 +97,13 @@ Task statuses:
 
 ### Rate limits and spacing
 
-The dispatcher uses randomized spacing rather than fixed cron-like scheduling.
+The dispatcher preserves rolling caps while using quota-aware slots for invitations and randomized spacing for other actions.
 
-- invites: 10 per rolling 24 hours
+- invites: 10 quota-consuming outcomes per rolling 24 hours; confirmed requests and unresolved `invite_not_confirmed` outcomes both reserve slots conservatively
 - posts: 50 per rolling 24 hours
 - autonomous feed comments: 12 per rolling 24 hours
 
-Spacing between actions is derived from the daily cap, then randomized in the `0.7x` to `1.3x` range.
+Invitation slots are reconstructed from persisted quota events, rather than adding a fresh delay after every completion. Remaining slots are distributed against the oldest retained event's 24-hour horizon, with a minimum gap of `0.7 × 24 hours / cap` (100 minutes 48 seconds at cap 10). At a full quota the worker waits until the oldest relevant event exits the inclusive rolling window. Cooldowns and profile-visit throttles still take precedence; no catch-up bursts or cap increase are allowed. Posts/comments retain `0.7x`–`1.3x` randomized spacing.
 
 Additional cooldowns are applied for known LinkedIn skip reasons:
 
@@ -113,6 +119,8 @@ Additional cooldowns are applied for known LinkedIn skip reasons:
 - autonomous feed-comment history: `data/feed_comment_history.json`
 
 The browser runs in a persistent context, so successful login state is meant to survive restarts.
+
+Startup runs `init_db()` before browser activity. Existing task databases receive additive, idempotent `not_before` and `preflight_retries` columns without replacing task rows. Back up live state before rollout. Older workers can read the expanded schema but do not honor deferred-retry deadlines, so rollback requires attention to pending deferred tasks.
 
 ## Environment Variables
 

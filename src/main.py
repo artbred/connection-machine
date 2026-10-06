@@ -14,7 +14,7 @@ from patchright.sync_api import sync_playwright
 load_dotenv()
 
 from dispatcher import TaskDispatcher  # noqa: E402
-from db import SessionLocal, Task, TaskStatus, TaskType  # noqa: E402
+from db import SessionLocal, Task, TaskStatus, TaskType, init_db  # noqa: E402
 from exceptions import SessionExpiredException, TaskSkippedException  # noqa: E402
 from metrics import NoopMetrics, create_metrics  # noqa: E402
 from tasks.invite import InviteTask, normalize_invite_skip_reason  # noqa: E402
@@ -273,6 +273,7 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
+        init_db()
         user_data_dir = os.path.join(os.getcwd(), "data", "connection-machine-chrome")
         logger.info(f"Using user data dir: {user_data_dir}")
 

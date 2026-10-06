@@ -6,14 +6,14 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 
 from sqlalchemy.orm import Session
 
 from .base import BaseTask
 from connection_state import ConnectionState, detect_connection_state
 from db import Task, TaskStatus, TaskType
-from linkedin_profile import wait_for_profile
+from linkedin_profile import canonical_profile_url, wait_for_profile
 
 logger = logging.getLogger(__name__)
 
@@ -36,11 +36,7 @@ COMMENT_ENGAGEMENT_RE = re.compile(
 
 
 def normalize_profile_url(url: str) -> str:
-    parsed = urlparse(urljoin("https://www.linkedin.com", url.strip()))
-    path = parsed.path.rstrip("/")
-    if not path.startswith("/in/"):
-        return ""
-    return f"https://www.linkedin.com{path}/"
+    return canonical_profile_url(urljoin("https://www.linkedin.com", url.strip())) or ""
 
 
 def notification_key(profile_url: str, text: str) -> str:
@@ -113,24 +109,26 @@ class NotificationReplyInviteScanner(BaseTask):
                 continue
 
             existing_task = self._find_existing_invite_task(db, normalized_url)
+            # Notifications must not resurrect a rejected prospect or replay a
+            # possibly sent invitation. Safe transient retries remain PENDING
+            # and are owned by the dispatcher's bounded not_before policy.
+            if existing_task and existing_task.status != TaskStatus.PENDING:
+                self._record_state(
+                    state,
+                    normalized_url,
+                    candidate,
+                    f"existing_{existing_task.status.value}",
+                    task_id=existing_task.id,
+                )
+                continue
             profiles = state.setdefault("profiles", {})
             existing_entry = profiles.get(normalized_url)
             existing_status = existing_entry.get("status") if existing_entry else ""
-            retry_failed_task = (
-                existing_status == "queued"
-                and existing_task is not None
-                and existing_task.status == TaskStatus.FAILED
-            )
-            if (
-                existing_entry
-                and existing_status
-                in {
-                    "queued",
-                    "already_connected",
-                    "already_pending",
-                }
-                and not retry_failed_task
-            ):
+            if existing_entry and existing_status in {
+                "queued",
+                "already_connected",
+                "already_pending",
+            }:
                 logger.info(
                     "Skipping notification reply candidate already handled: %s",
                     normalized_url,
@@ -145,31 +143,18 @@ class NotificationReplyInviteScanner(BaseTask):
                 continue
 
             if existing_task:
-                if existing_task.status in {TaskStatus.PENDING, TaskStatus.FAILED}:
-                    self._prioritize_existing_task(
-                        existing_task,
-                        candidate,
-                        priority_created_at,
-                    )
-                    existing_task.status = TaskStatus.PENDING
-                    existing_task.error = None
-                    db.commit()
-                    record = self._record_state(
-                        state,
-                        normalized_url,
-                        candidate,
-                        "queued",
-                        task_id=existing_task.id,
-                    )
-                    queued.append(record)
-                else:
-                    self._record_state(
-                        state,
-                        normalized_url,
-                        candidate,
-                        f"existing_{existing_task.status.value}",
-                        task_id=existing_task.id,
-                    )
+                self._prioritize_existing_task(
+                    existing_task, candidate, priority_created_at
+                )
+                db.commit()
+                record = self._record_state(
+                    state,
+                    normalized_url,
+                    candidate,
+                    "queued",
+                    task_id=existing_task.id,
+                )
+                queued.append(record)
                 continue
 
             connection_state = self._get_connection_state(normalized_url)

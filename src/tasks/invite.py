@@ -622,6 +622,7 @@ class InviteTask(BaseTask):
                 cooldown_until=cooldown_until,
                 from_active_cooldown=exc.from_active_cooldown,
                 cooldown_eligible=cooldown_until is not None,
+                retryable_preflight=exc.retryable_preflight,
             )
         except Exception as exc:
             normalized_reason = normalize_invite_skip_reason(str(exc))
@@ -683,7 +684,11 @@ class InviteTask(BaseTask):
 
         if not has_needed_stats:
             logger.info("Required audience counts unavailable for %s", url)
-            raise TaskSkippedException("audience_unavailable", cooldown_eligible=False)
+            raise TaskSkippedException(
+                "audience_unavailable",
+                cooldown_eligible=False,
+                retryable_preflight=True,
+            )
         rejection = audience_filter_rejection(
             stats, min_followers, require_500_connections
         )
@@ -698,6 +703,16 @@ class InviteTask(BaseTask):
             "+" if stats["connections_capped"] else "",
         )
         return stats
+
+    def _read_preflight_profile(self, url: str, *, personalize: bool):
+        try:
+            return wait_for_profile(self.page, url, personalize=personalize)
+        except TaskSkippedException as exc:
+            if exc.reason == "profile_not_ready":
+                raise TaskSkippedException(
+                    exc.reason, cooldown_eligible=False, retryable_preflight=True
+                ) from exc
+            raise
 
     def _require_target_identity(self) -> ProfileIdentity:
         identity = self._target_identity
@@ -1102,17 +1117,28 @@ class InviteTask(BaseTask):
         )
 
     def _after_connect_click(self, url: str, profile_content: str) -> dict:
-        error = self._check_invitation_error()
-        if error:
-            raise TaskSkippedException(error)
-        if self._wait_for_invite_modal():
-            return self._complete_connection(url, profile_content)
-        final_state = self._confirm_invitation_sent(url)
-        if final_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
-            return self._record_confirmed_invite(url, final_state, None)
-        # Connect itself may submit on some layouts. Never try another action
-        # after its outcome becomes ambiguous.
-        raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        try:
+            error = self._check_invitation_error()
+            if error:
+                raise TaskSkippedException(error)
+            if self._wait_for_invite_modal():
+                return self._complete_connection(url, profile_content)
+            final_state = self._confirm_invitation_sent(url)
+            if final_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+                return self._record_confirmed_invite(url, final_state, None)
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        except TaskSkippedException as exc:
+            if exc.reason in {"weekly_limit_reached", "withdrawal_cooldown"}:
+                raise
+            logger.warning("Post-Connect outcome is unconfirmed (%s)", exc.reason)
+            raise TaskSkippedException(
+                "invite_not_confirmed", cooldown_eligible=False
+            ) from exc
+        except Exception as exc:
+            logger.warning("Post-Connect confirmation failed: %s", exc)
+            raise TaskSkippedException(
+                "invite_not_confirmed", cooldown_eligible=False
+            ) from exc
 
     def _complete_connection(self, url: str, profile_content: str) -> dict:
         identity = self._require_target_identity()
@@ -1206,7 +1232,7 @@ class InviteTask(BaseTask):
         logger.info("Sending connection request to %s", url)
         self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
         self.validate_session()
-        snapshot = wait_for_profile(self.page, url, personalize=False)
+        snapshot = self._read_preflight_profile(url, personalize=False)
         identity = snapshot.identity
         self._target_identity = identity
         state = detect_connection_state(self.page, identity)
@@ -1218,7 +1244,7 @@ class InviteTask(BaseTask):
         self._last_audience_stats = self._enforce_audience_filter(url)
         profile_content = ""
         if try_personal_message:
-            snapshot = wait_for_profile(self.page, url, personalize=True)
+            snapshot = self._read_preflight_profile(url, personalize=True)
             if snapshot.identity != identity:
                 raise TaskSkippedException(
                     "profile_identity_mismatch", cooldown_eligible=False
@@ -1226,6 +1252,14 @@ class InviteTask(BaseTask):
             profile_content = snapshot.content
             if not profile_content:
                 logger.info("Owned profile sections are not ready; omitting the note")
+            else:
+                logger.info(
+                    "Owned profile ready for %s (headline=%d, about=%d, experience=%d characters)",
+                    identity.url,
+                    len(snapshot.headline),
+                    len(snapshot.about),
+                    len(snapshot.experience),
+                )
         assert_profile_identity(self.page, identity)
         # A dialog left by an earlier task must not be mistaken for the result
         # of a new Connect click, even when its recipient happens to match.

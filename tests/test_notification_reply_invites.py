@@ -3,7 +3,7 @@ import os
 import sys
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
@@ -253,6 +253,84 @@ class NotificationReplyInviteTests(unittest.TestCase):
             payload = json.loads(next_task.payload)
             self.assertEqual(payload["url"], "https://www.linkedin.com/in/ada/")
             self.assertEqual(payload["source"], NOTIFICATION_REPLY_INVITE_SOURCE)
+
+    def test_external_notification_url_cannot_be_rewritten_into_a_linkedin_target(self):
+        self.assertEqual(normalize_profile_url("https://example.com/in/ada/"), "")
+        self.assertEqual(
+            normalize_profile_url("//linkedin.com.example.com/in/ada/"), ""
+        )
+        self.assertEqual(
+            normalize_profile_url("/in/ADA/?tracking=1"),
+            "https://www.linkedin.com/in/ada/",
+        )
+
+    def test_failed_targets_are_not_resurrected_or_revisited_by_notifications(self):
+        class NoVisitScanner(FakeScanner):
+            def _get_connection_state(self, profile_url):
+                raise AssertionError(
+                    "A terminal task must not cause another profile visit"
+                )
+
+        for reason in ("audience_filter", "invite_not_confirmed", "profile_not_ready"):
+            with (
+                self.subTest(reason=reason),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                url = f"https://www.linkedin.com/in/{reason}/"
+                candidate = {
+                    "profile_url": url,
+                    "name": "Candidate",
+                    "text": "Candidate loved your comment",
+                    "notification_key": reason,
+                }
+                with SessionLocal() as db:
+                    task = Task(
+                        type=TaskType.SEND_INVITE,
+                        payload=json.dumps({"url": url}),
+                        status=TaskStatus.FAILED,
+                        error=reason,
+                        preflight_retries=2,
+                    )
+                    db.add(task)
+                    db.commit()
+                    scanner = NoVisitScanner(
+                        [candidate], Path(directory) / "state.json"
+                    )
+                    self.assertEqual(scanner.queue_reply_invites(db), [])
+                    db.refresh(task)
+                    self.assertEqual(task.status, TaskStatus.FAILED)
+                    self.assertEqual(task.error, reason)
+                    self.assertEqual(task.preflight_retries, 2)
+
+    def test_notification_priority_preserves_deferred_retry_budget_and_deadline(self):
+        due = datetime.utcnow() + timedelta(hours=6)
+        candidate = {
+            "profile_url": "https://www.linkedin.com/in/ada/",
+            "name": "Ada",
+            "text": "Ada loved your comment",
+            "notification_key": "later",
+        }
+        with tempfile.TemporaryDirectory() as directory, SessionLocal() as db:
+            task = Task(
+                type=TaskType.SEND_INVITE,
+                payload=json.dumps({"url": "http://linkedin.com/in/ADA?tracking=1"}),
+                status=TaskStatus.PENDING,
+                error="audience_unavailable",
+                preflight_retries=2,
+                not_before=due,
+            )
+            db.add(task)
+            db.commit()
+            scanner = FakeScanner([candidate], Path(directory) / "state.json")
+            scanner.queue_reply_invites(db)
+            db.refresh(task)
+            self.assertEqual(task.status, TaskStatus.PENDING)
+            self.assertEqual(task.not_before, due)
+            self.assertEqual(task.preflight_retries, 2)
+            self.assertEqual(task.error, "audience_unavailable")
+            self.assertEqual(
+                json.loads(task.payload)["source"], NOTIFICATION_REPLY_INVITE_SOURCE
+            )
 
 
 if __name__ == "__main__":

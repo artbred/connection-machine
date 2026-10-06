@@ -385,6 +385,37 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         )
         self.assertFalse(self.history_path.exists())
 
+    def test_preflight_audience_failure_retains_explicit_retry_permission(self):
+        task = self.make_task(
+            fixture(already_open=False).replace("5,000 followers<br>", "")
+        )
+        with self.assertRaises(TaskSkippedException) as caught:
+            task.run({"url": TARGET})
+        self.assertEqual(caught.exception.reason, "audience_unavailable")
+        self.assertTrue(caught.exception.retryable_preflight)
+        self.assert_nothing_sent()
+
+    def test_readiness_error_after_send_never_becomes_a_preflight_retry(self):
+        task = self.make_task(fixture(already_open=False))
+        with (
+            patch.object(
+                task,
+                "_confirm_invitation_sent",
+                side_effect=TaskSkippedException(
+                    "profile_not_ready", cooldown_eligible=False
+                ),
+            ),
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task.run({"url": TARGET, "try_personal_message": False})
+        self.assertEqual(caught.exception.reason, "invite_not_confirmed")
+        self.assertFalse(caught.exception.retryable_preflight)
+        self.assertEqual(
+            self.sent_records(),
+            [{"name": "Invite Jane Prospect to connect", "note": ""}],
+        )
+        self.assertFalse(self.history_path.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
