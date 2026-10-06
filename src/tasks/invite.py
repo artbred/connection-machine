@@ -1260,10 +1260,9 @@ class InviteTask(BaseTask):
                     len(snapshot.about),
                     len(snapshot.experience),
                 )
-        assert_profile_identity(self.page, identity)
-        # A dialog left by an earlier task must not be mistaken for the result
+        # An invitation dialog left by an earlier task must not be mistaken for the result
         # of a new Connect click, even when its recipient happens to match.
-        if self.page.locator("[role='dialog']:visible, dialog[open]").count():
+        if find_invite_dialog(self.page, identity) is not None:
             raise TaskSkippedException(
                 "modal_recipient_mismatch", cooldown_eligible=False
             )

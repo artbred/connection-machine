@@ -92,6 +92,7 @@ Task statuses:
 - Only explicitly marked **pre-send** `profile_not_ready` and `audience_unavailable` outcomes can be deferred: at most two retries, no earlier than 30 minutes and then six hours. Their `not_before` and `preflight_retries` fields survive restarts. A reason string alone never authorizes retry.
 - Audience rejections, identity/modal mismatches, generic navigation/selector failures, exhausted preflight retries, and uncertain sends remain terminal. Notification engagement cannot resurrect terminal tasks or reset deferred retry budgets.
 - Note and Send controls are scoped to the verified invitation dialog; stale text is cleared on the no-note path. Note readback must exactly match the generated note.
+- Before Connect, existing invitation dialogs abort even if their recipient matches. The same invitation-specific verifier is used before and after Connect; unrelated chat or embedded video-error dialogs do not qualify as invitation dialogs.
 - A potentially dispatched Connect/Send click is never blindly retried. Completion requires the verified target to show Pending/Connected; an unrelated success toast is not enough.
 - `completed` means an invitation workflow was confirmed, not that the recipient later accepted. Acceptance is not tracked.
 - These checks deliberately fail closed for unsupported layouts. Do not restore page-wide `.first` selectors, whole-`main` text extraction, or post-click content re-scraping as fallbacks.

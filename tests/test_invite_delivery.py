@@ -163,6 +163,43 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             [(TARGET, "pending", NOTE)],
         )
 
+    def test_video_error_dialog_does_not_block_a_verified_invitation(self):
+        video_error = """
+<div class="video-js">
+  <div role="dialog" class="vjs-error-display vjs-modal-dialog"
+       aria-label="Modal Window" aria-hidden="false">
+    <p>This is a modal window.</p>
+    <div>The media could not be loaded, either because the server or network
+         failed or because the format is not supported.</div>
+  </div>
+</div>
+"""
+        task = self.make_task(fixture(already_open=False) + video_error)
+        with patch.object(invite, "generate_connection_message", return_value=NOTE):
+            result = task.send_connection_request(TARGET)
+        self.assertEqual(result, {"status": "pending", "message": NOTE})
+        self.assertEqual(
+            self.sent_records(),
+            [{"name": "Invite Jane Prospect to connect", "note": NOTE}],
+        )
+        self.assertTrue(self.page.locator(".vjs-error-display").is_visible())
+
+    def test_preexisting_invitation_is_rejected_before_connect_even_for_same_target(self):
+        for recipient in ("Jane Prospect", "Alex Stranger"):
+            with self.subTest(recipient=recipient):
+                html = fixture(DIALOG.replace("Jane Prospect", recipient)).replace(
+                    'onclick="openInvite()"',
+                    'onclick="document.body.dataset.connectClicked=1; openInvite()"',
+                )
+                task = self.make_task(html)
+                with self.assertRaises(TaskSkippedException) as caught:
+                    task.send_connection_request(TARGET, try_personal_message=False)
+                self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
+                self.assertIsNone(
+                    self.page.locator("body").get_attribute("data-connect-clicked")
+                )
+                self.assert_nothing_sent()
+
     def test_no_note_path_removes_preexisting_editor_text(self):
         dialog = DIALOG.replace(
             '<textarea id="custom-message"></textarea>',
