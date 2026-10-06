@@ -1,136 +1,275 @@
-"""Executes PROFILE_CONTENT_EXTRACTION_JS in a real headless browser.
+"""Exercise owned DOM extraction against adversarial profile module layouts."""
 
-Covers the contamination scenarios observed live on LinkedIn profile pages:
-foreign recommendation modules, footer/aside noise, and Activity items that
-are verb-banner cards ("NAME commented on this" / "likes this" / "reposted
-this") whose body is another person's post.
-"""
-
-import os
-import sys
 import unittest
-from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-
-os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
-
-from tasks.invite import (  # noqa: E402
-    PROFILE_CONTENT_EXTRACTION_JS,
-    PROFILE_FOREIGN_MODULE_HEADINGS,
+from tests.browser_case import OfflineBrowserTestCase
+from tests.test_profile_content import (
+    ABOUT,
+    EXPERIENCE,
+    SECTIONS,
+    TOPCARD,
+    URL,
+    profile_html,
 )
-
-FIXTURE_HTML = """
-<main>
-  <section>
-    <h2>Jane Prospect</h2>
-    <div>Building data platforms | Ex-Acme</div>
-    <div>Berlin, Germany</div>
-    <button>Connect</button>
-  </section>
-  <section>
-    <h2>About</h2>
-    <div>I design streaming pipelines and write about event-driven systems.</div>
-  </section>
-  <section>
-    <h2>Activity</h2>
-    <ul>
-      <li><div>Jane Prospect</div>
-        <div>Own post about exactly-once semantics in Kafka pipelines.</div></li>
-      <li><div>Jane Prospect · 2nd</div>
-        <div>Second own post about schema registries.</div></li>
-      <li><div>Jane Prospect commented on this</div>
-        <div>Stranger One</div>
-        <div>Growth hacking guru | 10x your funnel</div>
-        <div>Stranger post body about growth hacking funnels.</div></li>
-      <li><div>Jane Prospect likes this</div>
-        <div>Stranger Two</div>
-        <div>Crypto influencer</div>
-        <div>Stranger post body about crypto trading signals.</div></li>
-      <li><div>Jane Prospect reposted this</div>
-        <div>Stranger Three</div>
-        <div>Sales coach</div>
-        <div>Stranger post body about cold outreach scripts.</div></li>
-    </ul>
-  </section>
-  <section>
-    <h2>Explore Premium profiles</h2>
-    <div>Foreign Person One — Aerospace Engineering Graduate</div>
-  </section>
-  <section>
-    <h2>People you may know</h2>
-    <div>Foreign Person Two — Quality Engineer</div>
-  </section>
-  <aside>Ad: Your Company Page is waiting</aside>
-  <footer>About Accessibility LinkedIn Corporation</footer>
-  <div role="dialog">Add a note to your invitation</div>
-</main>
-"""
+from linkedin_profile import is_profile_owned_element, read_profile_snapshot
 
 
-class ExtractionJsDomTest(unittest.TestCase):
-    result = None
+class OwnedExtractionBrowserTests(OfflineBrowserTestCase):
+    def snapshot(self):
+        snapshot = read_profile_snapshot(self.page, URL)
+        self.assertIsNotNone(snapshot)
+        return snapshot
 
-    @classmethod
-    def setUpClass(cls):
-        try:
-            from patchright.sync_api import sync_playwright
-        except ImportError:
-            raise unittest.SkipTest("patchright is not installed")
-
-        cls._pw = sync_playwright().start()
-        try:
-            try:
-                cls._browser = cls._pw.chromium.launch(headless=True)
-            except Exception:
-                cls._browser = cls._pw.chromium.launch(headless=True, channel="chrome")
-        except Exception as exc:
-            cls._pw.stop()
-            raise unittest.SkipTest(f"No Chromium available: {exc}")
-
-        page = cls._browser.new_page()
-        page.set_content(FIXTURE_HTML)
-        cls.result = page.evaluate(
-            PROFILE_CONTENT_EXTRACTION_JS, PROFILE_FOREIGN_MODULE_HEADINGS
+    def test_only_named_owner_fields_enter_personalization(self):
+        self.load_html(
+            profile_html(
+                extra="""
+          <div><div role="heading" aria-level="2">More profiles for you</div>
+            <div>Alex Stranger — Aerospace Engineering Graduate; led satellite propulsion research.</div></div>
+          <div><div role="heading" aria-level="2">Activity</div>
+            <div>Jane Prospect commented on this</div>
+            <div>Blair Other — Sales coaching director; enterprise cold outreach training.</div></div>
+          <section><h2>Education</h2><div>Unrequested university facts</div></section>
+          <section><h2>Unknown module</h2><div>Unowned mystery content</div></section>
+          <aside>Sidebar advert</aside><footer>LinkedIn Corporation</footer>
+          <div role="dialog">Invitation note text</div>
+        """
+            )
         )
-        cls.fixture_after = page.evaluate("() => document.querySelector('main').innerText")
-        cls._browser.close()
-        cls._pw.stop()
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.identity.name, "Jane Prospect")
+        self.assertEqual(snapshot.about, ABOUT)
+        self.assertEqual(snapshot.experience, EXPERIENCE)
+        self.assertIn("Building data platforms", snapshot.content)
+        for foreign in (
+            "Alex Stranger",
+            "Aerospace",
+            "satellite",
+            "Blair Other",
+            "Sales coaching",
+            "Activity",
+            "Education",
+            "university",
+            "mystery",
+            "Sidebar",
+            "Corporation",
+            "Invitation",
+            "followers",
+            "Connect",
+        ):
+            with self.subTest(foreign=foreign):
+                self.assertNotIn(foreign, snapshot.content)
+        self.assertIn("5,000 followers", snapshot.audience_text)
 
-    def test_extracts_profile_name(self):
-        self.assertEqual(self.result["name"], "Jane Prospect")
+    def test_nested_foreign_profile_cards_are_removed_with_their_prose(self):
+        sections = f"""<section><h2>About</h2><p>{ABOUT}</p>
+          <div class="recommendation"><a href="/in/alex-stranger/">Alex Stranger</a>
+            <div>Satellite propulsion research and orbital navigation.</div><button>Connect</button></div>
+        </section><section><h2>Experience</h2><p>{EXPERIENCE}</p>
+          <ul><li><a href="/in/blair-other/">Blair Other</a><p>Cold outreach training business.</p></li></ul>
+        </section>"""
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertIn(ABOUT, snapshot.content)
+        self.assertIn(EXPERIENCE, snapshot.content)
+        for foreign in ("Alex Stranger", "Satellite", "Blair Other", "Cold outreach"):
+            self.assertNotIn(foreign, snapshot.content)
 
-    def test_keeps_own_content(self):
-        content = self.result["content"]
-        self.assertIn("Building data platforms", content)
-        self.assertIn("streaming pipelines", content)
-        self.assertIn("exactly-once semantics", content)
-        self.assertIn("schema registries", content)
+    def test_unknown_nested_heading_cannot_leak_unlinked_foreign_text(self):
+        sections = SECTIONS.replace(
+            f"<p>{ABOUT}</p>",
+            f"""<p>{ABOUT}</p>
+          <div><div role="heading" aria-level="3">Someone else's story</div>
+          <p>Unlinked stranger invented orbital navigation systems.</p></div>""",
+        )
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertIn(ABOUT, snapshot.content)
+        self.assertNotIn("orbital", snapshot.content)
+        self.assertNotIn("Someone else", snapshot.content)
 
-    def test_drops_foreign_modules_and_chrome(self):
-        content = self.result["content"]
-        self.assertNotIn("Foreign Person One", content)
-        self.assertNotIn("Foreign Person Two", content)
-        self.assertNotIn("LinkedIn Corporation", content)
-        self.assertNotIn("Your Company Page", content)
-        self.assertNotIn("Add a note", content)
-        self.assertNotIn("Connect", content)
+    def test_activity_nested_inside_owned_section_is_not_owned_prose(self):
+        sections = SECTIONS.replace(
+            f"<p>{ABOUT}</p>",
+            f"""<p>{ABOUT}</p>
+          <div><h3>Activity</h3><div>Jane Prospect likes this</div>
+          <div>Foreign post about cryptocurrency trading signals.</div></div>""",
+        )
+        self.load_html(profile_html(sections=sections))
+        self.assertNotIn("cryptocurrency", self.snapshot().content)
 
-    def test_drops_verb_banner_activity_items(self):
-        content = self.result["content"]
-        self.assertNotIn("growth hacking", content)
-        self.assertNotIn("crypto trading", content)
-        self.assertNotIn("cold outreach", content)
-        self.assertNotIn("Stranger One", content)
-        self.assertNotIn("Stranger Two", content)
-        self.assertNotIn("Stranger Three", content)
+    def test_ambiguous_shared_heading_root_drops_entire_section(self):
+        sections = (
+            f"<section><h2>About</h2><p>{ABOUT}</p><h2>Activity</h2><p>Foreign facts</p></section>"
+            + f"<section><h2>Experience</h2><p>{EXPERIENCE}</p></section>"
+        )
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.about, "")
+        self.assertEqual(snapshot.content, "")
 
-    def test_page_state_is_restored_after_extraction(self):
-        self.assertIn("Foreign Person One", self.fixture_after)
-        self.assertIn("growth hacking", self.fixture_after)
+    def test_about_inside_recommendation_module_is_not_owner_about(self):
+        sections = f"""<div><h2>More profiles for you</h2>
+          <section><h3>About</h3><p>{ABOUT}</p></section></div>
+          <section><h2>Experience</h2><p>{EXPERIENCE}</p></section>"""
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.about, "")
+        self.assertEqual(snapshot.content, "")
+
+    def test_div_role_heading_sections_are_bounded(self):
+        sections = f"""<div><div role="heading" aria-level="2">About</div><p>{ABOUT}</p></div>
+          <div><div role="heading" aria-level="2">Experience</div><p>{EXPERIENCE}</p></div>
+          <div><div role="heading" aria-level="2">Activity</div><p>Unowned activity facts</p></div>"""
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.about, ABOUT)
+        self.assertEqual(snapshot.experience, EXPERIENCE)
+        self.assertNotIn("Unowned activity", snapshot.content)
+
+    def test_h3_sections_are_supported(self):
+        self.load_html(profile_html(sections=SECTIONS.replace("h2", "h3")))
+        snapshot = self.snapshot()
+        self.assertIn(ABOUT, snapshot.content)
+        self.assertIn(EXPERIENCE, snapshot.content)
+
+    def test_employer_linked_experience_job_heading_is_owned(self):
+        sections = f"""<section><h2>Experience</h2><ul><li>
+          <h3>Staff Data Engineer</h3>
+          <a href="https://www.linkedin.com/company/orchard/">Orchard Analytics</a>
+          <p>{EXPERIENCE}</p></li></ul></section>"""
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertIn("Staff Data Engineer", snapshot.experience)
+        self.assertIn("Orchard Analytics", snapshot.content)
+        self.assertIn(EXPERIENCE, snapshot.content)
+
+    def test_employer_link_does_not_authorize_another_person_experience(self):
+        sections = f"""<section><h2>Experience</h2><ul><li>
+          <h3>Staff Data Engineer</h3>
+          <a href="https://www.linkedin.com/company/orchard/">Orchard Analytics</a>
+          <p>{EXPERIENCE}</p></li><li>
+          <h3>Another person's job</h3><a href="/in/stranger/">Alex Stranger</a>
+          <a href="https://www.linkedin.com/company/moonshot/">Moonshot Labs</a>
+          <p>Foreign satellite propulsion achievements</p>
+          </li></ul></section>"""
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertIn(EXPERIENCE, snapshot.content)
+        self.assertNotIn("Moonshot", snapshot.content)
+        self.assertNotIn("satellite propulsion", snapshot.content)
+
+    def test_legacy_name_h2_and_contact_marker(self):
+        topcard = f'''<section><h2>Jane Prospect</h2>
+          <div>Building data platforms at Orchard Analytics</div>
+          <a href="{URL}overlay/contact-info/">Contact info</a><button>Connect</button></section>'''
+        self.load_html(profile_html(topcard=topcard))
+        snapshot = self.snapshot()
+        self.assertEqual(
+            snapshot.headline, "Building data platforms at Orchard Analytics"
+        )
+        self.assertIn(ABOUT, snapshot.content)
+
+    def test_sdui_topcard_role_heading_and_target_action_marker(self):
+        topcard = f'''<div data-view-name="profile-top-card">
+          <div role="heading" aria-level="1">Jane Prospect</div>
+          <div data-view-name="profile-headline">Building data platforms at Orchard Analytics</div>
+          <a href="{URL}overlay/connect/" aria-label="Invite Jane Prospect to connect">Connect</a></div>'''
+        self.load_html(profile_html(topcard=topcard))
+        self.assertIn(ABOUT, self.snapshot().content)
+
+    def test_wrapped_primary_column_excludes_other_columns(self):
+        self.load_html(f"""<main><div id="primary">{TOPCARD}{SECTIONS}</div>
+          <aside><section><h2>About</h2><p>Stranger biography.</p></section></aside></main>""")
+        self.assertEqual(self.snapshot().about, ABOUT)
+
+    def test_nested_foreign_card_does_not_claim_topcard_identity_or_stats(self):
+        nested = """<section><h2><a href="/in/foreign-person/">Foreign Person</a></h2>
+          <div>Space propulsion</div><div>900,000 followers</div><button id="foreign">Connect</button></section>"""
+        self.load_html(
+            profile_html(topcard=TOPCARD.replace("</section>", nested + "</section>"))
+        )
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.identity.name, "Jane Prospect")
+        self.assertNotIn("900,000", snapshot.audience_text)
+        self.assertTrue(
+            is_profile_owned_element(
+                self.page.locator("#connect"), self.page, snapshot.identity
+            )
+        )
+        self.assertFalse(
+            is_profile_owned_element(
+                self.page.locator("#foreign"), self.page, snapshot.identity
+            )
+        )
+
+    def test_generic_nested_div_foreign_action_is_not_owner_action(self):
+        nested = """<div><a href="/in/foreign-person/">Foreign Person</a>
+          <div>Space propulsion</div><button id="foreign">Connect</button></div>"""
+        self.load_html(
+            profile_html(topcard=TOPCARD.replace("</section>", nested + "</section>"))
+        )
+        snapshot = self.snapshot()
+        self.assertTrue(
+            is_profile_owned_element(
+                self.page.locator("#connect"), self.page, snapshot.identity
+            )
+        )
+        self.assertFalse(
+            is_profile_owned_element(
+                self.page.locator("#foreign"), self.page, snapshot.identity
+            )
+        )
+
+    def test_legacy_aria_hidden_display_text_survives_without_duplicates(self):
+        sections = SECTIONS.replace(
+            "<h2>About</h2>",
+            '<h2><span aria-hidden="true">About</span><span class="visually-hidden">About</span></h2>',
+        ).replace(
+            f"<p>{ABOUT}</p>",
+            f'<p><span aria-hidden="true">{ABOUT}</span><span class="visually-hidden">{ABOUT}</span></p>',
+        )
+        self.load_html(profile_html(sections=sections))
+        snapshot = self.snapshot()
+        self.assertEqual(snapshot.about, ABOUT)
+        self.assertEqual(snapshot.content.count(ABOUT), 1)
+
+    def test_foreign_module_loading_does_not_block_owner_readiness(self):
+        nested = """<div><h3>More profiles for you</h3><div class="skeleton" aria-busy="true">Loading</div></div>"""
+        self.load_html(
+            profile_html(
+                topcard=TOPCARD.replace("</section>", nested + "</section>"),
+                extra=nested,
+            )
+        )
+        self.assertIn(ABOUT, self.snapshot().content)
+
+    def test_read_only_extraction_preserves_attributes_dom_and_scroll(self):
+        self.load_html(
+            profile_html(
+                extra='<div style="height:1800px">Unknown page remainder</div>'
+            )
+        )
+        self.page.evaluate("() => window.scrollTo(0, 160)")
+        before = self.page.evaluate(
+            "() => ({html: document.documentElement.outerHTML, x: scrollX, y: scrollY})"
+        )
+        for _ in range(3):
+            self.snapshot()
+        after = self.page.evaluate(
+            "() => ({html: document.documentElement.outerHTML, x: scrollX, y: scrollY})"
+        )
+        self.assertEqual(after, before)
+
+    def test_fixture_requests_cannot_escape_to_network(self):
+        self.load_html(
+            profile_html(extra='<img src="https://example.invalid/foreign-image.png">')
+        )
+        self.page.wait_for_load_state("load")
+        self.assertIn(
+            "https://example.invalid/foreign-image.png", self.blocked_requests
+        )
+        self.assertEqual(self.snapshot().identity.name, "Jane Prospect")
 
 
 if __name__ == "__main__":

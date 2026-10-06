@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 from .base import BaseTask
 from connection_state import ConnectionState, detect_connection_state
 from db import Task, TaskStatus, TaskType
+from linkedin_profile import wait_for_profile
 
 logger = logging.getLogger(__name__)
 
@@ -326,9 +327,8 @@ class NotificationReplyInviteScanner(BaseTask):
 
     def _get_connection_state(self, profile_url: str) -> ConnectionState:
         self.page.goto(profile_url, timeout=60000, wait_until="domcontentloaded")
-        self.page.wait_for_selector("main", timeout=15000)
-        self.human.random_sleep(1.0, 2.0)
-        return detect_connection_state(self.page)
+        snapshot = wait_for_profile(self.page, profile_url, personalize=False)
+        return detect_connection_state(self.page, snapshot.identity)
 
     def _find_existing_invite_task(
         self,

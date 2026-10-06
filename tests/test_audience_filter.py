@@ -3,6 +3,7 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -14,11 +15,12 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 from exceptions import TaskSkippedException  # noqa: E402
 from tasks.invite import (  # noqa: E402
     InviteTask,
-    _format_invite_notification,
     audience_filter_rejection,
     get_invite_audience_filter,
     parse_audience_stats,
 )
+from linkedin_profile import wait_for_profile  # noqa: E402
+from tests.browser_case import OfflineBrowserTestCase  # noqa: E402
 
 # Live topcard text observed 2026-07-17 (andrewfelbinger)
 REAL_TOPCARD = (
@@ -83,8 +85,7 @@ class ParseAudienceStatsTest(unittest.TestCase):
 
     def test_counts_after_foreign_module_heading_ignored(self):
         text = (
-            "Jane Doe\nHeadline\nPages for you\nSpectro Cloud\n"
-            "12,895 followers\nFollow"
+            "Jane Doe\nHeadline\nPages for you\nSpectro Cloud\n12,895 followers\nFollow"
         )
         stats = parse_audience_stats(text)
         self.assertIsNone(stats["followers"])
@@ -99,10 +100,7 @@ class ParseAudienceStatsTest(unittest.TestCase):
         self.assertEqual(stats["connections"], 104)
 
     def test_headline_connections_phrase_does_not_shadow_real_stat(self):
-        text = (
-            "Jane Grower\n· 2nd\nGet 500+ connections in 30 days\n"
-            "42\n\nconnections"
-        )
+        text = "Jane Grower\n· 2nd\nGet 500+ connections in 30 days\n42\n\nconnections"
         stats = parse_audience_stats(text)
         self.assertEqual(stats["connections"], 42)
         self.assertFalse(stats["connections_capped"])
@@ -149,7 +147,9 @@ class AudienceFilterRejectionTest(unittest.TestCase):
 
     def test_disabled_filter_passes_everything(self):
         self.assertIsNone(
-            audience_filter_rejection({"followers": None, "connections": None}, 0, False)
+            audience_filter_rejection(
+                {"followers": None, "connections": None}, 0, False
+            )
         )
 
     def test_passing_profile(self):
@@ -195,197 +195,105 @@ class EnvConfigTest(unittest.TestCase):
             self.assertEqual(get_invite_audience_filter()[0], 0)
 
 
-class EnforceAudienceFilterTest(unittest.TestCase):
-    def _make_task(self, page_text):
-        class FakePage:
-            def evaluate(self, script, *args):
-                return page_text
-
-        class FakeHuman:
-            def random_sleep(self, *args, **kwargs):
-                return None
-
+class EnforceAudienceFilterTest(OfflineBrowserTestCase):
+    def _make_task(self, counts: str, extra: str = ""):
+        self.load_html(
+            '<main><section class="pv-top-card">'
+            '<h1><a href="/in/jane-prospect/">Jane Prospect</a></h1>'
+            f'<div id="counts">{counts}</div>'
+            "<button>Connect</button></section>"
+            f"{extra}</main>"
+        )
         task = InviteTask.__new__(InviteTask)
-        task.page = FakePage()
-        task.human = FakeHuman()
+        task.page = self.page
+        task.human = SimpleNamespace(
+            random_sleep=lambda *_: self.page.wait_for_timeout(100)
+        )
+        task._target_identity = wait_for_profile(
+            self.page, self.page.url, personalize=False
+        ).identity
         return task
 
-    def test_disabled_filter_returns_none_without_reading_page(self):
-        task = self._make_task(REAL_TOPCARD)
+    def test_qualified_target_passes(self):
+        task = self._make_task("3,348 followers<br>500+ connections")
         with patch.dict(
             os.environ,
-            {"INVITE_MIN_FOLLOWERS": "0", "INVITE_REQUIRE_500_CONNECTIONS": "false"},
+            {"INVITE_MIN_FOLLOWERS": "3000", "INVITE_REQUIRE_500_CONNECTIONS": "true"},
         ):
-            self.assertIsNone(task._enforce_audience_filter("https://x/in/a/"))
-
-    def test_passing_profile_returns_stats(self):
-        task = self._make_task(REAL_TOPCARD)
-        with patch.dict(
-            os.environ,
-            {"INVITE_MIN_FOLLOWERS": "1000", "INVITE_REQUIRE_500_CONNECTIONS": "true"},
-        ):
-            stats = task._enforce_audience_filter("https://x/in/a/")
+            stats = task._enforce_audience_filter(self.page.url)
         self.assertEqual(stats["followers"], 3348)
-        self.assertTrue(stats["connections_capped"])
+        self.assertEqual(stats["connections"], 500)
 
-    def test_failing_profile_raises_audience_filter_skip(self):
-        task = self._make_task("Jane Doe\n120 followers\n·\n89 connections")
+    def test_foreign_counts_cannot_qualify_small_target(self):
+        task = self._make_task(
+            "120 followers<br>89 connections",
+            '<div><div role="heading">More profiles for you</div>'
+            '<a href="/in/stranger/">Stranger</a>'
+            "<div>20,000 followers<br>500+ connections</div></div>",
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "INVITE_MIN_FOLLOWERS": "3000",
+                    "INVITE_REQUIRE_500_CONNECTIONS": "true",
+                },
+            ),
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task._enforce_audience_filter(self.page.url)
+        self.assertEqual(caught.exception.reason, "audience_filter")
+        self.assertFalse(caught.exception.cooldown_eligible)
+
+    def test_unreadable_counts_are_not_labeled_below_threshold(self):
+        task = self._make_task(
+            "500+ connections",
+            "<section><h2>Activity</h2><div>20,000 followers</div></section>",
+        )
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "INVITE_MIN_FOLLOWERS": "3000",
+                    "INVITE_REQUIRE_500_CONNECTIONS": "true",
+                },
+            ),
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task._enforce_audience_filter(self.page.url)
+        self.assertEqual(caught.exception.reason, "audience_unavailable")
+
+    def test_waits_for_configured_stat_to_hydrate(self):
+        task = self._make_task("49 connections")
+        self.page.evaluate("""() => setTimeout(() => {
+            document.querySelector('#counts').innerHTML =
+                '3,200 followers<br>49 connections';
+        }, 150)""")
         with patch.dict(
             os.environ,
-            {"INVITE_MIN_FOLLOWERS": "1000", "INVITE_REQUIRE_500_CONNECTIONS": "true"},
+            {"INVITE_MIN_FOLLOWERS": "3000", "INVITE_REQUIRE_500_CONNECTIONS": "false"},
         ):
-            with self.assertRaises(TaskSkippedException) as ctx:
-                task._enforce_audience_filter("https://x/in/a/")
-        self.assertEqual(ctx.exception.reason, "audience_filter")
-        self.assertFalse(ctx.exception.cooldown_eligible)
+            stats = task._enforce_audience_filter(self.page.url)
+        self.assertEqual(stats["followers"], 3200)
+        self.assertEqual(stats["connections"], 49)
 
-
-class RetryLoopTest(unittest.TestCase):
-    """The stat retry loop must wait for the CONFIGURED stat, not any stat."""
-
-    def _make_task(self, page_texts):
-        texts = iter(page_texts)
-        calls = {"n": 0}
-
-        class FakePage:
-            def evaluate(self, script, *args):
-                calls["n"] += 1
-                try:
-                    return next(texts)
-                except StopIteration:
-                    return page_texts[-1]
-
-        class FakeHuman:
-            def random_sleep(self, *args, **kwargs):
-                return None
-
-        task = InviteTask.__new__(InviteTask)
-        task.page = FakePage()
-        task.human = FakeHuman()
-        return task, calls
-
-    def test_followers_only_waits_past_a_connections_only_snapshot(self):
-        # Snapshot 1: topcard connections present, followers not yet hydrated.
-        # Snapshot 2: followers streamed in. A followers-only filter must not
-        # settle on snapshot 1 and fail closed.
-        snapshots = [
-            "Jane Doe\n· 2nd\n49\n\nconnections",
-            "Jane Doe\n· 2nd\n1,200 followers\n·\n49\n\nconnections",
-        ]
-        task, calls = self._make_task(snapshots)
-        with patch.dict(
-            os.environ,
-            {"INVITE_MIN_FOLLOWERS": "1000", "INVITE_REQUIRE_500_CONNECTIONS": "false"},
-        ):
-            stats = task._enforce_audience_filter("https://x/in/a/")
-        self.assertEqual(stats["followers"], 1200)
-        self.assertGreaterEqual(calls["n"], 2)
-
-
-class SendConnectionRequestWiringTest(unittest.TestCase):
-    """The filter must actually run inside the invite flow and short-circuit it."""
-
-    def _make_task(self):
-        class FakePage:
-            url = "https://www.linkedin.com/in/a/"
-
-            def goto(self, *a, **k):
-                return None
-
-            def wait_for_selector(self, *a, **k):
-                return None
-
-        class FakeHuman:
-            def random_sleep(self, *args, **kwargs):
-                return None
-
-        task = InviteTask.__new__(InviteTask)
-        task.page = FakePage()
-        task.human = FakeHuman()
-        return task
-
-    def test_filter_runs_before_content_capture_and_skips_person(self):
-        import tasks.invite as invite_mod
-        from connection_state import ConnectionState
-
-        task = self._make_task()
-        order = []
-
-        def fake_filter(url):
-            order.append("filter")
-            raise TaskSkippedException("audience_filter", cooldown_eligible=False)
-
-        def fake_capture():
-            order.append("capture")
-            return "", ""
-
-        task._enforce_audience_filter = fake_filter
-        task.get_profile_content = fake_capture
-
-        with patch.object(
-            invite_mod, "detect_connection_state", return_value=ConnectionState.CONNECTABLE
-        ), patch.object(invite_mod, "try_heuristic_connect", return_value=False):
-            with self.assertRaises(TaskSkippedException) as ctx:
-                task.send_connection_request("https://www.linkedin.com/in/a/", True)
-
-        self.assertEqual(ctx.exception.reason, "audience_filter")
-        # Filter ran; content capture never happened → person skipped entirely.
-        self.assertEqual(order, ["filter"])
-
-    def test_confirmed_notification_carries_filter_stats(self):
-        import tasks.invite as invite_mod
-        from connection_state import ConnectionState
-
-        task = InviteTask.__new__(InviteTask)
-        task._last_audience_stats = {
-            "followers": 3348,
-            "connections": 500,
-            "connections_capped": True,
-        }
-        task._record_invite_history = lambda *a, **k: None
-
-        class FakeState:
-            def record_event(self, *a, **k):
-                return None
-
-        task.invite_state = FakeState()
-
-        captured = {}
-        with patch.object(
-            invite_mod,
-            "send_notification",
-            side_effect=lambda text: captured.setdefault("text", text),
-        ):
-            task._record_confirmed_invite(
-                "https://x/in/a/", ConnectionState.PENDING, "hello"
-            )
-
-        self.assertIn("Followers: 3,348", captured["text"])
-        self.assertIn("Connections: 500+", captured["text"])
-
-
-class NotificationStatsTest(unittest.TestCase):
-    def test_notification_includes_stats(self):
-        text = _format_invite_notification(
-            "Invite confirmed",
-            profile_url="https://x/in/a/",
-            state="pending",
-            message="hello",
-            audience_stats={
-                "followers": 3348,
-                "connections": 500,
-                "connections_capped": True,
-            },
+    def test_profile_drift_aborts_the_filter(self):
+        task = self._make_task("3,348 followers<br>500+ connections")
+        self.page.locator("h1").evaluate(
+            "el => el.innerHTML = '<a href=\"/in/stranger/\">Stranger</a>'"
         )
-        self.assertIn("Followers: 3,348", text)
-        self.assertIn("Connections: 500+", text)
-
-    def test_notification_without_stats_unchanged(self):
-        text = _format_invite_notification(
-            "Invite confirmed", profile_url="https://x/in/a/", state="pending"
-        )
-        self.assertNotIn("Followers", text)
-        self.assertNotIn("Connections", text)
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "INVITE_MIN_FOLLOWERS": "3000",
+                    "INVITE_REQUIRE_500_CONNECTIONS": "true",
+                },
+            ),
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task._enforce_audience_filter(self.page.url)
+        self.assertEqual(caught.exception.reason, "profile_identity_mismatch")
 
 
 if __name__ == "__main__":

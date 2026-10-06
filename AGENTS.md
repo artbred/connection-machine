@@ -38,6 +38,9 @@ TaskDispatcher
 - `src/dispatcher.py`: polling loop, task selection, spacing windows, zombie cleanup, autonomous comment scheduling
 - `src/db.py`: SQLAlchemy engine, `linkedin_tasks` table, enums, DB initialization
 - `src/tasks/invite.py`: profile visit, connect-button discovery, optional AI-generated note, invitation confirmation
+- `src/linkedin_profile.py`: canonical target identity, shared topcard ownership, allowlisted profile sections, bounded readiness checks
+- `src/invite_modal.py`: recipient-verified invitation dialogs and scoped note/send controls
+- `src/connect_heuristics.py`, `src/connection_state.py`: identity-bound Connect/More actions, cache hints, and target connection-state detection
 - `src/tasks/post.py`: opens the supplied LinkedIn composer URL and submits a post
 - `src/tasks/comment.py`: scans the feed for safe posts, asks the LLM for a comment, optionally publishes it, and stores local comment history
 - `src/llm.py`: OpenRouter calls for connection notes, feed comments, and connect-action detection
@@ -73,6 +76,18 @@ Task statuses:
 - Stuck `processing` tasks are reset to `pending` on startup
 - stale pending `create_post` tasks older than one hour are deleted
 - legacy DB-backed feed-comment tasks are deleted
+
+### Invitation identity and personalization
+
+- Every invite requires the queued URL, loaded profile, Connect target, and invitation dialog recipient to agree. Profile URLs are canonicalized; a canonical page link alone is not enough to prove the visible topcard belongs to the target.
+- Personalization uses only the verified prospect's headline, About, and Experience sections. Activity, reposts, recommendations, and unbounded/ambiguous modules are excluded rather than sent to the LLM.
+- Readiness waits up to eight seconds for substantive owned content and 600 ms of stable identity/fields. At least one substantive About/Experience section is required; absent sections are optional, but discovered empty/loading sections prevent early personalization. Headline-only or insufficient content produces an invitation without a note, never a whole-page fallback.
+- Unknown or contradictory profile identity aborts with `profile_not_ready` or `profile_identity_mismatch`. An ambiguous/wrong invitation recipient aborts with `modal_recipient_mismatch`; a first name alone without an exact target profile link is insufficient.
+- Audience filtering reads only the verified topcard. Required counts that remain unreadable produce `audience_unavailable`; genuinely below-threshold counts produce `audience_filter`. Both remain conservative skips, not automatic retries.
+- Note and Send controls are scoped to the verified invitation dialog; stale text is cleared on the no-note path. Note readback must exactly match the generated note.
+- A potentially dispatched Connect/Send click is never blindly retried. Completion requires the verified target to show Pending/Connected; an unrelated success toast is not enough.
+- `completed` means an invitation workflow was confirmed, not that the recipient later accepted. Acceptance is not tracked.
+- These checks deliberately fail closed for unsupported layouts. Do not restore page-wide `.first` selectors, whole-`main` text extraction, or post-click content re-scraping as fallbacks.
 
 ### Rate limits and spacing
 
@@ -115,6 +130,9 @@ Optional but important:
 - `LLM_MODEL`: OpenRouter model slug used by every LLM module. Defaults to `google/gemini-3.7-flash`
 - `LLM_MODEL_CONNECTION_MESSAGE`, `LLM_MODEL_REFINE_TEXT`, `LLM_MODEL_FEED_COMMENT`, `LLM_MODEL_CONNECT_ACTION`: per-module overrides. Each falls back to `LLM_MODEL`, then to the built-in default
 - `HEADLESS`: browser visibility toggle. Defaults to `true`
+- `INVITE_MIN_FOLLOWERS`: minimum visible follower count; `0` disables this threshold
+- `INVITE_REQUIRE_500_CONNECTIONS`: require a visible count of at least 500 connections when enabled
+- `INVITE_MIN_VISIT_INTERVAL_SECONDS`: additional randomized throttle between profile visits, including skips; defaults to 90 seconds
 - `TELEGRAM_NOTIFICATIONS_URL`: notification endpoint
 - `TELEGRAM_CHAT_ID`: notification target
 - `TELEGRAM_API_KEY`: bearer token for the notification endpoint
@@ -152,6 +170,14 @@ uv run python src/main.py --debug-feed-comment --submit-comment
 uv run python utils/populate_db.py
 ```
 
+Run the isolated regression suite from the repository root:
+
+```bash
+DATABASE_URL=sqlite:///:memory: uv run python -m unittest discover -v
+```
+
+Browser regressions use intercepted synthetic pages in fresh contexts, never the persistent LinkedIn session. The suite blanks Telegram/OpenRouter credentials and blocks non-fixture browser traffic. It uses installed Chromium or local Chrome without downloading a browser; missing browser support is reported as skipped coverage, not a verified browser pass.
+
 ## Docker
 
 The container expects `.env` through `docker-compose.yaml` and mounts `./data` into `/app/data`.
@@ -171,6 +197,7 @@ When changing this codebase:
 - do not reintroduce DB-backed feed comments unless that is the explicit task
 - treat `data/` as runtime state, not source-controlled configuration
 - if you add a new env var, update both `.env.example` and this file in the same change
+- after completing the requested work and its verification, always create a local git commit covering the task's changes before the final handoff; exclude unrelated pre-existing changes, and do not push or deploy without explicit authorization
 
 ## Common Pitfalls
 

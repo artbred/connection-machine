@@ -8,7 +8,6 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional, Tuple
-from urllib.parse import urlparse
 
 from playwright.sync_api import Locator
 
@@ -18,11 +17,27 @@ from llm import generate_connection_message, get_next_connect_action
 from notifications import escape_html_text, send_notification
 from connection_state import detect_connection_state, ConnectionState
 from connect_heuristics import (
+    MENU_SELECTOR,
     try_heuristic_connect,
-    get_cached_selector,
+    get_cached_connect_button,
+    is_target_action,
     save_selector_to_cache,
 )
 from exceptions import TaskSkippedException
+from invite_modal import (
+    ADD_NOTE_SELECTOR,
+    INVITE_NOTE_SELECTOR,
+    SEND_INVITATION_NAME,
+    find_invite_dialog,
+    require_invite_dialog,
+)
+from linkedin_profile import (
+    ProfileIdentity,
+    assert_profile_identity,
+    canonical_profile_url,
+    get_profile_topcard,
+    wait_for_profile,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +45,8 @@ MAX_CONNECT_ITERATIONS = 5
 INVITE_HISTORY_RETENTION_DAYS = 30
 WEEKLY_LIMIT_CONFIRMATION_WINDOW = timedelta(minutes=15)
 MAX_INVITE_MESSAGE_LENGTH = 200
-MAX_PROFILE_CONTENT_LENGTH = 15000
-MIN_PROFILE_CONTENT_LENGTH = 200
-PROFILE_HYDRATION_TIMEOUT_SECONDS = 8.0
 
-# Audience filter (configured via .env). Followers/connections are read from
-# the topcard, which occupies the start of <main>'s text in every observed
-# SDUI render; the slice keeps stranger counts from recommendation modules
-# further down the page out of scope.
+# Audience thresholds apply only to the verified prospect's top card.
 AUDIENCE_FILTER_MIN_FOLLOWERS_ENV = "INVITE_MIN_FOLLOWERS"
 AUDIENCE_FILTER_REQUIRE_500_CONNECTIONS_ENV = "INVITE_REQUIRE_500_CONNECTIONS"
 AUDIENCE_STATS_TOPCARD_SLICE = 3000
@@ -56,9 +65,8 @@ _STAT_LINE_LEFTOVER_RE = re.compile(r"[\s\u00b7\u2022|+\-]*")
 _BARE_COUNT_LINE_RE = re.compile(r"(\d[\d.,]*)\s*([KkMm]?)\s*(\+)?")
 _KEYWORD_LINE_RE = re.compile(r"(followers|connections?)", re.IGNORECASE)
 
-# LinkedIn renders these recommendation/ad modules inside <main> on profile
-# pages. They are full of OTHER people's names and headlines and must never
-# reach the message-generation LLM.
+# Boundary markers for the audience-count parser only. Personalization uses
+# positively identified owner sections in linkedin_profile, never this denylist.
 PROFILE_FOREIGN_MODULE_HEADINGS = [
     "more profiles for you",
     "people also viewed",
@@ -71,99 +79,11 @@ PROFILE_FOREIGN_MODULE_HEADINGS = [
     "advertisement",
 ]
 
-# Extracts only the prospect's own content from the profile page. LinkedIn's
-# SDUI serves structurally different renders per load (hashed class names,
-# varying section nesting, sometimes no <h1>), so selection is by tag/role and
-# heading text only. Subtrees are hidden, main.innerText is read (innerText
-# honors display:none and skips collapsed junk), then styles are restored —
-# all synchronous, so the page never observably changes.
-PROFILE_CONTENT_EXTRACTION_JS = """
-(blockedHeadings) => {
-  const main = document.querySelector('main');
-  if (!main) return null;
-  const isBlocked = (text) => {
-    const t = (text || '').trim().toLowerCase();
-    return blockedHeadings.some((h) => t.startsWith(h));
-  };
-  const nameEl =
-    main.querySelector('h1') ||
-    main.querySelector('section h2') ||
-    main.querySelector('h2');
-  const profileName = nameEl
-    ? (nameEl.innerText || '').trim().split('\\n')[0].trim()
-    : '';
-  const hidden = [];
-  const hide = (el) => {
-    if (!el || hidden.some((entry) => entry[0] === el)) return;
-    hidden.push([el, el.style.display]);
-    el.style.display = 'none';
-  };
-  try {
-    main
-      .querySelectorAll('aside, footer, [role="dialog"], button, form')
-      .forEach(hide);
-    for (const heading of main.querySelectorAll('h2, h3')) {
-      if (isBlocked(heading.innerText)) {
-        hide(heading.closest('section') || heading.parentElement);
-      }
-    }
-    for (const section of main.querySelectorAll('section')) {
-      const heading = section.querySelector('h2, h3');
-      if (!heading || !/^activity/i.test((heading.innerText || '').trim())) {
-        continue;
-      }
-      for (const item of section.querySelectorAll('li')) {
-        const text = (item.innerText || '').trim();
-        if (!text) continue;
-        // Own posts are headed by the bare name; any trailing words mean a
-        // verb banner ("NAME commented on this" / "likes this" / "reposted
-        // this") whose body is ANOTHER person's post.
-        const first = text.split('\\n')[0].trim();
-        const rest = first.slice(profileName.length).trim();
-        const authored =
-          profileName &&
-          first.toLowerCase().startsWith(profileName.toLowerCase()) &&
-          (rest === '' || /^[·•\\s]*(1st|2nd|3rd\\+?)$/i.test(rest));
-        const repost = /reposted this/i.test(text.slice(0, 300));
-        if (!authored || repost) hide(item);
-      }
-    }
-    return { name: profileName, content: main.innerText };
-  } finally {
-    for (const [el, previous] of hidden) {
-      el.style.display = previous;
-    }
-  }
-}
-"""
-ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a note')"
-SEND_INVITATION_SELECTOR = (
-    "button[aria-label*='Send invitation' i], "
-    "button:has-text('Send invitation'), "
-    "button:has-text('Send without a note'), "
-    "div[role='dialog'] button[aria-label='Send' i], "
-    "div[role='dialog'] button:has-text('Send')"
-)
-INVITE_NOTE_SELECTOR = (
-    "textarea#custom-message, "
-    "textarea[name='message'], "
-    "textarea.connect-button-send-invite__custom-message, "
-    "[contenteditable='true'][role='textbox'], "
-    "[contenteditable='true']"
-)
 INVITE_HISTORY_PATH = (
     Path(__file__).resolve().parents[2] / "data" / "invite_history.json"
 )
 
-PROFILE_CONTAINER_SELECTORS = [
-    "div.pvs-profile-actions",
-    "section.pv-top-card",
-    "main section:has(h1)",
-    "div.ph5:has(button[aria-label*='Connect'], button[aria-label*='More'])",
-    "main section",
-]
 
-DROPDOWN_SELECTOR = "div.artdeco-dropdown__content:visible, div[role='menu']:visible"
 INVITE_REASON_DESCRIPTIONS = {
     "weekly_limit_reached": "LinkedIn weekly invitation limit reached",
     "withdrawal_cooldown": "LinkedIn is still withdrawing previous invitations",
@@ -182,6 +102,10 @@ INVITE_REASON_DESCRIPTIONS = {
     "send_button_timeout": "Send invitation button timed out",
     "add_note_unreachable": "Could not reach the invite modal",
     "llm_invalid_response": "LLM selector guidance was invalid",
+    "profile_not_ready": "The target profile did not become identifiable",
+    "profile_identity_mismatch": "The loaded profile does not match the intended recipient",
+    "modal_recipient_mismatch": "The invitation dialog recipient could not be verified",
+    "audience_unavailable": "Required audience counts could not be read",
 }
 
 
@@ -239,9 +163,7 @@ def _merge_split_stat_lines(lines: list[str]) -> list[str]:
             lookahead = index + 1
             while lookahead < len(lines) and not lines[lookahead]:
                 lookahead += 1
-            if lookahead < len(lines) and _KEYWORD_LINE_RE.fullmatch(
-                lines[lookahead]
-            ):
+            if lookahead < len(lines) and _KEYWORD_LINE_RE.fullmatch(lines[lookahead]):
                 merged.append(f"{line} {lines[lookahead]}")
                 index = lookahead + 1
                 continue
@@ -329,22 +251,6 @@ def audience_filter_rejection(
             return f"{connections} connections < required {CONNECTIONS_DISPLAY_CAP}+"
 
     return None
-
-
-def sanitize_profile_content(name: Any, content: Any) -> Tuple[str, str]:
-    """Normalize extracted profile data; drop content too thin to personalize.
-
-    Generating a message from a barely-loaded page makes the LLM invent or
-    latch onto stray text, so below the minimum we return no content and the
-    invite goes out without a note instead.
-    """
-    clean_name = " ".join(str(name or "").split())
-    clean_content = str(content or "").strip()
-    if len(clean_content) > MAX_PROFILE_CONTENT_LENGTH:
-        clean_content = clean_content[:MAX_PROFILE_CONTENT_LENGTH]
-    if len(clean_content) < MIN_PROFILE_CONTENT_LENGTH:
-        return clean_name, ""
-    return clean_name, clean_content
 
 
 def classify_invitation_feedback(text: str) -> Optional[str]:
@@ -458,6 +364,10 @@ def normalize_invite_skip_reason(reason: str) -> str:
         "security_checkpoint",
         "profile_unavailable",
         "audience_filter",
+        "profile_not_ready",
+        "profile_identity_mismatch",
+        "modal_recipient_mismatch",
+        "audience_unavailable",
         "weekly_limit_reached",
         "withdrawal_cooldown",
     }:
@@ -624,6 +534,9 @@ class InviteTask(BaseTask):
     def __init__(self, page):
         super().__init__(page)
         self.invite_state = InviteStateStore()
+        self._target_identity: ProfileIdentity | None = None
+        self._profile_menu_open = False
+        self._send_attempted = False
 
     def run(self, payload: dict):
         url = payload.get("url")
@@ -755,146 +668,85 @@ class InviteTask(BaseTask):
         if min_followers <= 0 and not require_500_connections:
             return None
 
+        identity = self._require_target_identity()
         stats = {"followers": None, "connections": None, "connections_capped": False}
-        for _ in range(AUDIENCE_STATS_MAX_ATTEMPTS):
-            try:
-                text = self.page.evaluate(
-                    "() => { const main = document.querySelector('main'); return main ? main.innerText : ''; }"
-                )
-            except Exception as exc:
-                logger.warning("Could not read profile text for audience filter: %s", exc)
-                break
-            stats = parse_audience_stats(text)
+        for attempt in range(AUDIENCE_STATS_MAX_ATTEMPTS):
+            snapshot = assert_profile_identity(self.page, identity)
+            stats = parse_audience_stats(snapshot.audience_text)
             has_needed_stats = (
                 min_followers <= 0 or stats["followers"] is not None
-            ) and (
-                not require_500_connections or stats["connections"] is not None
-            )
+            ) and (not require_500_connections or stats["connections"] is not None)
             if has_needed_stats:
                 break
-            self.human.random_sleep(0.7, 1.1)
+            if attempt + 1 < AUDIENCE_STATS_MAX_ATTEMPTS:
+                self.human.random_sleep(0.7, 1.1)
 
+        if not has_needed_stats:
+            logger.info("Required audience counts unavailable for %s", url)
+            raise TaskSkippedException("audience_unavailable", cooldown_eligible=False)
         rejection = audience_filter_rejection(
             stats, min_followers, require_500_connections
         )
         if rejection:
-            logger.info(
-                "Audience filter rejected %s: %s (followers=%s, connections=%s%s)",
-                url,
-                rejection,
-                stats.get("followers"),
-                stats.get("connections"),
-                "+" if stats.get("connections_capped") else "",
-            )
+            logger.info("Audience filter rejected %s: %s", url, rejection)
             raise TaskSkippedException("audience_filter", cooldown_eligible=False)
-
         logger.info(
             "Audience filter passed for %s (followers=%s, connections=%s%s)",
             url,
-            stats.get("followers"),
-            stats.get("connections"),
-            "+" if stats.get("connections_capped") else "",
+            stats["followers"],
+            stats["connections"],
+            "+" if stats["connections_capped"] else "",
         )
         return stats
 
-    def _wait_for_profile_hydration(self):
-        """Nudge lazy modules to load, then wait for main's text to stabilize.
-
-        Some SDUI renders stream sections (About, Experience) seconds after
-        domcontentloaded; capturing before that leaves the LLM with little
-        besides recommendation modules.
-        """
-        try:
-            for fraction in (0.35, 0.7):
-                self.page.evaluate(
-                    "fraction => window.scrollTo(0, Math.floor(document.body.scrollHeight * fraction))",
-                    fraction,
-                )
-                self.human.random_sleep(0.8, 1.4)
-            self.page.evaluate("() => window.scrollTo(0, 0)")
-        except Exception as exc:
-            logger.debug("Profile hydration scroll failed: %s", exc)
-
-        deadline = time.monotonic() + PROFILE_HYDRATION_TIMEOUT_SECONDS
-        previous_length = -1
-        while time.monotonic() < deadline:
-            try:
-                length = self.page.evaluate(
-                    "() => { const main = document.querySelector('main'); return main ? main.innerText.length : 0; }"
-                )
-            except Exception:
-                return
-            if length and length == previous_length:
-                return
-            previous_length = length
-            self.human.random_sleep(0.6, 1.0)
-
-    def get_profile_content(self) -> Tuple[str, str]:
-        """Return (profile_name, content) with only the prospect's own content.
-
-        Excludes recommendation modules, other authors' reposts, footer and
-        dialogs so the generated note can only be grounded in the prospect's
-        page. Content is empty when extraction fails or yields too little.
-        """
-        try:
-            self.page.wait_for_selector("main", state="attached", timeout=5000)
-            self._wait_for_profile_hydration()
-
-            result = self.page.evaluate(
-                PROFILE_CONTENT_EXTRACTION_JS,
-                PROFILE_FOREIGN_MODULE_HEADINGS,
+    def _require_target_identity(self) -> ProfileIdentity:
+        identity = self._target_identity
+        if identity is None:
+            raise TaskSkippedException(
+                "profile_identity_mismatch", cooldown_eligible=False
             )
-            if not result:
-                return "", ""
-
-            name, content = sanitize_profile_content(
-                result.get("name"), result.get("content")
-            )
-            if not content:
-                logger.warning(
-                    "Profile content too thin to personalize the invite note"
-                )
-            return name, content
-        except Exception as e:
-            logger.error(f"Error getting profile content: {e}")
-            return "", ""
-
-    def _wait_for_add_note(self, timeout: int = 2000) -> bool:
-        try:
-            self.page.wait_for_selector(ADD_NOTE_SELECTOR, timeout=timeout)
-            logger.info("'Add a note' button detected")
-            return True
-        except Exception:
-            return False
+        return identity
 
     def _wait_for_invite_modal(self, timeout: int = 5000) -> bool:
-        try:
-            self.page.wait_for_selector(
-                f"{ADD_NOTE_SELECTOR}, {SEND_INVITATION_SELECTOR}, {INVITE_NOTE_SELECTOR}",
-                timeout=timeout,
-            )
-            logger.info("Invite modal detected")
-            return True
-        except Exception:
-            return False
+        identity = self._require_target_identity()
+        deadline = time.monotonic() + timeout / 1000
+        while True:
+            if find_invite_dialog(self.page, identity) is not None:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            self.page.wait_for_timeout(100)
 
     def _get_action_container(self) -> Tuple[Locator, str]:
-        dropdown = self.page.locator(DROPDOWN_SELECTOR).first
-        try:
-            if dropdown.is_visible(timeout=300):
-                return dropdown, "dropdown"
-        except Exception:
-            pass
-
-        for selector in PROFILE_CONTAINER_SELECTORS:
-            try:
-                container = self.page.locator(selector).first
-                if container.is_visible(timeout=300):
-                    return container, selector
-            except Exception:
-                continue
-
-        return self.page.locator("body").first, "body"
+        identity = self._require_target_identity()
+        assert_profile_identity(self.page, identity)
+        if self._profile_menu_open:
+            roots = []
+            for menu in self.page.locator(MENU_SELECTOR).all():
+                if menu.is_visible() and menu.evaluate(
+                    """(el, selector) => {
+                      for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+                        if (parent.matches(selector) && parent.getClientRects().length &&
+                            getComputedStyle(parent).visibility !== 'hidden') return false;
+                      }
+                      return true;
+                    }""",
+                    MENU_SELECTOR,
+                ):
+                    roots.append(menu)
+            if len(roots) == 1:
+                return roots[0], "profile dropdown"
+            self._profile_menu_open = False
+            if roots:
+                raise TaskSkippedException(
+                    "connect_unavailable", cooldown_eligible=False
+                )
+        container = get_profile_topcard(self.page, identity)
+        if container is None:
+            raise TaskSkippedException(
+                "profile_identity_mismatch", cooldown_eligible=False
+            )
+        return container, "verified profile topcard"
 
     def _collect_visible_feedback_texts(self) -> set[str]:
         texts: set[str] = set()
@@ -955,37 +807,6 @@ class InviteTask(BaseTask):
 
         return None
 
-    def _check_invitation_success(self) -> bool:
-        try:
-            toast = self.page.locator("div.artdeco-toast-item").first
-            toast.wait_for(state="visible", timeout=3000)
-            text = toast.inner_text().lower()
-            logger.debug(f"Success toast content: {text}")
-            return (
-                "invitation sent" in text
-                or "invite sent" in text
-                or "invitation pending" in text
-            )
-        except Exception:
-            return False
-
-    def _is_send_modal_open(self) -> bool:
-        try:
-            dialog = self.page.locator("div[role='dialog']:visible").first
-            if not dialog.is_visible(timeout=500):
-                return False
-        except Exception:
-            return False
-
-        selectors = [INVITE_NOTE_SELECTOR, SEND_INVITATION_SELECTOR, ADD_NOTE_SELECTOR]
-        for selector in selectors:
-            try:
-                if dialog.locator(selector).first.is_visible(timeout=500):
-                    return True
-            except Exception:
-                continue
-        return True
-
     def _is_enabled_button(self, button: Any) -> bool:
         try:
             if not button.is_visible(timeout=500):
@@ -1004,42 +825,20 @@ class InviteTask(BaseTask):
             return False
 
     def _get_send_invitation_button(self) -> Locator:
-        try:
-            dialog = self.page.locator("div[role='dialog']:visible").first
-            if dialog.is_visible(timeout=500):
-                buttons = dialog.locator("button")
-                fallback = None
-                for index in range(min(buttons.count(), 20)):
-                    button = buttons.nth(index)
-                    label = _locator_accessible_text(button).lower()
-                    is_send = (
-                        "send invitation" in label
-                        or "send without a note" in label
-                        or label == "send"
-                    )
-                    if not is_send:
-                        continue
-                    if self._is_enabled_button(button):
-                        return button
-                    if fallback is None:
-                        fallback = button
-
-                if fallback is not None:
-                    return fallback
-        except Exception as exc:
-            logger.debug("Could not resolve send button inside invite dialog: %s", exc)
-
-        return self.page.locator(SEND_INVITATION_SELECTOR).first
+        dialog = require_invite_dialog(self.page, self._require_target_identity())
+        buttons = dialog.get_by_role("button", name=SEND_INVITATION_NAME)
+        visible = [button for button in buttons.all() if button.is_visible()]
+        if len(visible) != 1:
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        return visible[0]
 
     def _get_invite_note_editor(self) -> Locator:
-        try:
-            dialog = self.page.locator("div[role='dialog']:visible").first
-            if dialog.is_visible(timeout=500):
-                return dialog.locator(INVITE_NOTE_SELECTOR).first
-        except Exception:
-            pass
-
-        return self.page.locator(INVITE_NOTE_SELECTOR).first
+        dialog = require_invite_dialog(self.page, self._require_target_identity())
+        editors = dialog.locator(INVITE_NOTE_SELECTOR)
+        visible = [editor for editor in editors.all() if editor.is_visible()]
+        if len(visible) > 1:
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        return visible[0] if visible else editors.first
 
     def _get_invite_note_text(self, editor: Any) -> str:
         try:
@@ -1085,13 +884,10 @@ class InviteTask(BaseTask):
 
     def _invite_note_is_ready(self, editor: Locator, expected_text: str) -> bool:
         entered_text = " ".join(self._get_invite_note_text(editor).split())
-        if expected_text not in entered_text:
+        if expected_text != entered_text:
             return False
 
-        try:
-            return self._is_enabled_button(self._get_send_invitation_button())
-        except Exception:
-            return True
+        return self._is_enabled_button(self._get_send_invitation_button())
 
     def _enter_connection_message(self, connection_message: str) -> None:
         message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
@@ -1116,6 +912,8 @@ class InviteTask(BaseTask):
             try:
                 if self._invite_note_is_ready(custom_message, expected_text):
                     return
+            except TaskSkippedException:
+                raise
             except Exception:
                 pass
             self.human.random_sleep(0.3, 0.6)
@@ -1132,6 +930,8 @@ class InviteTask(BaseTask):
             try:
                 if self._invite_note_is_ready(custom_message, expected_text):
                     return
+            except TaskSkippedException:
+                raise
             except Exception:
                 pass
             self.human.random_sleep(0.3, 0.6)
@@ -1142,29 +942,42 @@ class InviteTask(BaseTask):
         self._set_invite_note_with_js(custom_message, message)
 
         entered_text = " ".join(self._get_invite_note_text(custom_message).split())
-        if expected_text not in entered_text or not self._is_enabled_button(
+        if expected_text != entered_text or not self._is_enabled_button(
             self._get_send_invitation_button()
         ):
             raise TaskSkippedException("invite_not_confirmed")
 
     def _normalize_profile_url(self, url: str) -> str:
-        parsed = urlparse(url)
-        path = parsed.path.rstrip("/")
-        return f"{parsed.scheme}://{parsed.netloc}{path}/"
+        normalized = canonical_profile_url(url)
+        if normalized is None:
+            raise ValueError("A LinkedIn /in/ profile URL is required")
+        return normalized
 
     def _confirm_invitation_sent(self, url: str) -> ConnectionState:
+        identity = self._require_target_identity()
+        if self._normalize_profile_url(url) != identity.url:
+            raise TaskSkippedException(
+                "profile_identity_mismatch", cooldown_eligible=False
+            )
         for _ in range(5):
-            state = detect_connection_state(self.page)
+            assert_profile_identity(self.page, identity)
+            # A stale or wrong-recipient dialog must never be used as success
+            # evidence even if a different control happens to say Pending.
+            find_invite_dialog(self.page, identity)
+            state = detect_connection_state(self.page, identity)
             if state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
                 return state
             self.human.random_sleep(0.8, 1.4)
 
-        normalized_url = self._normalize_profile_url(url)
-        self.page.goto(normalized_url, timeout=60000, wait_until="domcontentloaded")
-        self.page.wait_for_selector("main", timeout=15000)
-        self.human.random_sleep(1.0, 2.0)
-
-        return detect_connection_state(self.page)
+        if find_invite_dialog(self.page, identity) is not None:
+            return ConnectionState.UNKNOWN
+        self.page.goto(identity.url, timeout=60000, wait_until="domcontentloaded")
+        refreshed = wait_for_profile(self.page, identity.url, personalize=False)
+        if refreshed.identity != identity:
+            raise TaskSkippedException(
+                "profile_identity_mismatch", cooldown_eligible=False
+            )
+        return detect_connection_state(self.page, identity)
 
     def _record_confirmed_invite(
         self,
@@ -1288,327 +1101,212 @@ class InviteTask(BaseTask):
             encoding="utf-8",
         )
 
-    def _after_connect_click(
-        self,
-        try_personal_message: bool,
-        url: str,
-        source: str,
-        profile_name: str = "",
-        profile_content: str = "",
-    ) -> Optional[dict]:
+    def _after_connect_click(self, url: str, profile_content: str) -> dict:
         error = self._check_invitation_error()
         if error:
-            logger.warning(f"Invitation blocked after {source} click: {error}")
             raise TaskSkippedException(error)
-
         if self._wait_for_invite_modal():
-            logger.info("Invite modal opened via %s", source)
-            return self._complete_connection(
-                try_personal_message, url, profile_name, profile_content
-            )
-
-        error = self._check_invitation_error()
-        if error:
-            logger.warning(f"Invitation blocked after {source} click: {error}")
-            raise TaskSkippedException(error)
-
-        quick_state = detect_connection_state(self.page)
-        if quick_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
-            return self._record_confirmed_invite(url, quick_state, None)
-
-        try:
-            if self.page.locator(DROPDOWN_SELECTOR).first.is_visible(timeout=500):
-                logger.info("Dropdown opened after %s click", source)
-                return None
-        except Exception:
-            pass
-
+            return self._complete_connection(url, profile_content)
         final_state = self._confirm_invitation_sent(url)
         if final_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
             return self._record_confirmed_invite(url, final_state, None)
+        # Connect itself may submit on some layouts. Never try another action
+        # after its outcome becomes ambiguous.
+        raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
 
-        return None
+    def _complete_connection(self, url: str, profile_content: str) -> dict:
+        identity = self._require_target_identity()
+        require_invite_dialog(self.page, identity)
+        if self._send_attempted:
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        connection_message = None
+        if profile_content:
+            connection_message = generate_connection_message(
+                profile_content, identity.name
+            )
+            if connection_message:
+                connection_message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
 
-    def _complete_connection(
-        self,
-        try_personal_message: bool,
-        url: str,
-        profile_name: str = "",
-        profile_content: str = "",
-    ) -> dict:
-        connection_message: Optional[str] = None
-
-        if try_personal_message:
-            if not profile_content:
-                # Fallback: content was not captured before the Connect click.
-                # The extractor hides open dialogs, so the invite modal cannot
-                # leak into the content here.
-                profile_name, profile_content = self.get_profile_content()
-            if profile_content:
-                connection_message = generate_connection_message(
-                    profile_content, profile_name
-                )
-                if connection_message:
-                    connection_message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
-                    logger.info(f"Generated connection message: {connection_message}")
-
+        # Revalidate after the external generation call and after opening the
+        # note editor. There is deliberately no post-click content re-scrape.
+        dialog = require_invite_dialog(self.page, identity)
         if connection_message:
-            custom_message = self._get_invite_note_editor()
-            try:
-                editor_visible = custom_message.is_visible(timeout=500)
-            except Exception:
-                editor_visible = False
-
-            if not editor_visible:
-                add_note = self.page.locator(ADD_NOTE_SELECTOR).first
-                if not add_note.is_visible(timeout=1000):
-                    raise TaskSkippedException("add_note_unreachable")
-                self.human.click(add_note)
-
-            self.page.wait_for_selector(INVITE_NOTE_SELECTOR, timeout=3000)
+            if not self._get_invite_note_editor().is_visible():
+                add_note = dialog.locator(ADD_NOTE_SELECTOR)
+                visible = [button for button in add_note.all() if button.is_visible()]
+                if len(visible) != 1:
+                    raise TaskSkippedException(
+                        "add_note_unreachable", cooldown_eligible=False
+                    )
+                visible[0].click(timeout=3000)
+            self._get_invite_note_editor().wait_for(state="visible", timeout=3000)
             self._enter_connection_message(connection_message)
+        else:
+            editor = self._get_invite_note_editor()
+            if editor.is_visible():
+                editor.fill("", timeout=3000)
 
         send_btn = self._get_send_invitation_button()
-        if not send_btn.is_visible(timeout=1000):
-            raise TaskSkippedException("invite_not_confirmed")
         if not self._is_enabled_button(send_btn):
-            logger.warning(
-                "Invite send button is disabled: %s",
-                _locator_accessible_text(send_btn),
-            )
-            raise TaskSkippedException("invite_not_confirmed")
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        editor = self._get_invite_note_editor()
+        if editor.is_visible():
+            entered = " ".join(self._get_invite_note_text(editor).split())
+            expected = " ".join((connection_message or "").split())
+            if entered != expected:
+                raise TaskSkippedException(
+                    "invite_not_confirmed", cooldown_eligible=False
+                )
 
         feedback_before_send = self._collect_visible_feedback_texts()
-
-        # Use a precise click here. Missing the modal action button looks like a silent invite failure.
+        require_invite_dialog(self.page, identity)
+        self._send_attempted = True
         try:
             send_btn.click(delay=100, timeout=5000)
         except Exception as exc:
+            # A timeout can happen after dispatch. Confirm, but never click a
+            # second time or regenerate a new note for the same attempt.
             logger.warning(
-                "Direct send click failed, retrying with human click: %s", exc
+                "Send click outcome is uncertain; checking target state: %s", exc
             )
-            self.human.click(send_btn)
-
         self.human.random_sleep(2.0, 4.0)
-
         error = self._check_invitation_error(ignored_feedback=feedback_before_send)
         if error:
-            logger.warning(f"Invitation failed: {error}")
-            try:
-                close_btn = self.page.locator("button[aria-label='Dismiss']")
-                if close_btn.is_visible(timeout=500):
-                    close_btn.click()
-            except Exception:
-                pass
             raise TaskSkippedException(error)
-
-        success_toast_detected = self._check_invitation_success()
         final_state = self._confirm_invitation_sent(url)
-        confirmed_state = final_state
         if final_state not in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
-            if success_toast_detected:
-                confirmed_state = ConnectionState.PENDING
-            else:
-                if self._is_send_modal_open():
-                    logger.warning(
-                        "Invite modal still open after send click; treating invite as unconfirmed"
-                    )
-                logger.warning(
-                    "Invite not confirmed after send. success_toast=%s final_state=%s",
-                    success_toast_detected,
-                    final_state,
-                )
-                raise TaskSkippedException("invite_not_confirmed")
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+        return self._record_confirmed_invite(url, final_state, connection_message)
 
-        return self._record_confirmed_invite(url, confirmed_state, connection_message)
+    def _click_connect_target(self, target: Locator, profile_content: str) -> dict:
+        identity = self._require_target_identity()
+        target.scroll_into_view_if_needed()
+        if not is_target_action(
+            target, self.page, identity, from_profile_menu=self._profile_menu_open
+        ):
+            raise TaskSkippedException(
+                "profile_identity_mismatch", cooldown_eligible=False
+            )
+        try:
+            target.click(delay=100, timeout=5000)
+        except Exception as exc:
+            raise TaskSkippedException(
+                "invite_not_confirmed", cooldown_eligible=False
+            ) from exc
+        return self._after_connect_click(identity.url, profile_content)
 
     def send_connection_request(
         self, url: str, try_personal_message: bool = True
     ) -> dict:
-        logger.info(f"Sending connection request to {url}...")
+        url = self._normalize_profile_url(url)
+        self._target_identity = None
+        self._profile_menu_open = False
+        self._send_attempted = False
+        self._last_audience_stats = None
+        logger.info("Sending connection request to %s", url)
+        self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        self.validate_session()
+        snapshot = wait_for_profile(self.page, url, personalize=False)
+        identity = snapshot.identity
+        self._target_identity = identity
+        state = detect_connection_state(self.page, identity)
+        if state == ConnectionState.PENDING:
+            raise TaskSkippedException("already_pending", cooldown_eligible=False)
+        if state == ConnectionState.CONNECTED:
+            raise TaskSkippedException("already_connected", cooldown_eligible=False)
 
-        try:
-            self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            self.human.random_sleep(2.0, 4.0)
-            self.page.wait_for_selector("main", timeout=15000)
-
-            state = detect_connection_state(self.page)
-
-            if state == ConnectionState.PENDING:
-                logger.info("Connection already pending, skipping")
-                raise TaskSkippedException("already_pending")
-
-            if state == ConnectionState.CONNECTED:
-                logger.info("Already connected, skipping")
-                raise TaskSkippedException("already_connected")
-
-            # Reset per-task so a previous prospect's stats can never leak
-            # into this invite's notification.
-            self._last_audience_stats = None
-            self._last_audience_stats = self._enforce_audience_filter(url)
-
-            # Capture the prospect's content before any click: the page is
-            # still scrollable (no modal), so lazy sections can hydrate, and
-            # the note is guaranteed to be grounded in this profile.
-            profile_name = ""
-            profile_content = ""
-            if try_personal_message:
-                profile_name, profile_content = self.get_profile_content()
-
-            if try_heuristic_connect(self.page, self.human):
-                logger.info("Clicked Connect via heuristics (no LLM needed)")
-                self.human.random_sleep(1.0, 2.0)
-
-                result = self._after_connect_click(
-                    try_personal_message,
-                    url,
-                    "heuristic",
-                    profile_name,
-                    profile_content,
+        self._last_audience_stats = self._enforce_audience_filter(url)
+        profile_content = ""
+        if try_personal_message:
+            snapshot = wait_for_profile(self.page, url, personalize=True)
+            if snapshot.identity != identity:
+                raise TaskSkippedException(
+                    "profile_identity_mismatch", cooldown_eligible=False
                 )
-                if result:
-                    return result
-
-            cached_selector = get_cached_selector(self.page, "profile_card", "Connect")
-            if cached_selector:
-                logger.info(f"Using cached selector: {cached_selector}")
-                try:
-                    locator = self.page.locator(cached_selector).first
-                    locator.scroll_into_view_if_needed()
-                    self.human.random_sleep(0.3, 0.5)
-                    locator.click(delay=100)
-                    self.human.random_sleep(1.0, 2.0)
-
-                    result = self._after_connect_click(
-                        try_personal_message,
-                        url,
-                        "cached selector",
-                        profile_name,
-                        profile_content,
-                    )
-                    if result:
-                        return result
-                except Exception:
-                    logger.debug("Cached selector failed")
-
-            logger.info("Falling back to LLM for selector detection")
-
-            previous_feedback = None
-
-            for iteration in range(MAX_CONNECT_ITERATIONS):
-                logger.info(f"LLM iteration {iteration + 1}/{MAX_CONNECT_ITERATIONS}")
-
-                screenshot_bytes = self.page.screenshot()
-                screenshot_base64 = base64.b64encode(screenshot_bytes).decode("utf-8")
-
-                container, container_name = self._get_action_container()
-                container_html = container.inner_html()
-                logger.debug(f"Using container: {container_name}")
-
-                result = get_next_connect_action(
-                    screenshot_base64, container_html, previous_feedback
-                )
-
-                if result is None:
-                    raise ValueError("LLM returned invalid response")
-
-                selector = result.get("selector")
-                expected_text = result.get("expected_text")
-                reason = result.get("reason", "")
-
-                logger.info(
-                    f"LLM response: selector={selector}, expected_text={expected_text}, reason={reason}"
-                )
-
-                if selector is None:
-                    logger.info(f"LLM says skip: {reason}")
-                    raise TaskSkippedException(reason, cooldown_eligible=False)
-
-                try:
-                    all_matches = container.locator(selector).all()
-
-                    if not all_matches:
-                        previous_feedback = f"Selector '{selector}' found no elements. Try a different selector."
-                        logger.info(f"No elements found for selector: {selector}")
-                        continue
-
-                    target_locator = None
-
-                    if expected_text:
-                        for match in all_matches:
-                            try:
-                                if not match.is_visible(timeout=300):
-                                    continue
-                                text = _locator_accessible_text(match)
-                                if _locator_matches_expected_text(match, expected_text):
-                                    target_locator = match
-                                    logger.info(
-                                        f"Found matching element with text: {text}"
-                                    )
-                                    break
-                            except Exception:
-                                continue
-
-                        if not target_locator:
-                            previous_feedback = f"Element '{selector}' with text '{expected_text}' is NOT VISIBLE - it's likely inside a closed dropdown. Click the 'More' button first to open the dropdown."
-                            logger.info(
-                                f"No visible element with expected text '{expected_text}' found among {len(all_matches)} matches (element may be in closed dropdown)"
-                            )
-                            continue
-                    else:
-                        visible_matches = [
-                            m for m in all_matches if m.is_visible(timeout=300)
-                        ]
-                        if not visible_matches:
-                            previous_feedback = f"Element '{selector}' is NOT VISIBLE - it may be inside a closed dropdown. Click the 'More' button first."
-                            logger.info(
-                                f"No visible elements found for selector: {selector}"
-                            )
-                            continue
-                        target_locator = visible_matches[0]
-
-                    button_text = _locator_accessible_text(target_locator)
-
-                    is_dropdown_opener = "more" in button_text.lower()
-
-                    target_locator.scroll_into_view_if_needed()
-                    self.human.random_sleep(0.3, 0.5)
-                    target_locator.click(delay=100)
-                    self.human.random_sleep(1.0, 2.0)
-
-                    if is_dropdown_opener:
-                        logger.info(
-                            "Opened dropdown via LLM-selected action: %s",
-                            button_text or selector,
-                        )
-                        previous_feedback = None
-                        continue
-
-                    if button_text:
-                        save_selector_to_cache("profile_card", button_text, selector)
-                    previous_feedback = None
-
-                except Exception as e:
-                    previous_feedback = (
-                        f"Selector '{selector}' failed to click: {str(e)[:100]}"
-                    )
-                    logger.info(f"Suggested selector not clickable: {e}")
-                    continue
-
-                result = self._after_connect_click(
-                    try_personal_message,
-                    url,
-                    "LLM-selected action",
-                    profile_name,
-                    profile_content,
-                )
-                if result:
-                    return result
-
-            raise ValueError(
-                f"Could not reach 'Add a note' after {MAX_CONNECT_ITERATIONS} iterations"
+            profile_content = snapshot.content
+            if not profile_content:
+                logger.info("Owned profile sections are not ready; omitting the note")
+        assert_profile_identity(self.page, identity)
+        # A dialog left by an earlier task must not be mistaken for the result
+        # of a new Connect click, even when its recipient happens to match.
+        if self.page.locator("[role='dialog']:visible, dialog[open]").count():
+            raise TaskSkippedException(
+                "modal_recipient_mismatch", cooldown_eligible=False
             )
 
-        except Exception as e:
-            logger.error(f"Error sending connection request: {e}")
-            raise e
+        if try_heuristic_connect(self.page, self.human, identity):
+            return self._after_connect_click(url, profile_content)
+        cached = get_cached_connect_button(self.page, identity)
+        if cached is not None:
+            return self._click_connect_target(cached, profile_content)
+
+        previous_feedback = None
+        for iteration in range(MAX_CONNECT_ITERATIONS):
+            logger.info(
+                "LLM selector iteration %s/%s", iteration + 1, MAX_CONNECT_ITERATIONS
+            )
+            container, _ = self._get_action_container()
+            screenshot = base64.b64encode(self.page.screenshot()).decode("utf-8")
+            result = get_next_connect_action(
+                screenshot, container.inner_html(), previous_feedback
+            )
+            assert_profile_identity(self.page, identity)
+            if result is None:
+                raise TaskSkippedException(
+                    "llm_invalid_response", cooldown_eligible=False
+                )
+            selector = result.get("selector")
+            if selector is None:
+                raise TaskSkippedException(
+                    result.get("reason") or "connect_unavailable",
+                    cooldown_eligible=False,
+                )
+            # Resolve fresh after generation; the old scoped locator may now
+            # refer to a different card or a replaced dropdown.
+            container, _ = self._get_action_container()
+            expected_text = result.get("expected_text") or ""
+            try:
+                matches = container.locator(selector).all()
+            except Exception:
+                previous_feedback = (
+                    "Invalid selector; choose a visible Connect or More control."
+                )
+                continue
+            candidates = [
+                match
+                for match in matches
+                if _locator_matches_expected_text(match, expected_text)
+                and is_target_action(
+                    match,
+                    self.page,
+                    identity,
+                    allow_more=True,
+                    from_profile_menu=self._profile_menu_open,
+                )
+            ]
+            if len(candidates) != 1:
+                previous_feedback = (
+                    "Selector must identify one target-owned Connect or More control."
+                )
+                continue
+            target = candidates[0]
+            label = _locator_accessible_text(target).lower()
+            is_more = bool(re.search(r"\bmore\b", label))
+            if not is_more:
+                save_selector_to_cache(self.page, identity, selector)
+                return self._click_connect_target(target, profile_content)
+            target.scroll_into_view_if_needed()
+            if not is_target_action(target, self.page, identity, allow_more=True):
+                raise TaskSkippedException(
+                    "profile_identity_mismatch", cooldown_eligible=False
+                )
+            try:
+                target.click(delay=100, timeout=5000)
+            except Exception as exc:
+                raise TaskSkippedException(
+                    "connect_unavailable", cooldown_eligible=False
+                ) from exc
+            self._profile_menu_open = True
+            self.human.random_sleep(0.5, 1.0)
+            previous_feedback = None
+        raise TaskSkippedException("connect_unavailable", cooldown_eligible=False)

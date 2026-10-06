@@ -1,320 +1,283 @@
 import logging
 import re
-from dataclasses import dataclass, field
-from typing import Any, Optional
-from urllib.parse import parse_qs, urlparse
-from playwright.sync_api import Page, Locator
+from urllib.parse import parse_qs, quote, urljoin, urlparse
 
+from patchright.sync_api import Error as PatchrightError
+from playwright.sync_api import Error as PlaywrightError, Locator, Page
+
+from exceptions import TaskSkippedException
 from human_actions import HumanActions
+from linkedin_profile import (
+    ProfileIdentity,
+    assert_profile_identity,
+    canonical_profile_url,
+    get_profile_topcard,
+    is_profile_owned_element,
+)
 
 logger = logging.getLogger(__name__)
 
-CONNECT_WORD_RE = re.compile(r"\bconnect\b")
-
-PROFILE_ACTION_CONTAINER_SELECTORS = [
-    "div.pvs-profile-actions",
-    "section.pv-top-card",
-    "main section:has(h1)",
-    "div.ph5:has(button[aria-label*='More'], button[aria-label*='Connect'], button:has-text('Connect'), a[href*='/preload/custom-invite/'])",
-]
-
-DIRECT_CONNECT_PATTERNS = [
-    "a[href*='/preload/custom-invite/']",
-    "a[aria-label*='connect' i]",
-    "a:has-text('Connect')",
-    "button:has-text('Connect')",
-    "button[aria-label*='Connect' i]",
-    "[role='button']:has-text('Connect')",
-    "[role='button'][aria-label*='Connect' i]",
-]
-
-CONNECT_IN_DROPDOWN_PATTERNS = [
-    "div[role='menu'] button:has-text('Connect')",
-    "div[role='menu'] button[aria-label*='Connect' i]",
-    "div[role='menu'] [role='button']:has-text('Connect')",
-    "div[role='menu'] [role='button'][aria-label*='Connect' i]",
-    "div.artdeco-dropdown__content button:has-text('Connect')",
-    "div.artdeco-dropdown__content button[aria-label*='Connect' i]",
-    "div.artdeco-dropdown__content [role='button']:has-text('Connect')",
-    "div.artdeco-dropdown__content [role='button'][aria-label*='Connect' i]",
-    "[class*='dropdown'] button:has-text('Connect')",
-    "[class*='dropdown'] button[aria-label*='Connect' i]",
-    "[class*='dropdown'] [role='button']:has-text('Connect')",
-    "[class*='dropdown'] [role='button'][aria-label*='Connect' i]",
-]
-
-MORE_BUTTON_PATTERNS = [
-    "button[aria-label*='More actions']",
-    "button[aria-label*='More']",
-    "button:has-text('More')",
-]
+ACTION_SELECTOR = "button, a[href], [role='button'], [role='menuitem']"
+MENU_SELECTOR = "[role='menu'], .artdeco-dropdown__content, [class*='dropdown-content']"
+# Cache hints, never a capability: every candidate is identity-checked on every use.
+selector_cache: dict[str, str] = {}
 
 
-@dataclass
-class CacheEntry:
-    selector: str
-    expected_text: str
-    success_count: int = 0
-    failure_count: int = 0
+def _normalize(value: str) -> str:
+    return " ".join(value.split()).casefold()
 
 
-@dataclass
-class SelectorCache:
-    entries: dict[str, CacheEntry] = field(default_factory=dict)
-
-    def get(self, page_variant: str, expected_text: str) -> Optional[str]:
-        key = f"{page_variant}:{expected_text}"
-        entry = self.entries.get(key)
-        if entry:
-            return entry.selector
+def _href_identity(href: str, identity: ProfileIdentity) -> bool | None:
+    """None means no target evidence; every explicit destination must agree."""
+    if not href or href == "#":
         return None
-
-    def put(self, page_variant: str, button_text: str, selector: str) -> None:
-        key = f"{page_variant}:{button_text}"
-        existing = self.entries.get(key)
-        if existing:
-            existing.selector = selector
-            existing.success_count += 1
-        else:
-            self.entries[key] = CacheEntry(
-                selector=selector, expected_text=button_text, success_count=1
+    try:
+        parsed = urlparse(urljoin(identity.url, href))
+        host = (parsed.hostname or "").lower()
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not (host == "linkedin.com" or host.endswith(".linkedin.com"))
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.port not in {None, 80, 443}
+        ):
+            return False
+        target = canonical_profile_url(parsed.geturl())
+        query = parse_qs(parsed.query, keep_blank_values=True)
+        vanity = [
+            value
+            for key, values in query.items()
+            if key.lower() == "vanityname"
+            for value in values
+        ]
+        if vanity:
+            if any(
+                canonical_profile_url(
+                    f"https://www.linkedin.com/in/{quote(value, safe='')}/"
+                )
+                != identity.url
+                for value in vanity
+            ):
+                return False
+            return (
+                parsed.path.rstrip("/") == "/preload/custom-invite"
+                or target == identity.url
             )
-        logger.info(f"Cached selector: {selector} for '{button_text}'")
-
-    def record_failure(self, page_variant: str, expected_text: str) -> None:
-        key = f"{page_variant}:{expected_text}"
-        entry = self.entries.get(key)
-        if entry:
-            entry.failure_count += 1
-
-    def record_success(self, page_variant: str, expected_text: str) -> None:
-        key = f"{page_variant}:{expected_text}"
-        entry = self.entries.get(key)
-        if entry:
-            entry.success_count += 1
+        return target == identity.url
+    except ValueError:
+        return False
 
 
-selector_cache = SelectorCache()
-
-
-def _locator_accessible_text(locator: Any, timeout: int = 300) -> str:
-    parts = []
-    try:
-        text = (locator.inner_text(timeout=timeout) or "").strip()
-        if text:
-            parts.append(text)
-    except Exception:
-        pass
-
-    try:
-        aria_label = (locator.get_attribute("aria-label") or "").strip()
-        if aria_label:
-            parts.append(aria_label)
-    except Exception:
-        pass
-
-    return " ".join(parts)
-
-
-def _locator_matches_expected_text(locator: Any, expected_text: str) -> bool:
-    expected = (expected_text or "").strip().lower()
-    if not expected:
+def _label_identity(label: str, identity: ProfileIdentity) -> bool:
+    """Accept known generic controls or an exact named recipient, never substrings."""
+    text = _normalize(label)
+    if not text:
         return True
-
-    actual = _locator_accessible_text(locator).lower()
-    return bool(actual and (expected in actual or actual in expected))
-
-
-def _is_valid_connect_button(locator: Any) -> bool:
-    try:
-        if not locator.is_visible(timeout=500):
-            return False
-
-        box = locator.bounding_box(timeout=500)
-        if not box or box["width"] == 0 or box["height"] == 0:
-            return False
-
-        if locator.is_disabled(timeout=300):
-            return False
-
-        href = (locator.get_attribute("href") or "").lower()
-        text = _locator_accessible_text(locator).lower()
-        if "disconnect" in text or "disconnect" in href:
-            return False
-        return (
-            "/preload/custom-invite/" in href
-            or CONNECT_WORD_RE.search(text) is not None
-        )
-    except Exception:
-        return False
-
-
-def _current_profile_slug(page: Page) -> str:
-    parsed = urlparse(page.url)
-    parts = [part for part in parsed.path.split("/") if part]
-    if len(parts) >= 2 and parts[0] == "in":
-        return parts[1].lower()
-    return ""
-
-
-def _targets_current_profile(locator: Any, profile_slug: str) -> bool:
-    if not profile_slug:
-        return False
-
-    href = (locator.get_attribute("href") or "").lower()
-    if not href:
-        return False
-
-    parsed = urlparse(href)
-    query = {key.lower(): value for key, value in parse_qs(parsed.query).items()}
-    vanity_names = [value.lower() for value in query.get("vanityname", [])]
-    return profile_slug in vanity_names or f"/in/{profile_slug}" in parsed.path.lower()
-
-
-def _get_profile_action_container(page: Page) -> Optional[Locator]:
-    for selector in PROFILE_ACTION_CONTAINER_SELECTORS:
-        locator = page.locator(selector)
-        for index in range(min(locator.count(), 5)):
-            candidate = locator.nth(index)
-            try:
-                if candidate.is_visible(timeout=500):
-                    return candidate
-            except Exception:
-                continue
-
-    return None
-
-
-def _find_direct_connect_button(page: Page) -> Optional[Locator]:
-    container = _get_profile_action_container(page)
-    profile_slug = _current_profile_slug(page)
-    scopes: list[Any] = []
-    if container:
-        scopes.append(container)
-    scopes.append(page)
-
-    valid_buttons: list[tuple[Any, Locator]] = []
-
-    for scope in scopes:
-        buttons = scope.locator(", ".join(DIRECT_CONNECT_PATTERNS))
-        for i in range(min(buttons.count(), 10)):
-            try:
-                btn = buttons.nth(i)
-                if not _is_valid_connect_button(btn):
-                    continue
-                if _targets_current_profile(btn, profile_slug):
-                    return btn
-                valid_buttons.append((scope, btn))
-            except Exception:
-                continue
-
-    if profile_slug:
-        if container:
-            for scope, btn in valid_buttons:
-                if scope == container:
-                    return btn
-        return None
-
-    if valid_buttons:
-        return valid_buttons[0][1]
-    return None
-
-
-def _find_connect_in_dropdown(page: Page) -> Optional[Locator]:
-    for pattern in CONNECT_IN_DROPDOWN_PATTERNS:
-        try:
-            locator = page.locator(pattern).first
-            if _is_valid_connect_button(locator):
-                return locator
-        except Exception:
-            continue
-    return None
-
-
-def try_heuristic_connect(page: Page, human: HumanActions) -> bool:
-    direct_btn = _find_direct_connect_button(page)
-    if direct_btn:
-        try:
-            direct_btn.scroll_into_view_if_needed()
-            human.random_sleep(0.3, 0.6)
-            direct_btn.click(delay=100)
-            human.random_sleep(0.5, 1.0)
-            logger.info("Clicked Connect via direct button heuristic")
-            return True
-        except Exception as e:
-            logger.debug(f"Direct button click failed: {e}")
-
-    dropdown_btn = _find_connect_in_dropdown(page)
-    if dropdown_btn:
-        try:
-            dropdown_btn.scroll_into_view_if_needed()
-            human.random_sleep(0.2, 0.4)
-            dropdown_btn.click(delay=100)
-            human.random_sleep(0.5, 1.0)
-            logger.info("Clicked Connect in open dropdown via heuristic")
-            return True
-        except Exception as e:
-            logger.debug(f"Dropdown button click failed: {e}")
-
-    container = _get_profile_action_container(page)
-    if not container:
-        return False
-
-    for more_pattern in MORE_BUTTON_PATTERNS:
-        try:
-            more_btn = container.locator(more_pattern).first
-            if not more_btn.is_visible(timeout=500):
-                continue
-
-            more_btn.scroll_into_view_if_needed()
-            human.random_sleep(0.2, 0.4)
-            more_btn.click(delay=100)
-            human.random_sleep(0.5, 1.0)
-
-            dropdown_connect = _find_connect_in_dropdown(page)
-            if dropdown_connect:
-                dropdown_connect.click(delay=100)
-                human.random_sleep(0.5, 1.0)
-                logger.info("Clicked Connect via More dropdown heuristic")
-                return True
-
-            page.keyboard.press("Escape")
-            human.random_sleep(0.2, 0.4)
-
-        except Exception:
-            continue
-
+    if text in {
+        "connect",
+        "more",
+        "more actions",
+        "pending",
+        "withdraw",
+        "withdraw invitation",
+        "following",
+        "message",
+        "send message",
+        "send a message",
+    }:
+        return True
+    patterns = (
+        r"connect with (.+)",
+        r"invite (.+) to connect",
+        r"more actions for (.+)",
+        r"pending,? click to withdraw invitation sent to (.+)",
+        r"withdraw invitation (?:sent )?to (.+)",
+        r"message (.+)",
+        r"send (?:a )?message to (.+)",
+        r"following (.+)",
+    )
+    for pattern in patterns:
+        match = re.fullmatch(pattern, text)
+        if match:
+            return match.group(1) == _normalize(identity.name)
     return False
 
 
-def get_cached_selector(
-    page: Page, page_variant: str, expected_text: str
-) -> Optional[str]:
-    cached = selector_cache.get(page_variant, expected_text)
-    if not cached:
-        return None
+def _control_identity_matches(locator: Locator, identity: ProfileIdentity) -> bool:
+    # A contrary explicit aria label or href overrides even a verified topcard.
+    return _href_identity(
+        locator.get_attribute("href") or "", identity
+    ) is not False and _label_identity(
+        locator.get_attribute("aria-label") or "", identity
+    )
 
+
+def _action_kind(locator: Locator) -> str | None:
+    text = _normalize(locator.inner_text(timeout=500))
+    aria = _normalize(locator.get_attribute("aria-label") or "")
+    if "disconnect" in text or "disconnect" in aria:
+        return None
+    if text == "connect" or re.fullmatch(
+        r"connect(?: with .+)?|invite .+ to connect", aria
+    ):
+        return "connect"
+    if text == "more" or re.fullmatch(r"more(?: actions(?: for .+)?)?", aria):
+        return "more"
+    return None
+
+
+def _menu_membership(locator: Locator) -> dict:
+    return locator.evaluate(
+        """(el, selector) => {
+            const visible = node => !!(node.getClientRects().length &&
+                getComputedStyle(node).visibility !== 'hidden');
+            const menus = [...document.querySelectorAll(selector)].filter(visible);
+            const roots = menus.filter(node => !menus.some(other => other !== node && other.contains(node)));
+            return {inside: menus.some(node => node.contains(el)),
+                    unique: roots.length === 1 && roots[0].contains(el),
+                    count: roots.length};
+        }""",
+        MENU_SELECTOR,
+    )
+
+
+def is_target_action(
+    locator: Locator,
+    page: Page,
+    identity: ProfileIdentity,
+    *,
+    allow_more: bool = False,
+    from_profile_menu: bool = False,
+) -> bool:
+    """Validate a control; callers must revalidate immediately before clicking it.
+
+    from_profile_menu is a capability supplied only after clicking a validated
+    target More control. Merely finding an already-open menu does not grant it.
+    """
+    assert_profile_identity(page, identity)
     try:
-        locator = page.locator(cached).first
-        if not locator.is_visible(timeout=500):
-            return None
+        if locator.count() != 1 or not locator.is_visible() or locator.is_disabled():
+            return False
+        if not locator.evaluate(
+            "(el, selector) => el.matches(selector)", ACTION_SELECTOR
+        ):
+            return False
+        if locator.get_attribute("aria-disabled") == "true":
+            return False
+        if not _control_identity_matches(locator, identity):
+            return False
+        kind = _action_kind(locator)
+        if kind is None or (kind == "more" and not allow_more):
+            return False
+        menu = _menu_membership(locator)
+        if menu["inside"]:
+            return kind == "connect" and from_profile_menu and menu["unique"]
+        owned = is_profile_owned_element(locator, page, identity)
+        if kind == "more":
+            return owned and menu["count"] == 0
+        return (
+            owned
+            or _href_identity(locator.get_attribute("href") or "", identity) is True
+        )
+    except (PlaywrightError, PatchrightError):
+        return False
 
-        actual_text = _locator_accessible_text(locator)
-        if not _locator_matches_expected_text(locator, expected_text):
-            selector_cache.record_failure(page_variant, expected_text)
-            logger.debug(
-                f"Cache miss: expected '{expected_text}', found '{actual_text}'"
-            )
-            return None
 
-        selector_cache.record_success(page_variant, expected_text)
-        logger.info(f"Cache hit: {cached}")
-        return cached
-
-    except Exception as e:
-        logger.debug(f"Cache lookup failed: {e}")
+def _find_action(
+    page: Page,
+    identity: ProfileIdentity,
+    *,
+    more: bool = False,
+    from_profile_menu: bool = False,
+) -> Locator | None:
+    assert_profile_identity(page, identity)
+    scope = get_profile_topcard(page, identity) if more else page
+    if scope is None:
         return None
+    controls = scope.locator(ACTION_SELECTOR)
+    for index in range(controls.count()):
+        candidate = controls.nth(index)
+        if is_target_action(
+            candidate,
+            page,
+            identity,
+            allow_more=more,
+            from_profile_menu=from_profile_menu,
+        ) and _action_kind(candidate) == ("more" if more else "connect"):
+            return candidate
+    return None
 
 
-def save_selector_to_cache(page_variant: str, button_text: str, selector: str) -> None:
-    selector_cache.put(page_variant, button_text, selector)
+def _click_action(
+    locator: Locator,
+    page: Page,
+    human: HumanActions,
+    identity: ProfileIdentity,
+    *,
+    more: bool = False,
+    from_profile_menu: bool = False,
+) -> None:
+    locator.scroll_into_view_if_needed()
+    human.random_sleep(0.2, 0.4)
+    if not is_target_action(
+        locator, page, identity, allow_more=more, from_profile_menu=from_profile_menu
+    ):
+        raise TaskSkippedException("profile_identity_mismatch", cooldown_eligible=False)
+    try:
+        locator.click(delay=100)
+    except (PlaywrightError, PatchrightError) as exc:
+        # A timeout can occur after dispatch. Never attempt another Connect.
+        raise TaskSkippedException(
+            "invite_not_confirmed", cooldown_eligible=False
+        ) from exc
+    human.random_sleep(0.5, 1.0)
+
+
+def try_heuristic_connect(
+    page: Page, human: HumanActions, identity: ProfileIdentity
+) -> bool:
+    direct = _find_action(page, identity)
+    if direct is not None:
+        _click_action(direct, page, human, identity)
+        return True
+    more = _find_action(page, identity, more=True)
+    if more is None:
+        return False
+    _click_action(more, page, human, identity, more=True)
+    dropdown = _find_action(page, identity, from_profile_menu=True)
+    if dropdown is not None:
+        _click_action(dropdown, page, human, identity, from_profile_menu=True)
+        return True
+    assert_profile_identity(page, identity)
+    page.keyboard.press("Escape")
+    return False
+
+
+def get_cached_connect_button(page: Page, identity: ProfileIdentity) -> Locator | None:
+    assert_profile_identity(page, identity)
+    selector = selector_cache.get("connect")
+    if not selector:
+        return None
+    try:
+        candidates = page.locator(selector)
+        for index in range(candidates.count()):
+            candidate = candidates.nth(index)
+            if is_target_action(candidate, page, identity):
+                return candidate
+    except (PlaywrightError, PatchrightError) as exc:
+        logger.debug("Cached Connect selector is no longer usable: %s", exc)
+    return None
+
+
+def save_selector_to_cache(
+    page: Page, identity: ProfileIdentity, selector: str
+) -> None:
+    assert_profile_identity(page, identity)
+    try:
+        candidates = page.locator(selector)
+        for index in range(candidates.count()):
+            if is_target_action(candidates.nth(index), page, identity):
+                selector_cache["connect"] = selector
+                return
+    except (PlaywrightError, PatchrightError) as exc:
+        logger.debug("Not caching unusable Connect selector: %s", exc)
