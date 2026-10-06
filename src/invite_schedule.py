@@ -30,8 +30,9 @@ def next_invite_time(
 
     slot = window / limit
     minimum_gap = slot * 0.7
+    # Free capacity is usable once minimum spacing permits. Redistributing it
+    # against the next-oldest event would postpone a slot as its predecessor ages out.
+    quota_time = now
     if len(recent) == limit:
         quota_time = recent[0] + window + timedelta(microseconds=1)
-    else:
-        quota_time = recent[0] + window - (limit - len(recent)) * slot
     return max(now, recent[-1] + minimum_gap, quota_time)

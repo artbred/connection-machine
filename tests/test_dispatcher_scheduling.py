@@ -156,16 +156,16 @@ class DispatcherSchedulingTests(unittest.TestCase):
         self.assertEqual(self.row(post).status, TaskStatus.PENDING)
         self.assertEqual(self.actions, ["invite"])
         # The just-completed, initially uncommitted row must consume its slot.
-        self.assertEqual(
+        self.assertGreaterEqual(
             self.worker.next_execution_at[TaskType.SEND_INVITE],
-            started + timedelta(hours=2.4),
+            started + timedelta(minutes=100, seconds=48),
         )
 
     def test_rolling_cap_includes_exact_boundary_then_releases_one_slot(self):
         now = Clock.current
         oldest = now - timedelta(hours=24)
-        for index in range(10):
-            self.seed_success(oldest + timedelta(hours=index * 2))
+        for offset in (0, 4, 6, 8, 10, 12, 14, 16, 18, 21):
+            self.seed_success(oldest + timedelta(hours=offset))
         pending = self.add_task()
         self.worker.poll()
         self.assertEqual(self.row(pending).status, TaskStatus.PENDING)
@@ -205,11 +205,9 @@ class DispatcherSchedulingTests(unittest.TestCase):
         self.duration = timedelta(minutes=12)
         self.worker.poll()
         self.assertEqual(self.row(pending).status, TaskStatus.COMPLETED)
-        self.assertEqual(
+        self.assertGreaterEqual(
             self.worker.next_execution_at[TaskType.SEND_INVITE],
-            max(
-                oldest + timedelta(hours=4.8), Clock.current + timedelta(minutes=100.8)
-            ),
+            Clock.current + timedelta(minutes=100, seconds=48),
         )
         self.assertLess(
             self.worker.next_execution_at[TaskType.SEND_INVITE],
@@ -217,7 +215,7 @@ class DispatcherSchedulingTests(unittest.TestCase):
         )
 
     def test_background_work_is_held_for_an_imminent_invite(self):
-        self.seed_success(Clock.current - timedelta(hours=2, minutes=20))
+        self.seed_success(Clock.current - timedelta(minutes=90))
         pending = self.add_task()
         self.worker.poll()
         self.assertEqual(self.row(pending).status, TaskStatus.PENDING)

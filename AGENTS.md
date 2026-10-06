@@ -104,7 +104,7 @@ The dispatcher preserves rolling caps while using quota-aware slots for invitati
 - posts: 50 per rolling 24 hours
 - autonomous feed comments: 12 per rolling 24 hours
 
-Invitation slots are reconstructed from persisted quota events, rather than adding a fresh delay after every completion. Remaining slots are distributed against the oldest retained event's 24-hour horizon, with a minimum gap of `0.7 × 24 hours / cap` (100 minutes 48 seconds at cap 10). At a full quota the worker waits until the oldest relevant event exits the inclusive rolling window. Cooldowns and profile-visit throttles still take precedence; no catch-up bursts or cap increase are allowed. Posts/comments retain `0.7x`–`1.3x` randomized spacing.
+Invitation eligibility is reconstructed from persisted quota events. When capacity is available, the worker can attempt an invite after the minimum gap of `0.7 × 24 hours / cap` (100 minutes 48 seconds at cap 10); it does not redistribute free slots against a moving oldest-event horizon. At a full quota it waits until the oldest relevant event exits the inclusive rolling window. An expiring event must release capacity, not move the deadline later. Cooldowns and profile-visit throttles still take precedence; no catch-up bursts or cap increase are allowed. Posts/comments retain `0.7x`–`1.3x` randomized spacing.
 
 Additional cooldowns are applied for known LinkedIn skip reasons:
 
