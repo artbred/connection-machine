@@ -93,6 +93,7 @@ Task statuses:
 - Audience rejections, identity/modal mismatches, generic navigation/selector failures, exhausted preflight retries, and uncertain sends remain terminal. Notification engagement cannot resurrect terminal tasks or reset deferred retry budgets.
 - Note and Send controls are scoped to the verified invitation dialog; stale text is cleared on the no-note path. Note readback must exactly match the generated note.
 - Before Connect, existing invitation dialogs abort even if their recipient matches. The same invitation-specific verifier is used before and after Connect; unrelated chat or embedded video-error dialogs do not qualify as invitation dialogs.
+- Connect/More discovery shortlists labels in one browser read and uses structural locator hints to avoid repeatedly scanning every page control. Hints never grant action authority: recipient identity, ownership, and menu provenance are revalidated before each click, including after scrolling or DOM replacement.
 - A potentially dispatched Connect/Send click is never blindly retried. Completion requires the verified target to show Pending/Connected; an unrelated success toast is not enough.
 - `completed` means an invitation workflow was confirmed, not that the recipient later accepted. Acceptance is not tracked.
 - These checks deliberately fail closed for unsupported layouts. Do not restore page-wide `.first` selectors, whole-`main` text extraction, or post-click content re-scraping as fallbacks.

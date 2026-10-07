@@ -195,15 +195,41 @@ def _find_action(
     if scope is None:
         return None
     controls = scope.locator(ACTION_SELECTOR)
-    for index in range(controls.count()):
-        candidate = controls.nth(index)
+    kind = "more" if more else "connect"
+    # Shortlist labels in one browser read. Structural paths avoid repeating
+    # the page-wide selector query on every subsequent control property read.
+    # Paths remain hints: identity and ownership are revalidated before use.
+    selectors = controls.evaluate_all(
+        r"""(elements, kind) => {
+            const word = kind === 'more' ? /\bmore\b/iu : /\bconnect\b/iu;
+            const selectors = [];
+            for (const el of elements) {
+                if (!word.test(el.innerText || '') &&
+                    !word.test(el.getAttribute('aria-label') || '')) continue;
+                const parts = [];
+                for (let node = el; node; node = node.parentElement) {
+                    let index = 1;
+                    for (let sibling = node.previousElementSibling; sibling;
+                         sibling = sibling.previousElementSibling) {
+                        if (sibling.tagName === node.tagName) index++;
+                    }
+                    parts.unshift(node.tagName.toLowerCase() + ':nth-of-type(' + index + ')');
+                }
+                selectors.push(parts.join(' > '));
+            }
+            return selectors;
+        }""",
+        kind,
+    )
+    for selector in selectors:
+        candidate = page.locator(selector)
         if is_target_action(
             candidate,
             page,
             identity,
             allow_more=more,
             from_profile_menu=from_profile_menu,
-        ) and _action_kind(candidate) == ("more" if more else "connect"):
+        ) and _action_kind(candidate) == kind:
             return candidate
     return None
 

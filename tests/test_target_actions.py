@@ -69,13 +69,15 @@ class TargetActionBrowserTests(OfflineBrowserTestCase):
             detect_connection_state(self.page, identity), ConnectionState.PENDING
         )
 
-    def test_icon_only_named_target_connect_is_accepted(self):
+    def test_icon_only_named_target_connect_is_clicked(self):
         identity = self.load_profile(
-            '<button id="target" aria-label="Invite Jane Prospect to connect">+</button>'
+            """<button id="target" aria-label="  Invite Jane Prospect to connect  "
+                onclick="document.body.dataset.clicked='target'">+</button>"""
         )
         self.assertTrue(
-            is_target_action(self.page.locator("#target"), self.page, identity)
+            try_heuristic_connect(self.page, HumanActions(self.page), identity)
         )
+        self.assertEqual(self.page.locator("body").get_attribute("data-clicked"), "target")
 
     def test_disabled_hidden_and_nonaction_connect_nodes_are_rejected(self):
         identity = self.load_profile("""<button id="disabled" disabled>Connect</button>
@@ -296,6 +298,19 @@ class TargetActionBrowserTests(OfflineBrowserTestCase):
             onclick="document.body.dataset.clicked='yes'">Connect</button>""")
         self.page.evaluate("""() => window.addEventListener('scroll', () => {
             document.querySelector('h1').textContent='Wrong Person';
+        }, {once: true})""")
+        with self.assertRaises(TaskSkippedException) as raised:
+            try_heuristic_connect(self.page, HumanActions(self.page), identity)
+        self.assertEqual(raised.exception.reason, "profile_identity_mismatch")
+        self.assertIsNone(self.page.locator("body").get_attribute("data-clicked"))
+
+    def test_replaced_control_is_revalidated_before_click(self):
+        identity = self.load_profile("""<button id="target" style="margin-top:2000px"
+            onclick="document.body.dataset.clicked='yes'">Connect</button>""")
+        self.page.evaluate("""() => window.addEventListener('scroll', () => {
+            document.querySelector('#target').outerHTML =
+                '<button aria-label="Invite Other Person to connect" ' +
+                'onclick="document.body.dataset.clicked=\\'foreign\\'">Connect</button>';
         }, {once: true})""")
         with self.assertRaises(TaskSkippedException) as raised:
             try_heuristic_connect(self.page, HumanActions(self.page), identity)
