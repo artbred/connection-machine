@@ -537,6 +537,7 @@ class InviteTask(BaseTask):
         self._target_identity: ProfileIdentity | None = None
         self._profile_menu_open = False
         self._send_attempted = False
+        self._verified_note_dialog = None
 
     def run(self, payload: dict):
         url = payload.get("url")
@@ -840,7 +841,11 @@ class InviteTask(BaseTask):
             return False
 
     def _get_send_invitation_button(self) -> Locator:
-        dialog = require_invite_dialog(self.page, self._require_target_identity())
+        dialog = require_invite_dialog(
+            self.page,
+            self._require_target_identity(),
+            verified_note_dialog=self._verified_note_dialog,
+        )
         buttons = dialog.get_by_role("button", name=SEND_INVITATION_NAME)
         visible = [button for button in buttons.all() if button.is_visible()]
         if len(visible) != 1:
@@ -848,7 +853,11 @@ class InviteTask(BaseTask):
         return visible[0]
 
     def _get_invite_note_editor(self) -> Locator:
-        dialog = require_invite_dialog(self.page, self._require_target_identity())
+        dialog = require_invite_dialog(
+            self.page,
+            self._require_target_identity(),
+            verified_note_dialog=self._verified_note_dialog,
+        )
         editors = dialog.locator(INVITE_NOTE_SELECTOR)
         visible = [editor for editor in editors.all() if editor.is_visible()]
         if len(visible) > 1:
@@ -978,13 +987,17 @@ class InviteTask(BaseTask):
             assert_profile_identity(self.page, identity)
             # A stale or wrong-recipient dialog must never be used as success
             # evidence even if a different control happens to say Pending.
-            find_invite_dialog(self.page, identity)
+            find_invite_dialog(
+                self.page, identity, verified_note_dialog=self._verified_note_dialog
+            )
             state = detect_connection_state(self.page, identity)
             if state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
                 return state
             self.human.random_sleep(0.8, 1.4)
 
-        if find_invite_dialog(self.page, identity) is not None:
+        if find_invite_dialog(
+            self.page, identity, verified_note_dialog=self._verified_note_dialog
+        ) is not None:
             return ConnectionState.UNKNOWN
         self.page.goto(identity.url, timeout=60000, wait_until="domcontentloaded")
         refreshed = wait_for_profile(self.page, identity.url, personalize=False)
@@ -1160,55 +1173,70 @@ class InviteTask(BaseTask):
         # Use only the preflight-generated note; never generate after Connect.
         # Revalidate again after opening the editor and immediately before Send.
         dialog = require_invite_dialog(self.page, identity)
-        if connection_message:
-            if not self._get_invite_note_editor().is_visible():
-                add_note = dialog.locator(ADD_NOTE_SELECTOR)
-                visible = [button for button in add_note.all() if button.is_visible()]
-                if len(visible) != 1:
-                    raise TaskSkippedException(
-                        "add_note_unreachable", cooldown_eligible=False
-                    )
-                visible[0].click(timeout=3000)
-            self._get_invite_note_editor().wait_for(state="visible", timeout=3000)
-            self._enter_connection_message(connection_message)
-        else:
-            editor = self._get_invite_note_editor()
-            if editor.is_visible():
-                editor.fill("", timeout=3000)
-
-        send_btn = self._get_send_invitation_button()
-        if not self._is_enabled_button(send_btn):
-            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
-        editor = self._get_invite_note_editor()
-        if connection_message is not None and not editor.is_visible():
-            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
-        if editor.is_visible():
-            entered = " ".join(self._get_invite_note_text(editor).split())
-            expected = " ".join((connection_message or "").split())
-            if entered != expected:
-                raise TaskSkippedException(
-                    "invite_not_confirmed", cooldown_eligible=False
-                )
-
-        feedback_before_send = self._collect_visible_feedback_texts()
-        require_invite_dialog(self.page, identity)
-        self._send_attempted = True
         try:
-            send_btn.click(delay=100, timeout=5000)
-        except Exception as exc:
-            # A timeout can happen after dispatch. Confirm, but never click a
-            # second time or regenerate a new note for the same attempt.
-            logger.warning(
-                "Send click outcome is uncertain; checking target state: %s", exc
+            if connection_message:
+                if not self._get_invite_note_editor().is_visible():
+                    add_note = dialog.locator(ADD_NOTE_SELECTOR)
+                    visible = [button for button in add_note.all() if button.is_visible()]
+                    if len(visible) != 1:
+                        raise TaskSkippedException(
+                            "add_note_unreachable", cooldown_eligible=False
+                        )
+                    # LinkedIn removes the recipient name when this same dialog
+                    # becomes the note editor; bind only this verified transition.
+                    self._verified_note_dialog = dialog.element_handle()
+                    if self._verified_note_dialog is None:
+                        raise TaskSkippedException(
+                            "invite_not_confirmed", cooldown_eligible=False
+                        )
+                    visible[0].click(timeout=3000)
+                self._get_invite_note_editor().wait_for(state="visible", timeout=3000)
+                self._enter_connection_message(connection_message)
+            else:
+                editor = self._get_invite_note_editor()
+                if editor.is_visible():
+                    editor.fill("", timeout=3000)
+
+            send_btn = self._get_send_invitation_button()
+            if not self._is_enabled_button(send_btn):
+                raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+            editor = self._get_invite_note_editor()
+            if connection_message is not None and not editor.is_visible():
+                raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+            if editor.is_visible():
+                entered = " ".join(self._get_invite_note_text(editor).split())
+                expected = " ".join((connection_message or "").split())
+                if entered != expected:
+                    raise TaskSkippedException(
+                        "invite_not_confirmed", cooldown_eligible=False
+                    )
+
+            feedback_before_send = self._collect_visible_feedback_texts()
+            require_invite_dialog(
+                self.page, identity, verified_note_dialog=self._verified_note_dialog
             )
-        self.human.random_sleep(2.0, 4.0)
-        error = self._check_invitation_error(ignored_feedback=feedback_before_send)
-        if error:
-            raise TaskSkippedException(error)
-        final_state = self._confirm_invitation_sent(url)
-        if final_state not in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
-            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
-        return self._record_confirmed_invite(url, final_state, connection_message)
+            self._send_attempted = True
+            try:
+                send_btn.click(delay=100, timeout=5000)
+            except Exception as exc:
+                # A timeout can happen after dispatch. Confirm, but never click a
+                # second time or regenerate a new note for the same attempt.
+                logger.warning(
+                    "Send click outcome is uncertain; checking target state: %s", exc
+                )
+            self.human.random_sleep(2.0, 4.0)
+            error = self._check_invitation_error(ignored_feedback=feedback_before_send)
+            if error:
+                raise TaskSkippedException(error)
+            final_state = self._confirm_invitation_sent(url)
+            if final_state not in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+                raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+            return self._record_confirmed_invite(url, final_state, connection_message)
+        finally:
+            verified_dialog = self._verified_note_dialog
+            self._verified_note_dialog = None
+            if verified_dialog is not None:
+                verified_dialog.dispose()
 
     def _click_connect_target(
         self, target: Locator, connection_message: Optional[str]

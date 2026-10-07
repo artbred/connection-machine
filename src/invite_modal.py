@@ -2,7 +2,7 @@
 
 import re
 
-from playwright.sync_api import Locator
+from playwright.sync_api import Locator, ElementHandle
 
 from exceptions import TaskSkippedException
 from linkedin_profile import (
@@ -78,11 +78,17 @@ def _recipient_names(headings: list[str], paragraphs: list[str]) -> list[str]:
     return names
 
 
-def find_invite_dialog(page, identity: ProfileIdentity) -> Locator | None:
+def find_invite_dialog(
+    page,
+    identity: ProfileIdentity,
+    *,
+    verified_note_dialog: ElementHandle | None = None,
+) -> Locator | None:
     """Reject ambiguous/foreign recipients, including a stale dialog over the target.
 
     A full recipient name in invitation-specific UI or an exact profile link is
-    required. A first name alone cannot distinguish people and is not sufficient.
+    required. The note editor may omit both only after Add a note on the same
+    previously verified DOM element. A first name alone is not identity proof.
     """
     assert_profile_identity(page, identity)
     dialogs = page.locator("[role='dialog']:visible, dialog[open]")
@@ -119,17 +125,34 @@ def find_invite_dialog(page, identity: ProfileIdentity) -> Locator | None:
                 "modal_recipient_mismatch", cooldown_eligible=False
             )
         if not urls and expected_name not in names:
-            raise TaskSkippedException(
-                "modal_recipient_mismatch", cooldown_eligible=False
+            same_note_dialog = (
+                not names
+                and evidence["customMessage"]
+                and verified_note_dialog is not None
+                and dialog.evaluate(
+                    "(dialog, verified) => dialog === verified && verified.isConnected",
+                    verified_note_dialog,
+                )
             )
+            if not same_note_dialog:
+                raise TaskSkippedException(
+                    "modal_recipient_mismatch", cooldown_eligible=False
+                )
         matches.append(dialog)
     if len(matches) > 1:
         raise TaskSkippedException("modal_recipient_mismatch", cooldown_eligible=False)
     return matches[0] if matches else None
 
 
-def require_invite_dialog(page, identity: ProfileIdentity) -> Locator:
-    dialog = find_invite_dialog(page, identity)
+def require_invite_dialog(
+    page,
+    identity: ProfileIdentity,
+    *,
+    verified_note_dialog: ElementHandle | None = None,
+) -> Locator:
+    dialog = find_invite_dialog(
+        page, identity, verified_note_dialog=verified_note_dialog
+    )
     if dialog is None:
         raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
     return dialog

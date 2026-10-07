@@ -51,6 +51,13 @@ DIALOG = """
 </div>
 """
 
+NOTE_EDITOR = """
+<h2>Add a note to your invitation</h2>
+<p>LinkedIn members are more likely to accept invitations that include a personal note.</p>
+<textarea id="custom-message"></textarea>
+<button onclick="sendInvite()">Send</button>
+"""
+
 
 def fixture(dialog=DIALOG, *, already_open=True, confirm=True):
     return (
@@ -78,6 +85,33 @@ window.sendInvite = () => {
 """.replace("DIALOG_HTML", json.dumps(dialog)).replace(
             "CONFIRM_SEND", "true" if confirm else "false"
         )
+    )
+
+
+def note_transition_fixture(
+    editor=NOTE_EDITOR, *, replace_dialog=False, already_open=True
+):
+    prompt = """
+<div role="dialog" id="invite-dialog">
+  <h2>Add a note to your invitation?</h2>
+  <p>Personalize your invitation to Jane Prospect by adding a note.</p>
+  <button onclick="addNote()">Add a note</button>
+  <button onclick="sendInvite()">Send without a note</button>
+</div>
+"""
+    return fixture(prompt, already_open=already_open) + """
+<script>
+window.addNote = () => {
+  const dialog = document.querySelector('#invite-dialog');
+  if (REPLACE_DIALOG) {
+    dialog.outerHTML = '<div role="dialog" id="invite-dialog">' + EDITOR_HTML + '</div>';
+  } else {
+    dialog.innerHTML = EDITOR_HTML;
+  }
+};
+</script>
+""".replace("REPLACE_DIALOG", "true" if replace_dialog else "false").replace(
+        "EDITOR_HTML", json.dumps(editor)
     )
 
 
@@ -139,6 +173,46 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
     def assert_nothing_sent(self):
         self.assertEqual(self.sent_records(), [])
         self.assertFalse(self.history_path.exists())
+
+    def test_personalized_invite_survives_recipientless_note_transition(self):
+        task = self.make_task(note_transition_fixture(already_open=False))
+        with patch.object(invite, "generate_connection_message", return_value=NOTE):
+            result = task.send_connection_request(TARGET)
+        self.assertEqual(result, {"status": "pending", "message": NOTE})
+        self.assertEqual([record["note"] for record in self.sent_records()], [NOTE])
+
+    def test_unverified_recipientless_editor_is_rejected(self):
+        dialog = '<div role="dialog" id="invite-dialog">' + NOTE_EDITOR + "</div>"
+        task = self.make_task(fixture(dialog))
+        with self.assertRaises(TaskSkippedException) as caught:
+            task._complete_connection(TARGET, NOTE)
+        self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
+        self.assertEqual(self.page.locator("textarea").input_value(), "")
+        self.assert_nothing_sent()
+
+    def test_replaced_note_dialog_cannot_inherit_recipient(self):
+        task = self.make_task(note_transition_fixture(replace_dialog=True))
+        with self.assertRaises(TaskSkippedException) as caught:
+            task._complete_connection(TARGET, NOTE)
+        self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
+        self.assertEqual(self.page.locator("textarea").input_value(), "")
+        self.assert_nothing_sent()
+
+    def test_verified_transition_cannot_override_foreign_recipient(self):
+        editors = (
+            NOTE_EDITOR.replace(
+                "Add a note to your invitation", "Invite Alex Stranger to connect"
+            ),
+            NOTE_EDITOR + '<a href="/in/stranger/">Jane Prospect</a>',
+        )
+        for editor in editors:
+            with self.subTest(editor=editor):
+                task = self.make_task(note_transition_fixture(editor))
+                with self.assertRaises(TaskSkippedException) as caught:
+                    task._complete_connection(TARGET, NOTE)
+                self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
+                self.assertEqual(self.page.locator("textarea").input_value(), "")
+                self.assert_nothing_sent()
 
     def test_complete_flow_personalizes_only_owned_sections(self):
         task = self.make_task(fixture(already_open=False))
@@ -468,7 +542,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
                 self.assert_nothing_sent()
 
     def test_recipient_change_after_note_entry_stops_send(self):
-        task = self.make_task(fixture())
+        task = self.make_task(note_transition_fixture())
         enter_note = task._enter_connection_message
 
         def change_recipient(note):
