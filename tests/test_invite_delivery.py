@@ -145,14 +145,19 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
 
         def generate(content, name):
             self.assertEqual(name, "Jane Prospect")
+            self.assertEqual(self.page.locator("#invite-dialog").count(), 0)
+            self.assertEqual(self.page.locator("#connect").inner_text(), "Connect")
             self.assertIn("inventory systems", content)
             self.assertNotIn("Moonshot", content)
             self.assertNotIn("Alex Stranger", content)
             return NOTE
 
-        with patch.object(invite, "generate_connection_message", side_effect=generate):
+        with patch.object(
+            invite, "generate_connection_message", side_effect=generate
+        ) as generator:
             result = task.send_connection_request(TARGET)
         self.assertEqual(result, {"status": "pending", "message": NOTE})
+        generator.assert_called_once()
         self.assertEqual(
             self.sent_records(),
             [{"name": "Invite Jane Prospect to connect", "note": NOTE}],
@@ -161,6 +166,109 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         self.assertEqual(
             [(e["url"], e["status"], e["message"]) for e in history],
             [(TARGET, "pending", NOTE)],
+        )
+
+    def test_missing_owned_content_stops_before_connect(self):
+        html = fixture(already_open=False).replace(ABOUT, "").replace(
+            "Data engineer at Orchard Analytics", ""
+        )
+        task = self.make_task(html)
+        with (
+            patch.object(
+                invite,
+                "wait_for_profile",
+                side_effect=lambda page, url, **kwargs: wait_for_profile(
+                    page, url, timeout_ms=200, **kwargs
+                ),
+            ),
+            patch.object(invite, "generate_connection_message") as generator,
+            patch.object(invite, "try_heuristic_connect") as connect,
+            patch.object(invite, "get_cached_connect_button") as cached,
+            patch.object(invite, "get_next_connect_action") as selector,
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task.run({"url": TARGET})
+        self.assertEqual(caught.exception.reason, "profile_not_ready")
+        self.assertTrue(caught.exception.retryable_preflight)
+        generator.assert_not_called()
+        connect.assert_not_called()
+        cached.assert_not_called()
+        selector.assert_not_called()
+        self.assertEqual(self.page.locator("#invite-dialog").count(), 0)
+        self.assert_nothing_sent()
+
+    def test_unusable_generated_note_stops_before_connect(self):
+        for note in (None, "", " \n\t", "x" * 201, {"message": NOTE}):
+            with self.subTest(note=note):
+                task = self.make_task(fixture(already_open=False))
+                with (
+                    patch.object(
+                        invite, "generate_connection_message", return_value=note
+                    ) as generator,
+                    patch.object(invite, "try_heuristic_connect") as connect,
+                    patch.object(invite, "get_cached_connect_button") as cached,
+                    patch.object(invite, "get_next_connect_action") as selector,
+                    self.assertRaises(TaskSkippedException) as caught,
+                ):
+                    task.run({"url": TARGET})
+                self.assertEqual(caught.exception.reason, "llm_invalid_response")
+                self.assertFalse(caught.exception.retryable_preflight)
+                generator.assert_called_once()
+                connect.assert_not_called()
+                cached.assert_not_called()
+                selector.assert_not_called()
+                self.assertEqual(self.page.locator("#invite-dialog").count(), 0)
+                self.assert_nothing_sent()
+
+    def test_direct_connect_submission_is_not_personalized_success(self):
+        html = fixture(already_open=False).replace(
+            'onclick="openInvite()"',
+            'onclick="document.body.dataset.sent = JSON.stringify([{name: '
+            "'Invite Jane Prospect to connect', note: ''}]); "
+            "this.textContent = 'Pending'; this.setAttribute('aria-label', 'Pending')\"",
+        )
+        task = self.make_task(html)
+        with (
+            patch.object(
+                invite, "generate_connection_message", return_value=NOTE
+            ) as generator,
+            patch.object(task, "_wait_for_invite_modal", return_value=False),
+            patch.object(invite, "send_notification") as notification,
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task.run({"url": TARGET})
+        self.assertEqual(caught.exception.reason, "invite_not_confirmed")
+        self.assertFalse(caught.exception.retryable_preflight)
+        generator.assert_called_once()
+        notification.assert_not_called()
+        self.assertEqual(
+            self.sent_records(),
+            [{"name": "Invite Jane Prospect to connect", "note": ""}],
+        )
+        self.assertFalse(self.history_path.exists())
+        self.assertFalse(task._send_attempted)
+        self.assertEqual(
+            task.invite_state.get_recent_events()[0]["reason"], "invite_not_confirmed"
+        )
+
+    def test_explicit_no_note_allows_direct_connect_submission(self):
+        html = fixture(already_open=False).replace(
+            'onclick="openInvite()"',
+            'onclick="document.body.dataset.sent = JSON.stringify([{name: '
+            "'Invite Jane Prospect to connect', note: ''}]); "
+            "this.textContent = 'Pending'; this.setAttribute('aria-label', 'Pending')\"",
+        )
+        task = self.make_task(html)
+        with (
+            patch.object(invite, "generate_connection_message") as generator,
+            patch.object(task, "_wait_for_invite_modal", return_value=False),
+        ):
+            result = task.send_connection_request(TARGET, try_personal_message=False)
+        generator.assert_not_called()
+        self.assertEqual(result, {"status": "pending", "message": None})
+        self.assertEqual(
+            self.sent_records(),
+            [{"name": "Invite Jane Prospect to connect", "note": ""}],
         )
 
     def test_video_error_dialog_does_not_block_a_verified_invitation(self):
@@ -217,19 +325,19 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         self.assertEqual(result, {"status": "pending", "message": None})
         self.assertEqual(self.sent_records()[0]["note"], "")
 
-    def test_wrong_recipient_stops_before_generation_or_typing(self):
+    def test_wrong_recipient_stops_before_typing(self):
         task = self.make_task(fixture(DIALOG.replace("Jane Prospect", "Alex Stranger")))
         with (
             patch.object(
                 invite,
                 "generate_connection_message",
                 side_effect=AssertionError(
-                    "A foreign modal must never reach generation"
+                    "No generation is permitted after Connect"
                 ),
             ),
             self.assertRaises(TaskSkippedException) as caught,
         ):
-            task._complete_connection(TARGET, ABOUT)
+            task._complete_connection(TARGET, NOTE)
         self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
         self.assertEqual(self.page.locator("textarea").input_value(), "")
         self.assert_nothing_sent()
@@ -238,14 +346,14 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         dialog = DIALOG.replace("<h2>", '<a href="/in/stranger/">Jane Prospect</a><h2>')
         task = self.make_task(fixture(dialog))
         with self.assertRaises(TaskSkippedException) as caught:
-            task._complete_connection(TARGET, "")
+            task._complete_connection(TARGET, None)
         self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
         self.assert_nothing_sent()
 
     def test_first_name_alone_does_not_identify_recipient(self):
         task = self.make_task(fixture(DIALOG.replace("Jane Prospect", "Jane")))
         with self.assertRaises(TaskSkippedException) as caught:
-            task._complete_connection(TARGET, "")
+            task._complete_connection(TARGET, None)
         self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
         self.assert_nothing_sent()
 
@@ -254,7 +362,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             "<h2>", '<a href="/in/jane-prospect/?tracking=1">Jane</a><h2>'
         )
         task = self.make_task(fixture(dialog))
-        result = task._complete_connection(TARGET, "")
+        result = task._complete_connection(TARGET, None)
         self.assertEqual(result["status"], "pending")
         self.assertEqual(
             self.sent_records(), [{"name": "Invite Jane to connect", "note": ""}]
@@ -271,8 +379,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
     def test_chat_before_invitation_does_not_steal_note_or_send(self):
         chat = '<div role="dialog"><h2>Messages</h2><textarea id="chat">Keep this draft</textarea><button onclick="document.body.dataset.chatSent = String(Number(document.body.dataset.chatSent) + 1)">Send</button></div>'
         task = self.make_task(fixture(chat + DIALOG))
-        with patch.object(invite, "generate_connection_message", return_value=NOTE):
-            task._complete_connection(TARGET, ABOUT)
+        task._complete_connection(TARGET, NOTE)
         self.assertEqual(self.page.locator("#chat").input_value(), "Keep this draft")
         self.assertEqual(self.page.locator("body").get_attribute("data-chat-sent"), "0")
         self.assertEqual(self.sent_records()[0]["note"], NOTE)
@@ -282,16 +389,17 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             fixture(DIALOG + DIALOG.replace('id="invite-dialog"', 'id="other"'))
         )
         with self.assertRaises(TaskSkippedException) as caught:
-            task._complete_connection(TARGET, "")
+            task._complete_connection(TARGET, None)
         self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
         self.assert_nothing_sent()
 
-    def test_recipient_change_during_generation_aborts(self):
-        task = self.make_task(fixture())
+    def test_foreign_dialog_appearing_during_generation_aborts_before_connect(self):
+        task = self.make_task(fixture(already_open=False))
 
         def change_recipient(*_):
-            self.page.locator("#invite-dialog h2").evaluate(
-                "el => el.textContent = 'Invite Alex Stranger to connect'"
+            self.page.locator("body").evaluate(
+                "(el, html) => el.insertAdjacentHTML('beforeend', html)",
+                DIALOG.replace("Jane Prospect", "Alex Stranger"),
             )
             return NOTE
 
@@ -299,14 +407,16 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             patch.object(
                 invite, "generate_connection_message", side_effect=change_recipient
             ),
+            patch.object(invite, "try_heuristic_connect") as connect,
             self.assertRaises(TaskSkippedException) as caught,
         ):
-            task._complete_connection(TARGET, ABOUT)
+            task.send_connection_request(TARGET)
+        connect.assert_not_called()
         self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
         self.assert_nothing_sent()
 
     def test_profile_change_during_generation_aborts(self):
-        task = self.make_task(fixture())
+        task = self.make_task(fixture(already_open=False))
 
         def change_profile(*_):
             self.page.locator("h1").evaluate(
@@ -318,9 +428,11 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             patch.object(
                 invite, "generate_connection_message", side_effect=change_profile
             ),
+            patch.object(invite, "try_heuristic_connect") as connect,
             self.assertRaises(TaskSkippedException) as caught,
         ):
-            task._complete_connection(TARGET, ABOUT)
+            task.send_connection_request(TARGET)
+        connect.assert_not_called()
         self.assertEqual(caught.exception.reason, "profile_identity_mismatch")
         self.assert_nothing_sent()
 
@@ -331,9 +443,49 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
                     fixture(DIALOG.replace('id="send"', f'id="send" {attribute}'))
                 )
                 with self.assertRaises(TaskSkippedException) as caught:
-                    task._complete_connection(TARGET, "")
+                    task._complete_connection(TARGET, None)
                 self.assertEqual(caught.exception.reason, "invite_not_confirmed")
                 self.assert_nothing_sent()
+
+    def test_note_disappearing_or_changing_before_send_fails_closed(self):
+        for mutation in ("el => el.remove()", "el => el.value = 'Different note'"):
+            with self.subTest(mutation=mutation):
+                task = self.make_task(fixture())
+                enter_note = task._enter_connection_message
+
+                def mutate_note(note):
+                    enter_note(note)
+                    self.page.locator("#custom-message").evaluate(mutation)
+
+                with (
+                    patch.object(
+                        task, "_enter_connection_message", side_effect=mutate_note
+                    ),
+                    self.assertRaises(TaskSkippedException) as caught,
+                ):
+                    task._complete_connection(TARGET, NOTE)
+                self.assertEqual(caught.exception.reason, "invite_not_confirmed")
+                self.assert_nothing_sent()
+
+    def test_recipient_change_after_note_entry_stops_send(self):
+        task = self.make_task(fixture())
+        enter_note = task._enter_connection_message
+
+        def change_recipient(note):
+            enter_note(note)
+            self.page.locator("#invite-dialog h2").evaluate(
+                "el => el.textContent = 'Invite Alex Stranger to connect'"
+            )
+
+        with (
+            patch.object(
+                task, "_enter_connection_message", side_effect=change_recipient
+            ),
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task._complete_connection(TARGET, NOTE)
+        self.assertEqual(caught.exception.reason, "modal_recipient_mismatch")
+        self.assert_nothing_sent()
 
     def test_note_readiness_rejects_extra_text(self):
         task = self.make_task(fixture())
@@ -388,7 +540,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         self.assertEqual(scope.locator("#foreign").count(), 0)
 
     def test_send_timeout_after_dispatch_confirms_without_resending(self):
-        task = self.make_task(fixture())
+        task = self.make_task(fixture(already_open=False))
         original = BrowserLocator.click
 
         # Read the id before dispatch, because the real handler removes dialog.
@@ -398,12 +550,16 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             if is_send:
                 raise BrowserTimeoutError("Timeout after dispatch")
 
-        with patch.object(BrowserLocator, "click", uncertain_click):
-            result = task._complete_connection(TARGET, "")
+        with (
+            patch.object(BrowserLocator, "click", uncertain_click),
+            patch.object(invite, "generate_connection_message", return_value=NOTE) as generator,
+        ):
+            result = task.send_connection_request(TARGET)
+        generator.assert_called_once()
         self.assertEqual(result["status"], "pending")
         self.assertEqual(
             self.sent_records(),
-            [{"name": "Invite Jane Prospect to connect", "note": ""}],
+            [{"name": "Invite Jane Prospect to connect", "note": NOTE}],
         )
 
     def test_unconfirmed_send_is_not_retried_or_accepted_from_generic_toast(self):
@@ -412,10 +568,10 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             + '<div class="artdeco-toast-item">Invitation sent</div>'
         )
         with self.assertRaises(TaskSkippedException) as caught:
-            task._complete_connection(TARGET, "")
+            task._complete_connection(TARGET, None)
         self.assertEqual(caught.exception.reason, "invite_not_confirmed")
         with self.assertRaises(TaskSkippedException):
-            task._complete_connection(TARGET, "")
+            task._complete_connection(TARGET, None)
         self.assertEqual(
             self.sent_records(),
             [{"name": "Invite Jane Prospect to connect", "note": ""}],

@@ -101,8 +101,8 @@ INVITE_REASON_DESCRIPTIONS = {
     "navigation_error": "Profile navigation failed",
     "send_button_timeout": "Send invitation button timed out",
     "add_note_unreachable": "Could not reach the invite modal",
-    "llm_invalid_response": "LLM selector guidance was invalid",
-    "profile_not_ready": "The target profile did not become identifiable",
+    "llm_invalid_response": "LLM output was missing or invalid",
+    "profile_not_ready": "The target profile or required owned content was not ready",
     "profile_identity_mismatch": "The loaded profile does not match the intended recipient",
     "modal_recipient_mismatch": "The invitation dialog recipient could not be verified",
     "audience_unavailable": "Required audience counts could not be read",
@@ -905,7 +905,7 @@ class InviteTask(BaseTask):
         return self._is_enabled_button(self._get_send_invitation_button())
 
     def _enter_connection_message(self, connection_message: str) -> None:
-        message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
+        message = connection_message
         custom_message = self._get_invite_note_editor()
         expected_text = " ".join(message.split())
 
@@ -1116,15 +1116,21 @@ class InviteTask(BaseTask):
             encoding="utf-8",
         )
 
-    def _after_connect_click(self, url: str, profile_content: str) -> dict:
+    def _after_connect_click(self, url: str, connection_message: Optional[str]) -> dict:
         try:
             error = self._check_invitation_error()
             if error:
                 raise TaskSkippedException(error)
             if self._wait_for_invite_modal():
-                return self._complete_connection(url, profile_content)
+                return self._complete_connection(url, connection_message)
             final_state = self._confirm_invitation_sent(url)
             if final_state in {ConnectionState.PENDING, ConnectionState.CONNECTED}:
+                if connection_message is not None:
+                    # Connect can submit immediately. Pending proves an invite,
+                    # not delivery of the note we never entered or submitted.
+                    raise TaskSkippedException(
+                        "invite_not_confirmed", cooldown_eligible=False
+                    )
                 return self._record_confirmed_invite(url, final_state, None)
             raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
         except TaskSkippedException as exc:
@@ -1140,21 +1146,19 @@ class InviteTask(BaseTask):
                 "invite_not_confirmed", cooldown_eligible=False
             ) from exc
 
-    def _complete_connection(self, url: str, profile_content: str) -> dict:
+    def _complete_connection(self, url: str, connection_message: Optional[str]) -> dict:
         identity = self._require_target_identity()
         require_invite_dialog(self.page, identity)
         if self._send_attempted:
             raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
-        connection_message = None
-        if profile_content:
-            connection_message = generate_connection_message(
-                profile_content, identity.name
-            )
-            if connection_message:
-                connection_message = connection_message[:MAX_INVITE_MESSAGE_LENGTH]
+        if connection_message is not None and (
+            not connection_message.strip()
+            or len(connection_message) > MAX_INVITE_MESSAGE_LENGTH
+        ):
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
 
-        # Revalidate after the external generation call and after opening the
-        # note editor. There is deliberately no post-click content re-scrape.
+        # Use only the preflight-generated note; never generate after Connect.
+        # Revalidate again after opening the editor and immediately before Send.
         dialog = require_invite_dialog(self.page, identity)
         if connection_message:
             if not self._get_invite_note_editor().is_visible():
@@ -1176,6 +1180,8 @@ class InviteTask(BaseTask):
         if not self._is_enabled_button(send_btn):
             raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
         editor = self._get_invite_note_editor()
+        if connection_message is not None and not editor.is_visible():
+            raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
         if editor.is_visible():
             entered = " ".join(self._get_invite_note_text(editor).split())
             expected = " ".join((connection_message or "").split())
@@ -1204,7 +1210,9 @@ class InviteTask(BaseTask):
             raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
         return self._record_confirmed_invite(url, final_state, connection_message)
 
-    def _click_connect_target(self, target: Locator, profile_content: str) -> dict:
+    def _click_connect_target(
+        self, target: Locator, connection_message: Optional[str]
+    ) -> dict:
         identity = self._require_target_identity()
         target.scroll_into_view_if_needed()
         if not is_target_action(
@@ -1219,7 +1227,7 @@ class InviteTask(BaseTask):
             raise TaskSkippedException(
                 "invite_not_confirmed", cooldown_eligible=False
             ) from exc
-        return self._after_connect_click(identity.url, profile_content)
+        return self._after_connect_click(identity.url, connection_message)
 
     def send_connection_request(
         self, url: str, try_personal_message: bool = True
@@ -1242,24 +1250,38 @@ class InviteTask(BaseTask):
             raise TaskSkippedException("already_connected", cooldown_eligible=False)
 
         self._last_audience_stats = self._enforce_audience_filter(url)
-        profile_content = ""
+        connection_message = None
         if try_personal_message:
             snapshot = self._read_preflight_profile(url, personalize=True)
             if snapshot.identity != identity:
                 raise TaskSkippedException(
                     "profile_identity_mismatch", cooldown_eligible=False
                 )
-            profile_content = snapshot.content
-            if not profile_content:
-                logger.info("Owned profile sections are not ready; omitting the note")
-            else:
-                logger.info(
-                    "Owned profile ready for %s (headline=%d, about=%d, experience=%d characters)",
-                    identity.url,
-                    len(snapshot.headline),
-                    len(snapshot.about),
-                    len(snapshot.experience),
+            if not snapshot.content.strip():
+                raise TaskSkippedException(
+                    "profile_not_ready",
+                    cooldown_eligible=False,
+                    retryable_preflight=True,
                 )
+            logger.info(
+                "Owned profile ready for %s (headline=%d, about=%d, experience=%d characters)",
+                identity.url,
+                len(snapshot.headline),
+                len(snapshot.about),
+                len(snapshot.experience),
+            )
+            connection_message = generate_connection_message(
+                snapshot.content, identity.name
+            )
+            if (
+                not isinstance(connection_message, str)
+                or not connection_message.strip()
+                or len(connection_message) > MAX_INVITE_MESSAGE_LENGTH
+            ):
+                raise TaskSkippedException(
+                    "llm_invalid_response", cooldown_eligible=False
+                )
+            assert_profile_identity(self.page, identity)
         # An invitation dialog left by an earlier task must not be mistaken for the result
         # of a new Connect click, even when its recipient happens to match.
         if find_invite_dialog(self.page, identity) is not None:
@@ -1268,10 +1290,10 @@ class InviteTask(BaseTask):
             )
 
         if try_heuristic_connect(self.page, self.human, identity):
-            return self._after_connect_click(url, profile_content)
+            return self._after_connect_click(url, connection_message)
         cached = get_cached_connect_button(self.page, identity)
         if cached is not None:
-            return self._click_connect_target(cached, profile_content)
+            return self._click_connect_target(cached, connection_message)
 
         previous_feedback = None
         for iteration in range(MAX_CONNECT_ITERATIONS):
@@ -1327,7 +1349,7 @@ class InviteTask(BaseTask):
             is_more = bool(re.search(r"\bmore\b", label))
             if not is_more:
                 save_selector_to_cache(self.page, identity, selector)
-                return self._click_connect_target(target, profile_content)
+                return self._click_connect_target(target, connection_message)
             target.scroll_into_view_if_needed()
             if not is_target_action(target, self.page, identity, allow_more=True):
                 raise TaskSkippedException(

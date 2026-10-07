@@ -35,21 +35,57 @@ TOPCARD = f"""<section class="pv-top-card">
 <button id="connect">Connect</button></section>"""
 SECTIONS = f"""<section id="about"><h2>About</h2><p>{ABOUT}</p></section>
 <section id="experience"><h2>Experience</h2><p>{EXPERIENCE}</p></section>"""
+SDUI_EXPERIENCE = """<div componentkey="com.linkedin.sdui.profile.card.refTARGETExperienceTopLevelSection">
+  <div data-display-contents="true"><section>
+    <div>
+      <div data-display-contents="true">
+        <div componentkey="Profile_Top_Level_ExperienceTopLevelSectionjane-prospect"></div>
+      </div>
+      <div data-display-contents="true"><div>
+      <div><h2 componentkey="ProfileNullStateCardAnchor_Experience">Experience</h2></div>
+      <div data-component-type="LazyColumn">
+        <div componentkey="entity-collection-item-first"><div>
+          <a href="https://www.linkedin.com/company/orchard/"><div>
+            <div><p>Staff Engineer</p><p>Orchard Analytics · Full-time</p></div>
+            <p>Jun 2011 - Present · 15 yrs 5 mos</p>
+            <p>Bengaluru, Karnataka, India</p>
+          </div></a>
+          <div><p><span>Leading reliable inventory ingestion and analytics platforms.</span></p></div>
+        </div></div>
+        <div componentkey="entity-collection-item-second"><div>
+          <a href="https://www.linkedin.com/company/previous/"><div>
+            <div><p>Senior Engineer</p><p>Previous Systems · Full-time</p></div>
+            <p>Jan 2007 - May 2011 · 4 yrs 5 mos</p>
+          </div></a>
+        </div></div>
+      </div>
+      </div></div>
+    </div>
+  </section></div>
+</div>"""
 
 
 def profile_html(sections=SECTIONS, topcard=TOPCARD, extra=""):
     return f"<!doctype html><html><body><main>{topcard}{sections}{extra}</main></body></html>"
 
 
-def sdui_profile_html():
+def sdui_profile_html(experience=""):
     # Production SDUI uses a layout section around a LazyColumn, then keyed
     # cards inside wrapper groups; the nearest section is not the whole column.
     prefix = "com.linkedin.sdui.profile.card.refTARGET"
-    return f"""<main><section><div data-component-type="LazyColumn">
-      <div componentkey="{prefix}Topcard"><div><section id="target-card">
-        <div><div><a href="{URL}"><div><div><h2>Jane Prospect</h2></div></div></a></div>
-          <p>· 2nd</p></div>
+    return f"""<meta charset="utf-8"><style>[data-display-contents="true"] {{ display: contents; }}</style>
+    <main><section><div data-component-type="LazyColumn">
+      <div componentkey="{prefix}Topcard"><div data-display-contents="true"><section id="target-card">
+        <div><div><div data-display-contents="true">
+          <a componentkey="ProfileVerificationTriggerRef-jane-prospect" href="{URL}">
+            <div><div><h2>Jane Prospect</h2><svg aria-label="View verifications"></svg></div></div>
+          </a>
+        </div></div>
+          <div data-display-contents="true" style="display:none"><p>· 1st</p></div>
+          <p>· 2nd</p>
+        </div>
         <p>Building data platforms at Orchard Analytics</p>
+        <p>Orchard Analytics · Example University</p>
         <div><a href="{URL}overlay/contact-info/">Contact info</a></div>
         <p>5,000 followers</p><div><p>500+</p><p>connections</p></div>
         <button id="target-connect">Connect</button>
@@ -60,6 +96,7 @@ def sdui_profile_html():
         <div componentkey="{prefix}About"><div><section><h2>About</h2>
           <p>{ABOUT}</p></section></div></div>
       </div>
+      {experience}
       <div componentkey="{prefix}Activity"><section><h2>Activity</h2>
         <p>Unrelated shared post content must not personalize an invitation.</p>
         <a href="/in/foreign/">Foreign Person</a><button id="foreign-connect">Connect</button>
@@ -226,6 +263,7 @@ class SduiProfileBrowserTests(OfflineBrowserTestCase):
             snapshot.identity, ProfileIdentity(URL, "jane-prospect", "Jane Prospect")
         )
         self.assertEqual(snapshot.about, ABOUT)
+        self.assertEqual(snapshot.headline, "Building data platforms at Orchard Analytics")
         self.assertNotIn("shared post", snapshot.content)
         self.assertNotIn("Mutual Person", snapshot.content)
         self.assertEqual(
@@ -244,6 +282,148 @@ class SduiProfileBrowserTests(OfflineBrowserTestCase):
         )
         self.assertIn("5,000 followers", snapshot.audience_text)
         self.assertIn("500+", snapshot.audience_text)
+
+    def test_observed_experience_top_level_section_supplies_personalization(self):
+        short_about = (
+            "I build reliable platforms with experienced data engineering teams "
+            "across industries."
+        )
+        self.load_html(sdui_profile_html(SDUI_EXPERIENCE).replace(ABOUT, short_about))
+        snapshot = wait_for_profile(self.page, URL, timeout_ms=1200)
+        self.assertEqual(snapshot.about, short_about)
+        self.assertEqual(snapshot.headline, "Building data platforms at Orchard Analytics")
+        self.assertIn("Staff Engineer", snapshot.experience)
+        self.assertIn("Orchard Analytics · Full-time", snapshot.experience)
+        self.assertIn("Previous Systems · Full-time", snapshot.experience)
+        self.assertIn("Experience:", snapshot.content)
+        self.assertNotIn("Example University", snapshot.content)
+        self.assertNotIn("shared post", snapshot.content)
+        self.assertNotIn("Mutual Person", snapshot.content)
+
+    def test_both_exact_owned_experience_suffixes_remain_supported(self):
+        for suffix in ("Experience", "ExperienceTopLevelSection"):
+            with self.subTest(suffix=suffix):
+                self.load_html(
+                    sdui_profile_html(
+                        SDUI_EXPERIENCE.replace("refTARGETExperienceTopLevelSection", "refTARGET" + suffix)
+                    )
+                )
+                snapshot = read_profile_snapshot(self.page, URL)
+                self.assertIn("Staff Engineer", snapshot.experience)
+                self.assertTrue(snapshot.content)
+
+    def test_foreign_owner_and_near_match_experience_keys_are_not_owned(self):
+        for key in (
+            "refOTHERExperienceTopLevelSection",
+            "refTARGET-extraExperienceTopLevelSection",
+            "refTARGETExperienceTopLevelSection-extra",
+        ):
+            with self.subTest(key=key):
+                self.load_html(
+                    sdui_profile_html(
+                        SDUI_EXPERIENCE.replace("refTARGETExperienceTopLevelSection", key)
+                    )
+                )
+                snapshot = read_profile_snapshot(self.page, URL)
+                self.assertEqual(snapshot.experience, "")
+                self.assertEqual(snapshot.content, "")
+
+    def test_experience_in_different_lazy_column_is_not_owned(self):
+        experience = f'<div data-component-type="LazyColumn">{SDUI_EXPERIENCE}</div>'
+        self.load_html(sdui_profile_html(experience))
+        snapshot = read_profile_snapshot(self.page, URL)
+        self.assertEqual(snapshot.experience, "")
+        self.assertEqual(snapshot.content, "")
+
+    def test_boxless_experience_wrappers_preserve_visibility_and_exclusions(self):
+        extra = """
+          <div data-display-contents="true">
+            <span data-display-contents="true">Visible boxless role description</span>
+            <p style="display:none">Hidden role details</p>
+            <div style="display:none"><span data-display-contents="true">Hidden direct text</span></div>
+            <span data-display-contents="true" style="visibility:hidden">Invisible direct text</span>
+            <div style="visibility:hidden"><span data-display-contents="true">Invisible ancestor text</span></div>
+            <button>Button marketing prose</button>
+            <div role="button">Action marketing prose</div>
+            <aside><p>Sidebar marketing prose</p></aside>
+            <section><h3>Recommended person</h3>
+              <a href="/in/foreign/">Foreign Person</a><p>Foreign marketing prose</p>
+            </section>
+          </div>
+        """
+        self.load_html(
+            sdui_profile_html(SDUI_EXPERIENCE.replace("</section>", extra + "</section>"))
+        )
+        snapshot = read_profile_snapshot(self.page, URL)
+        self.assertIn("Staff Engineer", snapshot.experience)
+        self.assertIn("Visible boxless role description", snapshot.experience)
+        self.assertNotIn("Hidden", snapshot.experience)
+        self.assertNotIn("Invisible", snapshot.experience)
+        self.assertNotIn("marketing", snapshot.experience)
+        self.assertNotIn("Foreign", snapshot.experience)
+
+    def test_boxless_loading_wrapper_requires_rendered_owned_content(self):
+        for hidden_style in ("", "display:none", "visibility:hidden"):
+            with self.subTest(hidden_style=hidden_style):
+                loading = (
+                    f'<div style="{hidden_style}"><div data-display-contents="true" aria-busy="true">'
+                    "<p>Loading role details</p></div></div>"
+                )
+                self.load_html(
+                    sdui_profile_html(SDUI_EXPERIENCE.replace("</section>", loading + "</section>"))
+                )
+                snapshot = read_profile_snapshot(self.page, URL)
+                if hidden_style:
+                    self.assertIn("Staff Engineer", snapshot.content)
+                    self.assertNotIn("Loading role details", snapshot.experience)
+                else:
+                    self.assertEqual(snapshot.experience, "")
+                    self.assertEqual(snapshot.content, "")
+
+    def test_experience_does_not_borrow_recommendation_prose(self):
+        experience = SDUI_EXPERIENCE.replace(
+            "</section>",
+            '<section><h3>People you may know</h3><a href="/in/foreign/">'
+            "Foreign Person</a><p>Foreign aerospace executive biography</p></section></section>",
+        )
+        self.load_html(sdui_profile_html(experience))
+        snapshot = read_profile_snapshot(self.page, URL)
+        self.assertIn("Staff Engineer", snapshot.content)
+        self.assertNotIn("Foreign", snapshot.content)
+        self.assertNotIn("aerospace", snapshot.experience)
+
+    def test_duplicate_foreign_experience_card_cannot_contaminate_owned_text(self):
+        foreign = SDUI_EXPERIENCE.replace("refTARGET", "refOTHER").replace(
+            "Staff Engineer", "Foreign Executive"
+        )
+        self.load_html(sdui_profile_html(SDUI_EXPERIENCE + foreign))
+        snapshot = read_profile_snapshot(self.page, URL)
+        self.assertEqual(snapshot.experience, "")
+        self.assertEqual(snapshot.content, "")
+
+    def test_headline_does_not_scan_adjacent_or_recommendation_text(self):
+        for replacement in (
+            "<div><p>Adjacent aerospace biography</p></div>",
+            '<section><h3>Recommended person</h3><p>Adjacent aerospace biography</p></section>',
+            '<p><a href="/in/foreign/">Adjacent aerospace biography</a></p>',
+        ):
+            with self.subTest(replacement=replacement):
+                html = sdui_profile_html().replace(
+                    "<p>Building data platforms at Orchard Analytics</p>",
+                    replacement,
+                )
+                self.load_html(html)
+                snapshot = read_profile_snapshot(self.page, URL)
+                self.assertEqual(snapshot.headline, "")
+                self.assertNotIn("aerospace", snapshot.content)
+
+    def test_headline_requires_a_bounded_name_and_degree_row(self):
+        html = sdui_profile_html().replace(
+            "<p>· 2nd</p>", "<p>Someone else's unbounded biography</p>"
+        )
+        self.load_html(html)
+        snapshot = read_profile_snapshot(self.page, URL)
+        self.assertEqual(snapshot.headline, "")
 
     def test_card_marker_alone_does_not_prove_recipient(self):
         self.load_html(sdui_profile_html().replace(f'href="{URL}', 'href="/unknown/'))
@@ -353,7 +533,7 @@ class ProfileReadinessBrowserTests(OfflineBrowserTestCase):
         self.assertEqual(snapshot.content, "")
         self.assertEqual(snapshot.identity.name, "Jane Prospect")
 
-    def test_missing_empty_or_thin_sections_fall_back_to_no_note(self):
+    def test_missing_empty_or_thin_sections_leave_content_unavailable(self):
         for sections in (
             "",
             "<section><h2>About</h2></section><section><h2>Experience</h2></section>",

@@ -89,7 +89,21 @@ _PROFILE_DOM_JS = r"""
   };
   const loading = '[aria-busy="true"],.artdeco-loader,[class*="skeleton"],[data-loading="true"]';
   const busy = (el, excluded) => el.matches(loading) ||
-    [...el.querySelectorAll(loading)].some(node => visible(node) && !insideExcluded(node, el, excluded));
+    [...el.querySelectorAll(loading)].some(node => {
+      if (insideExcluded(node, el, excluded)) return false;
+      if (visible(node)) return true;
+      // Boxless loading wrappers still gate their rendered section contents.
+      const style = getComputedStyle(node);
+      if (style.display !== 'contents' || style.visibility === 'hidden') return false;
+      const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+      for (let child = walker.nextNode(); child; child = walker.nextNode()) {
+        if (!clean(child.nodeValue) || getComputedStyle(child.parentElement).visibility === 'hidden') continue;
+        const range = document.createRange();
+        range.selectNodeContents(child);
+        if (range.getClientRects().length) return true;
+      }
+      return false;
+    });
   const profile = (value, marker = false) => {
     try {
       const u = new URL(value, location.href);
@@ -242,8 +256,26 @@ _PROFILE_DOM_JS = r"""
     if (!container || insideExcluded(container, container, omitted)) return '';
     const chunks = [];
     const visit = node => {
-      if (node.nodeType === Node.TEXT_NODE) { const s = clean(node.nodeValue); if (s) chunks.push(s); return; }
-      if (node.nodeType !== Node.ELEMENT_NODE || omitted.has(node) || node === omitHeading || !visible(node)) return;
+      if (node.nodeType === Node.TEXT_NODE) {
+        const s = clean(node.nodeValue);
+        if (!s) return;
+        // A display:contents parent has no box; direct text still must render.
+        if (!visible(node.parentElement)) {
+          const range = document.createRange();
+          range.selectNodeContents(node);
+          if (!range.getClientRects().length ||
+              getComputedStyle(node.parentElement).visibility === 'hidden') return;
+        }
+        chunks.push(s);
+        return;
+      }
+      if (node.nodeType !== Node.ELEMENT_NODE || omitted.has(node) || node === omitHeading) return;
+      if (!visible(node)) {
+        const style = getComputedStyle(node);
+        // SDUI wraps the complete Experience body in boxless layout nodes.
+        // Traverse these only; descendants retain their own visibility checks.
+        if (style.display !== 'contents' || style.visibility === 'hidden') return;
+      }
       for (const child of node.childNodes) visit(child);
       if (node.matches('div,p,li,section,article,br')) chunks.push('\n');
     };
@@ -254,6 +286,33 @@ _PROFILE_DOM_JS = r"""
   const headlineNodes = [...root.querySelectorAll('.text-body-medium,.pv-text-details__left-panel .text-body-medium,[data-view-name="profile-headline"],[data-field="headline"]')]
     .filter(el => visible(el) && !insideExcluded(el, root, excluded));
   if (headlineNodes.length === 1) headline = text(headlineNodes[0], excluded);
+  // SDUI's name link is nested in display-contents wrappers. Its name row
+  // contains only that branch and connection-degree labels; the headline is
+  // the immediately following paragraph, never arbitrary topcard text.
+  if (!headline && !headlineNodes.length && cardPrefix) {
+    const nameLink = heading.closest('a[href]');
+    if (nameLink && root.contains(nameLink) && profile(nameLink.href) === expected) {
+      let block = nameLink;
+      while (block.parentElement !== root && block.parentElement?.matches('div')) {
+        const row = block.parentElement;
+        const siblings = [...row.children].filter(el => el !== block && labelText(el));
+        if (siblings.length) {
+          const next = row.nextElementSibling;
+          if (labelText(block) === name && row.querySelectorAll(headings).length === 1 &&
+              siblings.every(el => !el.querySelector('a,button,' + headings) &&
+                /^·\s*(?:1st|2nd|3rd\+?)$/i.test(labelText(el))) &&
+              next?.matches('p') && !next.querySelector('a,button,' + headings) &&
+              !insideExcluded(next, root, excluded) && visible(next) &&
+              !/\b(followers|connections?)\b/i.test(next.innerText)) {
+            headline = text(next, excluded);
+            headlineNodes.push(next);
+          }
+          break;
+        }
+        block = row;
+      }
+    }
+  }
   // Legacy unclassed fixtures: only the immediate leaf after the name block.
   if (!headline && !headlineNodes.length) {
     let block = heading;
@@ -280,8 +339,9 @@ _PROFILE_DOM_JS = r"""
     }
     if (!section || section === primary || section.contains(root)) continue;
     const sectionCard = h.closest(sduiCards);
+    const cardNames = key === 'experience' ? ['Experience', 'ExperienceTopLevelSection'] : ['About'];
     if (cardPrefix && (!sectionCard?.contains(section) ||
-        sectionCard.getAttribute('componentkey') !== cardPrefix + key[0].toUpperCase() + key.slice(1) ||
+        !cardNames.some(suffix => sectionCard.getAttribute('componentkey') === cardPrefix + suffix) ||
         sectionCard.closest(lazyColumn) !== primary)) continue;
     // Keyed sibling cards share SDUI wrapper groups, not each other's prose.
     // Unkeyed foreign modules still invalidate an enclosing branch.
@@ -295,7 +355,7 @@ _PROFILE_DOM_JS = r"""
           [...ancestor.querySelectorAll(headings)].some(other => !section.contains(other) && !inSiblingCard(other)) ||
           [...ancestor.querySelectorAll('a[href]')].some(a => {
             const target = profile(a.href, true);
-            return target && target !== expected && !inSiblingCard(a);
+            return !section.contains(a) && target && target !== expected && !inSiblingCard(a);
           })) nestedModule = true;
     }
     if (nestedModule) continue;
@@ -391,7 +451,7 @@ def wait_for_profile(
     """Wait for verified identity and stable, explicitly loaded owned sections.
 
     Absent sections are optional; discovered empty/busy sections must hydrate.
-    Headline-only and thin profiles exhaust the wait and get a no-note fallback.
+    Headline-only and thin profiles exhaust the wait with content unavailable.
     A section not represented in the DOM cannot be predicted before it arrives.
     """
     url = canonical_profile_url(expected_url)

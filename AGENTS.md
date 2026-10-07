@@ -38,7 +38,7 @@ TaskDispatcher
 - `src/dispatcher.py`: polling loop, task selection, spacing windows, zombie cleanup, autonomous comment scheduling
 - `src/db.py`: SQLAlchemy engine, `linkedin_tasks` table, enums, DB initialization
 - `src/invite_schedule.py`: deterministic rolling-quota slots and minimum invitation spacing
-- `src/tasks/invite.py`: profile visit, connect-button discovery, optional AI-generated note, invitation confirmation
+- `src/tasks/invite.py`: profile visit, connect-button discovery, required-by-default AI-generated note, invitation confirmation
 - `src/linkedin_profile.py`: canonical target identity, shared topcard ownership, allowlisted profile sections, bounded readiness checks
 - `src/invite_modal.py`: recipient-verified invitation dialogs and scoped note/send controls
 - `src/connect_heuristics.py`, `src/connection_state.py`: identity-bound Connect/More actions, cache hints, and target connection-state detection
@@ -85,16 +85,17 @@ Task statuses:
 
 - Every invite requires the queued URL, loaded profile, Connect target, and invitation dialog recipient to agree. Profile URLs are canonicalized; a canonical page link alone is not enough to prove the visible topcard belongs to the target.
 - Personalization uses only the verified prospect's headline, About, and Experience sections. Activity, reposts, recommendations, and unbounded/ambiguous modules are excluded rather than sent to the LLM.
-- Both classic profile cards and SDUI's keyed cards inside a `LazyColumn` are supported. SDUI layout sections are not treated as foreign modules: exact self/contact links still establish identity, and About/Experience card keys must match the verified topcard owner. Unkeyed foreign modules and cards belonging to another owner remain excluded.
-- Readiness waits up to eight seconds for substantive owned content and 600 ms of stable identity/fields. At least one substantive About/Experience section is required; absent sections are optional, but discovered empty/loading sections prevent early personalization. Headline-only or insufficient content produces an invitation without a note, never a whole-page fallback.
+- Both classic profile cards and SDUI's keyed cards inside a `LazyColumn` are supported. SDUI About/Experience card keys must match the verified topcard owner, including `ExperienceTopLevelSection`. Owned text traversal supports boxless `display: contents` wrappers without treating hidden content, unrelated controls, or foreign modules as profile prose.
+- Readiness waits up to eight seconds for substantive owned content and 600 ms of stable identity/fields. At least one substantive About/Experience section is required; absent sections are optional, but discovered empty/loading sections prevent early personalization. When personalization is requested (the default), headline-only or insufficient content defers/skips the task before Connect with `profile_not_ready`; it never falls back to a note-less invitation or whole-page text.
+- A nonempty note of at most 200 characters must be generated before Connect. Missing/invalid generation aborts with `llm_invalid_response`; there is no silent no-note fallback. The same preflight-generated note is used throughout the attempt, without regeneration after any potentially dispatched click. Note-less invitations require explicit `try_personal_message: false` or the debug CLI's `--no-message`.
 - Unknown or contradictory profile identity aborts with `profile_not_ready` or `profile_identity_mismatch`. An ambiguous/wrong invitation recipient aborts with `modal_recipient_mismatch`; a first name alone without an exact target profile link is insufficient. Once Connect may have been dispatched, non-platform confirmation errors are logged with their original cause and held as `invite_not_confirmed`.
 - Audience filtering reads only the verified topcard. Required counts that remain unreadable produce `audience_unavailable`; genuinely below-threshold counts produce `audience_filter`.
 - Only explicitly marked **pre-send** `profile_not_ready` and `audience_unavailable` outcomes can be deferred: at most two retries, no earlier than 30 minutes and then six hours. Their `not_before` and `preflight_retries` fields survive restarts. A reason string alone never authorizes retry.
 - Audience rejections, identity/modal mismatches, generic navigation/selector failures, exhausted preflight retries, and uncertain sends remain terminal. Notification engagement cannot resurrect terminal tasks or reset deferred retry budgets.
-- Note and Send controls are scoped to the verified invitation dialog; stale text is cleared on the no-note path. Note readback must exactly match the generated note.
+- Note and Send controls are scoped to the verified invitation dialog. A requested note must remain visible and its readback must match the generated note before Send; stale text is cleared only on the explicit no-note path.
 - Before Connect, existing invitation dialogs abort even if their recipient matches. The same invitation-specific verifier is used before and after Connect; unrelated chat or embedded video-error dialogs do not qualify as invitation dialogs.
 - Connect/More discovery shortlists labels in one browser read and uses structural locator hints to avoid repeatedly scanning every page control. Hints never grant action authority: recipient identity, ownership, and menu provenance are revalidated before each click, including after scrolling or DOM replacement.
-- A potentially dispatched Connect/Send click is never blindly retried. Completion requires the verified target to show Pending/Connected; an unrelated success toast is not enough.
+- A potentially dispatched Connect/Send click is never blindly retried. Completion requires the verified target to show Pending/Connected; an unrelated success toast is not enough. If Connect directly submits before a requested note can be entered, the outcome is held as `invite_not_confirmed`, not reported as personalized success.
 - `completed` means an invitation workflow was confirmed, not that the recipient later accepted. Acceptance is not tracked.
 - These checks deliberately fail closed for unsupported layouts. Do not restore page-wide `.first` selectors, whole-`main` text extraction, or post-click content re-scraping as fallbacks.
 
@@ -150,7 +151,7 @@ Optional but important:
 
 Behavior notes:
 
-- invite tasks still work without `OPENROUTER_API_KEY`, but personalized notes and some selector-detection behavior degrade
+- default personalized invite tasks require `OPENROUTER_API_KEY`; without it they fail before Connect rather than sending without a note. Explicit no-note tasks can still use deterministic Connect discovery without the key.
 - autonomous feed comments require `OPENROUTER_API_KEY`
 - model selection is resolved per request in `src/llm.py:resolve_model`, so changing `LLM_MODEL*` only needs a worker restart
 - `LLM_MODEL_CONNECT_ACTION` must name a vision-capable model; that module sends a screenshot
