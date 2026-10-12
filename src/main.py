@@ -23,6 +23,7 @@ from tasks.notification_reply_invites import (  # noqa: E402
     NOTIFICATION_REPLY_INVITE_SOURCE,
     NotificationReplyInviteScanner,
 )
+from worker_watchdog import WorkerWatchdog  # noqa: E402
 
 # Global shutdown flag
 shutdown_event = threading.Event()
@@ -267,6 +268,8 @@ def main():
     args = parse_args()
     metrics = create_metrics()
     metrics.set_up(True)
+    watchdog = WorkerWatchdog()
+    watchdog.start()
 
     # Register signal handlers for graceful shutdown
     signal.signal(signal.SIGTERM, signal_handler)
@@ -380,6 +383,7 @@ def main():
 
             logger.info("Starting task dispatcher loop...")
             while not shutdown_event.is_set():
+                watchdog.heartbeat("dispatcher poll")
                 try:
                     dispatcher.poll()
                 except SessionExpiredException:
@@ -426,6 +430,7 @@ def main():
         metrics.set_up(False)
         metrics.shutdown()
         logger.info("Shutdown complete.")
+        watchdog.stop()
         sys.exit(0)
 
 

@@ -80,6 +80,7 @@ Task statuses:
 - Runnable invitations take priority over other queued task types and notification scans
 - New notification scans/comments do not start within 15 minutes of a pending invitation becoming eligible; already-running synchronous actions are not forcibly interrupted
 - Notification discovery runs in available idle windows, with its existing 30-minute minimum interval. With recent invite history and a backlog, it runs at most once per quota event; it never runs during a durable invite cooldown or exhausted invite quota.
+- `src/worker_watchdog.py` bounds startup and each dispatcher cycle to 15 minutes without a progress heartbeat. Untimed Patchright reads can otherwise leave a running container stalled indefinitely. The watchdog emits a diagnostic stack and exits nonzero without waiting for browser cleanup; Docker's `restart: always` restarts the worker with the same persistent state. It never issues browser actions or retries an invitation itself; startup still quarantines interrupted `processing` invites. A standalone CLI process exits rather than restarting itself.
 
 ### Invitation identity and personalization
 
