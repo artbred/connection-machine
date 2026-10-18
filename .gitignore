@@ -20,3 +20,9 @@ data
 .sisyphus
 .ruff_cache
 .omx/
+
+# Local credentials never belong in version control.
+auth.json
+config.yaml
+*.key
+*.pem

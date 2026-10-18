@@ -11,8 +11,13 @@ services:
     restart: always
     dns:
       - 1.1.1.1
-    ports:
-      - ${METRICS_BIND_HOST:-0.0.0.0}:${METRICS_PORT:-9102}:${METRICS_PORT:-9102}
+    expose:
+      - "${METRICS_PORT:-9102}"
+    networks:
+      default: {}
+      connection-machine-metrics:
+        aliases:
+          - connection-machine-metrics
     logging:
       driver: json-file
       options:
@@ -25,5 +30,8 @@ volumes:
     external: true
     name: connection-machine-data
 networks:
+  connection-machine-metrics:
+    external: true
+    name: connection-machine-metrics
   dokploy-network:
     external: true
