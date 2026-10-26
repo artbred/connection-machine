@@ -22,7 +22,7 @@ SEND_INVITATION_NAME = re.compile(
 )
 
 _DIALOG_EVIDENCE_JS = """
-(dialog) => {
+(dialog, noteSelector) => {
   const visible = el => !!(el.getClientRects().length);
   const text = el => (el.innerText || '').replace(/\\s+/g, ' ').trim();
   const headings = [...dialog.querySelectorAll('h1, h2, h3, [role="heading"]')]
@@ -43,7 +43,8 @@ _DIALOG_EVIDENCE_JS = """
     .map(el => el.getAttribute('aria-label') || text(el));
   return {
     headings, paragraphs, links, buttons,
-    customMessage: !!dialog.querySelector(
+    customMessage: !!dialog.querySelector(noteSelector),
+    dedicatedMessage: !!dialog.querySelector(
       'textarea#custom-message, textarea.connect-button-send-invite__custom-message'
     )
   };
@@ -99,10 +100,20 @@ def find_invite_dialog(
         dialog = dialogs.nth(index)
         if not dialog.is_visible():
             continue
-        evidence = dialog.evaluate(_DIALOG_EVIDENCE_JS)
+        evidence = dialog.evaluate(_DIALOG_EVIDENCE_JS, INVITE_NOTE_SELECTOR)
+        same_note_dialog = (
+            verified_note_dialog is not None
+            and dialog.evaluate(
+                "(dialog, verified) => dialog === verified && verified.isConnected",
+                verified_note_dialog,
+            )
+        )
         names = _recipient_names(evidence["headings"], evidence["paragraphs"])
         invitation_ui = (
-            evidence["customMessage"]
+            evidence["dedicatedMessage"]
+            # Generic editor forms also occur in unrelated messaging dialogs.
+            # They retain invitation authority only on the bound transition.
+            or (evidence["customMessage"] and same_note_dialog)
             or bool(names)
             or any(
                 re.search(
@@ -125,16 +136,7 @@ def find_invite_dialog(
                 "modal_recipient_mismatch", cooldown_eligible=False
             )
         if not urls and expected_name not in names:
-            same_note_dialog = (
-                not names
-                and evidence["customMessage"]
-                and verified_note_dialog is not None
-                and dialog.evaluate(
-                    "(dialog, verified) => dialog === verified && verified.isConnected",
-                    verified_note_dialog,
-                )
-            )
-            if not same_note_dialog:
+            if not (not names and evidence["customMessage"] and same_note_dialog):
                 raise TaskSkippedException(
                     "modal_recipient_mismatch", cooldown_eligible=False
                 )

@@ -334,13 +334,20 @@ class TargetActionBrowserTests(OfflineBrowserTestCase):
 
         def dispatch_then_timeout(locator, *args, **kwargs):
             original_click(locator, *args, **kwargs)
+            if kwargs.get("trial"):
+                return  # A trial performs checks, but never dispatches.
+            self.assertEqual(kwargs.get("timeout"), 5000)
             raise BrowserTimeoutError(
                 "Transport timed out after the click was dispatched"
             )
 
-        with patch.object(BrowserLocator, "click", dispatch_then_timeout):
+        with (
+            patch.object(BrowserLocator, "click", dispatch_then_timeout),
+            self.assertLogs("connect_heuristics", level="WARNING") as logs,
+        ):
             with self.assertRaises(TaskSkippedException) as raised:
                 try_heuristic_connect(self.page, HumanActions(self.page), identity)
+        self.assertIn("Transport timed out after the click was dispatched", logs.output[0])
         self.assertEqual(raised.exception.reason, "invite_not_confirmed")
         self.assertFalse(raised.exception.cooldown_eligible)
         self.assertEqual(

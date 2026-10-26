@@ -183,6 +183,40 @@ def is_target_action(
         return False
 
 
+def is_actionable_target(
+    locator: Locator,
+    page: Page,
+    identity: ProfileIdentity,
+    *,
+    allow_more: bool = False,
+    from_profile_menu: bool = False,
+) -> bool:
+    """Check pointer actionability without dispatch, then revalidate after scroll.
+
+    A visible sticky duplicate can be covered by navigation. It is safe to try
+    another candidate only here, before a real click could have been dispatched.
+    """
+    if not is_target_action(
+        locator, page, identity, allow_more=allow_more,
+        from_profile_menu=from_profile_menu,
+    ):
+        return False
+    actionable = True
+    try:
+        locator.click(trial=True, timeout=1000)
+    except (PlaywrightError, PatchrightError) as exc:
+        logger.debug("Connect/More actionability trial failed (%s): %.1200s",
+                     type(exc).__name__, str(exc))
+        actionable = False
+    # Trial clicks can scroll and trigger replacement, even when they time out.
+    if not is_target_action(
+        locator, page, identity, allow_more=allow_more,
+        from_profile_menu=from_profile_menu,
+    ):
+        raise TaskSkippedException("profile_identity_mismatch", cooldown_eligible=False)
+    return actionable
+
+
 def _find_action(
     page: Page,
     identity: ProfileIdentity,
@@ -223,7 +257,7 @@ def _find_action(
     )
     for selector in selectors:
         candidate = page.locator(selector)
-        if is_target_action(
+        if is_actionable_target(
             candidate,
             page,
             identity,
@@ -250,9 +284,11 @@ def _click_action(
     ):
         raise TaskSkippedException("profile_identity_mismatch", cooldown_eligible=False)
     try:
-        locator.click(delay=100)
+        locator.click(delay=100, timeout=5000)
     except (PlaywrightError, PatchrightError) as exc:
         # A timeout can occur after dispatch. Never attempt another Connect.
+        logger.warning("Connect/More click outcome is uncertain (%s): %.1200s",
+                       type(exc).__name__, str(exc))
         raise TaskSkippedException(
             "invite_not_confirmed", cooldown_eligible=False
         ) from exc
@@ -288,7 +324,7 @@ def get_cached_connect_button(page: Page, identity: ProfileIdentity) -> Locator 
         candidates = page.locator(selector)
         for index in range(candidates.count()):
             candidate = candidates.nth(index)
-            if is_target_action(candidate, page, identity):
+            if is_actionable_target(candidate, page, identity):
                 return candidate
     except (PlaywrightError, PatchrightError) as exc:
         logger.debug("Cached Connect selector is no longer usable: %s", exc)

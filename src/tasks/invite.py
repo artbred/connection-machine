@@ -21,6 +21,7 @@ from connect_heuristics import (
     try_heuristic_connect,
     get_cached_connect_button,
     is_target_action,
+    is_actionable_target,
     save_selector_to_cache,
 )
 from exceptions import TaskSkippedException
@@ -864,6 +865,30 @@ class InviteTask(BaseTask):
             raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
         return visible[0] if visible else editors.first
 
+    def _wait_for_invite_note_editor(self, timeout: int = 3000) -> Locator:
+        """Wait through Add a note's hidden transition, not through mismatches."""
+        identity = self._require_target_identity()
+        deadline = time.monotonic() + timeout / 1000
+        while True:
+            # Re-run the recipient verifier on every poll. Never rebind the
+            # original handle, or retry a foreign/replaced/ambiguous dialog.
+            dialog = find_invite_dialog(
+                self.page, identity, verified_note_dialog=self._verified_note_dialog
+            )
+            if dialog is not None:
+                visible = [editor for editor in dialog.locator(INVITE_NOTE_SELECTOR).all()
+                           if editor.is_visible()]
+                if len(visible) > 1:
+                    raise TaskSkippedException(
+                        "invite_not_confirmed", cooldown_eligible=False
+                    )
+                if visible:
+                    return visible[0]
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TaskSkippedException("invite_not_confirmed", cooldown_eligible=False)
+            self.page.wait_for_timeout(min(100, remaining * 1000))
+
     def _get_invite_note_text(self, editor: Any) -> str:
         try:
             tag_name = (editor.evaluate("element => element.tagName") or "").lower()
@@ -1190,7 +1215,7 @@ class InviteTask(BaseTask):
                             "invite_not_confirmed", cooldown_eligible=False
                         )
                     visible[0].click(timeout=3000)
-                self._get_invite_note_editor().wait_for(state="visible", timeout=3000)
+                self._wait_for_invite_note_editor()
                 self._enter_connection_message(connection_message)
             else:
                 editor = self._get_invite_note_editor()
@@ -1252,6 +1277,8 @@ class InviteTask(BaseTask):
         try:
             target.click(delay=100, timeout=5000)
         except Exception as exc:
+            logger.warning("Connect click outcome is uncertain (%s): %.1200s",
+                           type(exc).__name__, str(exc))
             raise TaskSkippedException(
                 "invite_not_confirmed", cooldown_eligible=False
             ) from exc
@@ -1359,7 +1386,7 @@ class InviteTask(BaseTask):
                 match
                 for match in matches
                 if _locator_matches_expected_text(match, expected_text)
-                and is_target_action(
+                and is_actionable_target(
                     match,
                     self.page,
                     identity,

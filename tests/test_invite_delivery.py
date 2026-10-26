@@ -16,6 +16,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 from patchright.sync_api import Locator as BrowserLocator  # noqa: E402
 from patchright.sync_api import TimeoutError as BrowserTimeoutError  # noqa: E402
 
+import connect_heuristics  # noqa: E402
 from exceptions import TaskSkippedException  # noqa: E402
 from human_actions import HumanActions  # noqa: E402
 from invite_modal import find_invite_dialog  # noqa: E402
@@ -72,7 +73,8 @@ window.sendInvite = () => {
   const dialog = document.querySelector('#invite-dialog');
   const sent = JSON.parse(document.body.dataset.sent);
   sent.push({name: dialog.querySelector('h2').textContent,
-             note: dialog.querySelector('textarea')?.value || ''});
+             note: dialog.querySelector('textarea')?.value ||
+                   dialog.querySelector('[contenteditable="true"]')?.textContent || ''});
   document.body.dataset.sent = JSON.stringify(sent);
   if (CONFIRM_SEND) {
     dialog.remove();
@@ -89,7 +91,8 @@ window.sendInvite = () => {
 
 
 def note_transition_fixture(
-    editor=NOTE_EDITOR, *, replace_dialog=False, already_open=True
+    editor=NOTE_EDITOR, *, replace_dialog=False, already_open=True, delay_ms=0,
+    hide_during_transition=True
 ):
     prompt = """
 <div role="dialog" id="invite-dialog">
@@ -103,15 +106,26 @@ def note_transition_fixture(
 <script>
 window.addNote = () => {
   const dialog = document.querySelector('#invite-dialog');
-  if (REPLACE_DIALOG) {
-    dialog.outerHTML = '<div role="dialog" id="invite-dialog">' + EDITOR_HTML + '</div>';
+  const transition = () => {
+    if (REPLACE_DIALOG) {
+      dialog.outerHTML = '<div role="dialog" id="invite-dialog">' + EDITOR_HTML + '</div>';
+    } else {
+      dialog.innerHTML = EDITOR_HTML;
+      dialog.style.display = '';
+    }
+  };
+  if (DELAY_MS) {
+    if (HIDE_TRANSITION) dialog.style.display = 'none';
+    setTimeout(transition, DELAY_MS);
   } else {
-    dialog.innerHTML = EDITOR_HTML;
+    transition();
   }
 };
 </script>
 """.replace("REPLACE_DIALOG", "true" if replace_dialog else "false").replace(
         "EDITOR_HTML", json.dumps(editor)
+    ).replace("DELAY_MS", str(delay_ms)).replace(
+        "HIDE_TRANSITION", "true" if hide_during_transition else "false"
     )
 
 
@@ -173,6 +187,162 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
     def assert_nothing_sent(self):
         self.assertEqual(self.sent_records(), [])
         self.assertFalse(self.history_path.exists())
+
+    def covered_connect_fixture(self):
+        # Both controls are visible, exact-target actions. Only the main one
+        # receives pointer events; the sticky duplicate is behind the navbar.
+        return fixture(already_open=False).replace(
+            '<main><section class="pv-top-card">',
+            '''<style>main {padding-top:120px} #sticky {position:fixed;top:10px;left:10px}
+            #navbar {position:fixed;top:0;left:0;width:100%;height:80px;z-index:10}</style>
+            <button id="navbar">For Business</button>
+            <main><section class="pv-top-card">''',
+        ).replace(
+            '<button id="connect"',
+            '''<a id="sticky" class="connect-choice"
+               href="/preload/custom-invite/?vanityName=jane-prospect"
+               aria-label="Invite Jane Prospect to connect"
+               onclick="document.body.dataset.stickyClicks='1';return false">Connect</a>
+            <button id="connect" class="connect-choice"''',
+        )
+
+    def test_covered_sticky_connect_is_skipped_without_dispatch(self):
+        task = self.make_task(self.covered_connect_fixture())
+        self.assertTrue(self.page.locator('#sticky').is_visible())
+        action = connect_heuristics._find_action(self.page, task._target_identity)
+        self.assertIsNotNone(action)
+        self.assertEqual(action.get_attribute('id'), 'connect')
+        self.assertIsNone(self.page.locator('body').get_attribute('data-sticky-clicks'))
+        self.assertEqual(self.page.locator('#invite-dialog').count(), 0)
+        self.assert_nothing_sent()
+
+    def test_cached_covered_sticky_connect_is_skipped_without_dispatch(self):
+        task = self.make_task(self.covered_connect_fixture())
+        with patch.dict(connect_heuristics.selector_cache, {'connect': '.connect-choice'}, clear=True):
+            action = connect_heuristics.get_cached_connect_button(self.page, task._target_identity)
+        self.assertIsNotNone(action)
+        self.assertEqual(action.get_attribute('id'), 'connect')
+        self.assertEqual(self.page.locator('#invite-dialog').count(), 0)
+        self.assert_nothing_sent()
+
+    def test_covered_sticky_connect_full_flow_all_discovery_paths(self):
+        for discovery in ('heuristic', 'cached', 'llm'):
+            with self.subTest(discovery=discovery):
+                task = self.make_task(self.covered_connect_fixture())
+                with (
+                    patch.dict(connect_heuristics.selector_cache,
+                               {'connect': '.connect-choice'} if discovery == 'cached' else {}, clear=True),
+                    patch.object(invite, 'generate_connection_message', return_value=NOTE) as generator,
+                    patch.object(invite, 'get_next_connect_action', return_value={
+                        'selector': '.connect-choice', 'expected_text': 'Connect',
+                    }) as llm,
+                ):
+                    if discovery == 'heuristic':
+                        result = task.send_connection_request(TARGET)
+                    else:
+                        with patch.object(invite, 'try_heuristic_connect', return_value=False):
+                            result = task.send_connection_request(TARGET)
+                generator.assert_called_once()
+                self.assertEqual(llm.call_count, 1 if discovery == 'llm' else 0)
+                self.assertEqual(result, {'status': 'pending', 'message': NOTE})
+                self.assertEqual([record['note'] for record in self.sent_records()], [NOTE])
+                self.assertIsNone(self.page.locator('body').get_attribute('data-sticky-clicks'))
+
+    def test_personalized_invite_waits_for_hidden_same_note_dialog(self):
+        task = self.make_task(note_transition_fixture(already_open=False, delay_ms=600))
+        with patch.object(invite, 'generate_connection_message', return_value=NOTE) as generator:
+            result = task.send_connection_request(TARGET)
+        generator.assert_called_once()
+        self.assertEqual(result, {'status': 'pending', 'message': NOTE})
+        self.assertEqual([record['note'] for record in self.sent_records()], [NOTE])
+        self.assertIsNone(task._verified_note_dialog)
+
+    def test_personalized_invite_waits_for_editor_inside_visible_dialog(self):
+        task = self.make_task(note_transition_fixture(delay_ms=600, hide_during_transition=False))
+        result = task._complete_connection(TARGET, NOTE)
+        self.assertEqual(result, {'status': 'pending', 'message': NOTE})
+        self.assertEqual([record['note'] for record in self.sent_records()], [NOTE])
+
+    def test_name_free_supported_editor_forms_keep_same_dialog_binding(self):
+        for editor in ('<textarea name="message"></textarea>',
+                       '<div contenteditable="true" role="textbox"></div>'):
+            with self.subTest(editor=editor):
+                # No invitation wording: editor evidence must match the same
+                # forms the scoped note selector already supports.
+                task = self.make_task(note_transition_fixture(
+                    '<h2>Message</h2>' + editor + '<button onclick="sendInvite()">Send</button>',
+                    delay_ms=600,
+                ))
+                result = task._complete_connection(TARGET, NOTE)
+                self.assertEqual(result, {'status': 'pending', 'message': NOTE})
+                self.assertEqual([record['note'] for record in self.sent_records()], [NOTE])
+
+    def test_delayed_replaced_note_dialog_cannot_inherit_recipient(self):
+        task = self.make_task(note_transition_fixture(replace_dialog=True, delay_ms=600))
+        with self.assertRaises(TaskSkippedException) as caught:
+            task._complete_connection(TARGET, NOTE)
+        self.assertEqual(caught.exception.reason, 'modal_recipient_mismatch')
+        self.assertEqual(self.page.locator('textarea').input_value(), '')
+        self.assertIsNone(task._verified_note_dialog)
+        self.assertFalse(task._send_attempted)
+        self.assert_nothing_sent()
+
+    def test_delayed_foreign_note_dialog_is_not_retried(self):
+        for editor in (
+            NOTE_EDITOR.replace('Add a note to your invitation', 'Invite Alex Stranger to connect'),
+            NOTE_EDITOR + '<a href="/in/stranger/">Jane Prospect</a>',
+        ):
+            with self.subTest(editor=editor):
+                task = self.make_task(note_transition_fixture(editor, delay_ms=600))
+                with self.assertRaises(TaskSkippedException) as caught:
+                    task._complete_connection(TARGET, NOTE)
+                self.assertEqual(caught.exception.reason, 'modal_recipient_mismatch')
+                self.assertEqual(self.page.locator('textarea').input_value(), '')
+                self.assertFalse(task._send_attempted)
+                self.assertIsNone(task._verified_note_dialog)
+                self.assert_nothing_sent()
+
+    def test_note_transition_timeout_fails_closed_and_clears_binding(self):
+        task = self.make_task(note_transition_fixture(delay_ms=10000))
+        original_wait = task._wait_for_invite_note_editor
+        with (
+            patch.object(task, '_wait_for_invite_note_editor',
+                         side_effect=lambda: original_wait(timeout=200)),
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task._complete_connection(TARGET, NOTE)
+        self.assertEqual(caught.exception.reason, 'invite_not_confirmed')
+        self.assertFalse(caught.exception.retryable_preflight)
+        self.assertFalse(task._send_attempted)
+        self.assertIsNone(task._verified_note_dialog)
+        self.assert_nothing_sent()
+
+    def test_note_transition_mismatch_is_not_polled_again(self):
+        task = self.make_task(note_transition_fixture())
+        with (
+            patch.object(invite, 'find_invite_dialog', side_effect=TaskSkippedException(
+                'modal_recipient_mismatch', cooldown_eligible=False)) as verifier,
+            patch.object(self.page, 'wait_for_timeout') as sleep,
+            self.assertRaises(TaskSkippedException) as caught,
+        ):
+            task._wait_for_invite_note_editor()
+        self.assertEqual(caught.exception.reason, 'modal_recipient_mismatch')
+        verifier.assert_called_once()
+        sleep.assert_not_called()
+        self.assert_nothing_sent()
+
+    def test_chat_is_ignored_during_hidden_note_transition(self):
+        chat = '''<div role="dialog"><h2>Messaging</h2>
+          <textarea id="chat" name="message">Draft</textarea>
+          <div id="chat-editable" contenteditable="true" role="textbox">Draft editor</div>
+          <button onclick="document.body.dataset.chatSent='1'">Send</button></div>'''
+        task = self.make_task(note_transition_fixture(delay_ms=600) + chat)
+        result = task._complete_connection(TARGET, NOTE)
+        self.assertEqual(result['status'], 'pending')
+        self.assertEqual(self.page.locator('#chat').input_value(), 'Draft')
+        self.assertEqual(self.page.locator('#chat-editable').inner_text(), 'Draft editor')
+        self.assertEqual(self.page.locator('body').get_attribute('data-chat-sent'), '0')
+        self.assertEqual([record['note'] for record in self.sent_records()], [NOTE])
 
     def test_personalized_invite_survives_recipientless_note_transition(self):
         task = self.make_task(note_transition_fixture(already_open=False))
