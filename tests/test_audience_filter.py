@@ -3,7 +3,6 @@ import sys
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -19,8 +18,7 @@ from tasks.invite import (  # noqa: E402
     get_invite_audience_filter,
     parse_audience_stats,
 )
-from linkedin_profile import wait_for_profile  # noqa: E402
-from tests.browser_case import OfflineBrowserTestCase  # noqa: E402
+from linkedin_profile import ProfileDetails  # noqa: E402
 
 # Live topcard text observed 2026-07-17 (andrewfelbinger)
 REAL_TOPCARD = (
@@ -195,105 +193,35 @@ class EnvConfigTest(unittest.TestCase):
             self.assertEqual(get_invite_audience_filter()[0], 0)
 
 
-class EnforceAudienceFilterTest(OfflineBrowserTestCase):
-    def _make_task(self, counts: str, extra: str = ""):
-        self.load_html(
-            '<main><section class="pv-top-card">'
-            '<h1><a href="/in/jane-prospect/">Jane Prospect</a></h1>'
-            f'<div id="counts">{counts}</div>'
-            "<button>Connect</button></section>"
-            f"{extra}</main>"
-        )
+class EnforceAudienceFilterTest(unittest.TestCase):
+    FILTER = {"INVITE_MIN_FOLLOWERS": "3000", "INVITE_REQUIRE_500_CONNECTIONS": "true"}
+
+    def enforce(self, followers_text="", connections_text=""):
         task = InviteTask.__new__(InviteTask)
-        task.page = self.page
-        task.human = SimpleNamespace(
-            random_sleep=lambda *_: self.page.wait_for_timeout(100)
+        details = ProfileDetails(
+            followers_text=followers_text, connections_text=connections_text
         )
-        task._target_identity = wait_for_profile(
-            self.page, self.page.url, personalize=False
-        ).identity
-        return task
+        with patch.dict(os.environ, self.FILTER):
+            return task._enforce_audience_filter(
+                "https://www.linkedin.com/in/jane-prospect/", details
+            )
 
     def test_qualified_target_passes(self):
-        task = self._make_task("3,348 followers<br>500+ connections")
-        with patch.dict(
-            os.environ,
-            {"INVITE_MIN_FOLLOWERS": "3000", "INVITE_REQUIRE_500_CONNECTIONS": "true"},
-        ):
-            stats = task._enforce_audience_filter(self.page.url)
+        stats = self.enforce("3,348 followers", "500+ connections")
         self.assertEqual(stats["followers"], 3348)
         self.assertEqual(stats["connections"], 500)
 
-    def test_foreign_counts_cannot_qualify_small_target(self):
-        task = self._make_task(
-            "120 followers<br>89 connections",
-            '<div><div role="heading">More profiles for you</div>'
-            '<a href="/in/stranger/">Stranger</a>'
-            "<div>20,000 followers<br>500+ connections</div></div>",
-        )
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "INVITE_MIN_FOLLOWERS": "3000",
-                    "INVITE_REQUIRE_500_CONNECTIONS": "true",
-                },
-            ),
-            self.assertRaises(TaskSkippedException) as caught,
-        ):
-            task._enforce_audience_filter(self.page.url)
+    def test_small_target_is_rejected_without_retry(self):
+        with self.assertRaises(TaskSkippedException) as caught:
+            self.enforce("120 followers", "89 connections")
         self.assertEqual(caught.exception.reason, "audience_filter")
-        self.assertFalse(caught.exception.cooldown_eligible)
+        self.assertFalse(caught.exception.retryable_preflight)
 
-    def test_unreadable_counts_are_not_labeled_below_threshold(self):
-        task = self._make_task(
-            "500+ connections",
-            "<section><h2>Activity</h2><div>20,000 followers</div></section>",
-        )
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "INVITE_MIN_FOLLOWERS": "3000",
-                    "INVITE_REQUIRE_500_CONNECTIONS": "true",
-                },
-            ),
-            self.assertRaises(TaskSkippedException) as caught,
-        ):
-            task._enforce_audience_filter(self.page.url)
+    def test_missing_count_is_unavailable_not_below_threshold(self):
+        with self.assertRaises(TaskSkippedException) as caught:
+            self.enforce(connections_text="500+ connections")
         self.assertEqual(caught.exception.reason, "audience_unavailable")
-
-    def test_waits_for_configured_stat_to_hydrate(self):
-        task = self._make_task("49 connections")
-        self.page.evaluate("""() => setTimeout(() => {
-            document.querySelector('#counts').innerHTML =
-                '3,200 followers<br>49 connections';
-        }, 150)""")
-        with patch.dict(
-            os.environ,
-            {"INVITE_MIN_FOLLOWERS": "3000", "INVITE_REQUIRE_500_CONNECTIONS": "false"},
-        ):
-            stats = task._enforce_audience_filter(self.page.url)
-        self.assertEqual(stats["followers"], 3200)
-        self.assertEqual(stats["connections"], 49)
-
-    def test_profile_drift_aborts_the_filter(self):
-        task = self._make_task("3,348 followers<br>500+ connections")
-        self.page.locator("h1").evaluate(
-            "el => el.innerHTML = '<a href=\"/in/stranger/\">Stranger</a>'"
-        )
-        with (
-            patch.dict(
-                os.environ,
-                {
-                    "INVITE_MIN_FOLLOWERS": "3000",
-                    "INVITE_REQUIRE_500_CONNECTIONS": "true",
-                },
-            ),
-            self.assertRaises(TaskSkippedException) as caught,
-        ):
-            task._enforce_audience_filter(self.page.url)
-        self.assertEqual(caught.exception.reason, "profile_identity_mismatch")
+        self.assertTrue(caught.exception.retryable_preflight)
 
 
 if __name__ == "__main__":

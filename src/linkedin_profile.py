@@ -1,10 +1,11 @@
-"""Read-only, positive-ownership profile extraction and bounded hydration waits.
+"""Read-only profile identity, owner top card, and LLM-parse verification.
 
-Unknown layouts intentionally lose personalization rather than borrow nearby text.
+Structure is used only to prove who the page and its actions belong to; profile
+prose and audience counts come from the LLM and must appear verbatim on the page.
 A canonical link is corroboration, never proof that a SPA topcard has hydrated.
 """
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 import re
 import time
 import unicodedata
@@ -24,14 +25,29 @@ class ProfileIdentity:
 @dataclass(frozen=True)
 class ProfileSnapshot:
     identity: ProfileIdentity
+    _topcard_selector: str = field(default="", repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ProfileDetails:
+    """LLM-parsed owner fields; each kept only when found verbatim on the page."""
+
     headline: str = ""
     about: str = ""
     experience: str = ""
-    audience_text: str = ""
-    content: str = ""
-    _topcard_selector: str = field(default="", repr=False, compare=False)
-    _section_selectors: tuple[str, ...] = field(default=(), repr=False, compare=False)
-    _content_ready: bool = field(default=False, repr=False, compare=False)
+    followers_text: str = ""
+    connections_text: str = ""
+
+    def content(self, name: str) -> str:
+        """Note-generation input, or "" when too thin to personalize."""
+        fields = (("Headline", self.headline), ("About", self.about), ("Experience", self.experience))
+        if (
+            max(len(self.about), len(self.experience)) < 80
+            or sum(len(value) for _, value in fields) < _MIN_CONTENT_LENGTH
+        ):
+            return ""
+        parts = [name, *(f"{label}:\n{value}" for label, value in fields if value)]
+        return "\n\n".join(parts)[:_MAX_CONTENT_LENGTH]
 
 
 def canonical_profile_url(url: str) -> str | None:
@@ -104,6 +120,13 @@ _PROFILE_DOM_JS = r"""
       }
       return false;
     });
+  // LinkedIn may wrap each column item in unkeyed, single-child layout divs.
+  const columnOf = card => {
+    let el = card.parentElement;
+    while (el && !el.matches(lazyColumn) && el.matches('div:not([componentkey])') &&
+        el.children.length === 1) el = el.parentElement;
+    return el?.matches(lazyColumn) ? el : null;
+  };
   const profile = (value, marker = false) => {
     try {
       const u = new URL(value, location.href);
@@ -146,26 +169,10 @@ _PROFILE_DOM_JS = r"""
     }
     return root;
   };
-  const exclusions = (root, allowedHeading = null, experience = false) => {
+  const exclusions = (root, allowedHeading = null) => {
     const excluded = new Set(root.querySelectorAll(noise + ',script,style,button,[role="button"],.visually-hidden,.sr-only,[hidden]'));
-    // LinkedIn's displayed text often has aria-hidden=true paired with a
-    // visually-hidden duplicate. Keep the displayed text, not both or neither.
-    for (const h of root.querySelectorAll(headings)) {
-      if (h === allowedHeading) continue;
-      // Job titles are headings too. Within Experience, a bounded job item
-      // linked to an employer is owned prose, not a recommendation module.
-      const job = h.closest('li,article');
-      const employerLinked = experience && job && root.contains(job) &&
-        h.matches('h3,[role="heading"][aria-level="3"]') &&
-        [...h.parentElement.querySelectorAll('a[href]')].some(a => {
-          try {
-            const u = new URL(a.href);
-            return /^(?:[a-z0-9-]+\.)*linkedin\.com$/i.test(u.hostname) &&
-              /^\/company\/[^/]+\/?$/.test(u.pathname);
-          } catch (_) { return false; }
-        });
-      if (!employerLinked) excluded.add(moduleFor(h, root));
-    }
+    for (const h of root.querySelectorAll(headings))
+      if (h !== allowedHeading) excluded.add(moduleFor(h, root));
     for (const a of root.querySelectorAll('a[href]')) {
       const target = profile(a.href, true);
       if (target && target !== expected) excluded.add(moduleFor(a, root));
@@ -192,8 +199,7 @@ _PROFILE_DOM_JS = r"""
     if (!root || root === main || root.closest(noise)) continue;
     const sduiCard = root.closest(sduiCards);
     const sduiKey = sduiCard?.getAttribute('componentkey') || '';
-    const sduiColumn = sduiKey.endsWith('Topcard') &&
-      sduiCard.parentElement?.matches(lazyColumn) ? sduiCard.parentElement : null;
+    const sduiColumn = sduiKey.endsWith('Topcard') ? columnOf(sduiCard) : null;
     // SDUI nests keyed cards inside a layout section. Only its explicit
     // topcard/column relationship may cross that otherwise unsafe boundary.
     if (root.parentElement?.closest('section,article') && !sduiColumn) continue;
@@ -229,14 +235,13 @@ _PROFILE_DOM_JS = r"""
     }
     if (!markers.length) continue;
     candidates.push({root, heading, name, markers, excluded,
-      primary: sduiColumn || root.parentElement,
-      cardPrefix: sduiColumn ? sduiKey.slice(0, -'Topcard'.length) : ''});
+      primary: sduiColumn || root.parentElement});
   }
   // Multiple apparent owners are unsafe even when one matches the queue.
   const unique = candidates.filter((item, i) => candidates.findIndex(c => c.root === item.root) === i);
   if (!unique.length) return {status: 'not_ready'};
   if (unique.length !== 1 || unique[0].markers.some(url => url !== expected)) return {status: 'mismatch'};
-  const {root, heading, name, excluded, primary, cardPrefix} = unique[0];
+  const {root, heading, name, excluded, primary} = unique[0];
   if (ownHeadings(main)[0] !== heading) return {status: 'not_ready'};
   if (args.name && name !== args.name) return {status: 'mismatch'};
   if (busy(root, excluded)) return {status: 'not_ready'};
@@ -252,272 +257,105 @@ _PROFILE_DOM_JS = r"""
     return true;
   };
   if (args.element) return {status: 'ready', owned: owned(args.element)};
-  const text = (container, omitted, omitHeading = null) => {
-    if (!container || insideExcluded(container, container, omitted)) return '';
-    const chunks = [];
-    const visit = node => {
-      if (node.nodeType === Node.TEXT_NODE) {
-        const s = clean(node.nodeValue);
-        if (!s) return;
-        // A display:contents parent has no box; direct text still must render.
-        if (!visible(node.parentElement)) {
-          const range = document.createRange();
-          range.selectNodeContents(node);
-          if (!range.getClientRects().length ||
-              getComputedStyle(node.parentElement).visibility === 'hidden') return;
-        }
-        chunks.push(s);
-        return;
-      }
-      if (node.nodeType !== Node.ELEMENT_NODE || omitted.has(node) || node === omitHeading) return;
-      if (!visible(node)) {
-        const style = getComputedStyle(node);
-        // SDUI wraps the complete Experience body in boxless layout nodes.
-        // Traverse these only; descendants retain their own visibility checks.
-        if (style.display !== 'contents' || style.visibility === 'hidden') return;
-      }
-      for (const child of node.childNodes) visit(child);
-      if (node.matches('div,p,li,section,article,br')) chunks.push('\n');
-    };
-    visit(container);
-    return chunks.join(' ').replace(/ *\n */g, '\n').replace(/\n+/g, '\n').trim();
-  };
-  let headline = '';
-  const headlineNodes = [...root.querySelectorAll('.text-body-medium,.pv-text-details__left-panel .text-body-medium,[data-view-name="profile-headline"],[data-field="headline"]')]
-    .filter(el => visible(el) && !insideExcluded(el, root, excluded));
-  if (headlineNodes.length === 1) headline = text(headlineNodes[0], excluded);
-  // SDUI's name link is nested in display-contents wrappers. Its name row
-  // contains only that branch and connection-degree labels; the headline is
-  // the immediately following paragraph, never arbitrary topcard text.
-  if (!headline && !headlineNodes.length && cardPrefix) {
-    const nameLink = heading.closest('a[href]');
-    if (nameLink && root.contains(nameLink) && profile(nameLink.href) === expected) {
-      let block = nameLink;
-      while (block.parentElement !== root && block.parentElement?.matches('div')) {
-        const row = block.parentElement;
-        const siblings = [...row.children].filter(el => el !== block && labelText(el));
-        if (siblings.length) {
-          const next = row.nextElementSibling;
-          if (labelText(block) === name && row.querySelectorAll(headings).length === 1 &&
-              siblings.every(el => !el.querySelector('a,button,' + headings) &&
-                /^·\s*(?:1st|2nd|3rd\+?)$/i.test(labelText(el))) &&
-              next?.matches('p') && !next.querySelector('a,button,' + headings) &&
-              !insideExcluded(next, root, excluded) && visible(next) &&
-              !/\b(followers|connections?)\b/i.test(next.innerText)) {
-            headline = text(next, excluded);
-            headlineNodes.push(next);
-          }
-          break;
-        }
-        block = row;
-      }
-    }
-  }
-  // Legacy unclassed fixtures: only the immediate leaf after the name block.
-  if (!headline && !headlineNodes.length) {
-    let block = heading;
-    if (heading.parentElement?.tagName === 'A') block = heading.parentElement;
-    const next = block.nextElementSibling;
-    if (next && next.matches('div,p') && !next.querySelector('a,button,' + headings) &&
-        !insideExcluded(next, root, excluded) && !/\b(followers|connections?)\b/i.test(next.innerText))
-      headline = text(next, excluded);
-  }
-  const fields = {about: '', experience: ''};
-  const complete = {about: false, experience: false};
-  const discovered = {about: false, experience: false};
-  const sectionPaths = [];
-  for (const key of Object.keys(fields)) {
-    const matches = [...primary.querySelectorAll(headings)].filter(h =>
-      !root.contains(h) && visible(h) && !h.closest(noise) && labelText(h).toLowerCase() === key);
-    discovered[key] = matches.length > 0;
-    if (matches.length !== 1) continue;
-    const h = matches[0];
-    let section = h.parentElement;
-    while (section && section !== primary) {
-      if (section.matches('section,article') || section.parentElement === primary) break;
-      section = section.parentElement;
-    }
-    if (!section || section === primary || section.contains(root)) continue;
-    const sectionCard = h.closest(sduiCards);
-    const cardNames = key === 'experience' ? ['Experience', 'ExperienceTopLevelSection'] : ['About'];
-    if (cardPrefix && (!sectionCard?.contains(section) ||
-        !cardNames.some(suffix => sectionCard.getAttribute('componentkey') === cardPrefix + suffix) ||
-        sectionCard.closest(lazyColumn) !== primary)) continue;
-    // Keyed sibling cards share SDUI wrapper groups, not each other's prose.
-    // Unkeyed foreign modules still invalidate an enclosing branch.
-    const inSiblingCard = node => {
-      const card = node.closest(sduiCards);
-      return cardPrefix && card && card !== sectionCard && primary.contains(card);
-    };
-    let nestedModule = false;
-    for (let ancestor = section.parentElement; ancestor && ancestor !== primary; ancestor = ancestor.parentElement) {
-      if (ancestor.matches('section,article,li') ||
-          [...ancestor.querySelectorAll(headings)].some(other => !section.contains(other) && !inSiblingCard(other)) ||
-          [...ancestor.querySelectorAll('a[href]')].some(a => {
-            const target = profile(a.href, true);
-            return !section.contains(a) && target && target !== expected && !inSiblingCard(a);
-          })) nestedModule = true;
-    }
-    if (nestedModule) continue;
-    // A branch containing multiple owner sections has no bounded section root.
-    if ([...section.querySelectorAll(headings)].some(other => other !== h &&
-        /^(about|experience)$/i.test(labelText(other)))) continue;
-    const omitted = exclusions(section, h, key === 'experience');
-    if (omitted.has(section)) continue;
-    sectionPaths.push(path(section));
-    if (busy(section, omitted)) continue;
-    fields[key] = text(section, omitted, h);
-    complete[key] = !!fields[key] &&
-      !/^(loading(?:\.{3}|…)?|please wait(?:\.{3}|…)?|show (?:all|more)|see more)$/i.test(fields[key]);
-  }
-  const audienceExcluded = new Set(excluded);
-  audienceExcluded.add(heading);
-  for (const node of headlineNodes) audienceExcluded.add(node);
-  const audience = text(root, audienceExcluded);
-  return {status: 'ready', name, headline, ...fields, audience,
-    topcard: path(root), sections: sectionPaths,
-    complete: Object.values(complete).some(Boolean) &&
-      Object.keys(fields).every(key => !discovered[key] || complete[key]) &&
-      !primary.matches('[aria-busy="true"],[data-loading="true"]')};
+  return {status: 'ready', name, topcard: path(root)};
 }
 """
 
 _MIN_CONTENT_LENGTH = 200
 _MAX_CONTENT_LENGTH = 15000
-_STABILITY_SECONDS = 0.6
+_MAX_PAGE_TEXT = 30000
+_TEXT_STABLE_SECONDS = 1.0
 _POLL_MS = 100
+_MAIN_TEXT_JS = "() => { const m = document.querySelectorAll('main'); return m.length === 1 ? m[0].innerText : ''; }"
 
 
-def _extract(page, expected_url: str, name: str = "") -> dict | None:
+def _extract(page, expected_url: str) -> dict | None:
     try:
-        return page.evaluate(_PROFILE_DOM_JS, {"url": expected_url, "name": name})
+        return page.evaluate(_PROFILE_DOM_JS, {"url": expected_url, "name": ""})
     except Exception:
         # Navigation/detachment cannot establish ownership; retry only reads.
         return None
 
 
-def _snapshot(result: dict, url: str) -> ProfileSnapshot:
+def _snapshot(result: dict | None, url: str) -> ProfileSnapshot | None:
+    if not result or result.get("status") != "ready":
+        return None
     identity = ProfileIdentity(url, urlsplit(url).path.split("/")[2], result["name"])
-    headline, about, experience = (
-        result.get(key, "") for key in ("headline", "about", "experience")
-    )
-    parts = [identity.name]
-    parts.extend(
-        f"{label}:\n{value}"
-        for label, value in (
-            ("Headline", headline),
-            ("About", about),
-            ("Experience", experience),
-        )
-        if value
-    )
-    content = "\n\n".join(parts)
-    ready = (
-        bool(result.get("complete"))
-        and max(len(about), len(experience)) >= 80
-        and len(headline + about + experience) >= _MIN_CONTENT_LENGTH
-    )
-    return ProfileSnapshot(
-        identity,
-        headline,
-        about,
-        experience,
-        result.get("audience", ""),
-        content[:_MAX_CONTENT_LENGTH] if ready else "",
-        result.get("topcard", ""),
-        tuple(result.get("sections", ())),
-        ready,
-    )
+    return ProfileSnapshot(identity, result.get("topcard", ""))
 
 
 def read_profile_snapshot(page, expected_url: str) -> ProfileSnapshot | None:
     """Take one synchronous DOM snapshot; no navigation, scrolling, or sleeps."""
     url = canonical_profile_url(expected_url)
-    if not url:
-        return None
-    result = _extract(page, url)
-    return (
-        _snapshot(result, url) if result and result.get("status") == "ready" else None
-    )
+    return _snapshot(_extract(page, url), url) if url else None
 
 
 def _skip(reason: str) -> NoReturn:
     raise TaskSkippedException(reason, cooldown_eligible=False)
 
 
-def wait_for_profile(
-    page, expected_url: str, *, personalize: bool = True, timeout_ms: int = 8000
-) -> ProfileSnapshot:
-    """Wait for verified identity and stable, explicitly loaded owned sections.
-
-    Absent sections are optional; discovered empty/busy sections must hydrate.
-    Headline-only and thin profiles exhaust the wait with content unavailable.
-    A section not represented in the DOM cannot be predicted before it arrives.
-    """
+def wait_for_profile(page, expected_url: str, *, timeout_ms: int = 8000) -> ProfileSnapshot:
+    """Wait (bounded) until the target's owner top card is verified."""
     url = canonical_profile_url(expected_url)
     if not url:
         _skip("profile_identity_mismatch")
     deadline = time.monotonic() + max(0, timeout_ms) / 1000
-    identity = None
-    stable_since = None
-    previous = None
-    scrolled = set()
     while True:
-        result = _extract(page, url, identity.name if identity else "")
+        result = _extract(page, url)
         if result and result.get("status") == "mismatch":
             _skip("profile_identity_mismatch")
-        snapshot = (
-            _snapshot(result, url)
-            if result and result.get("status") == "ready"
-            else None
-        )
-        now = time.monotonic()
+        snapshot = _snapshot(result, url)
         if snapshot:
-            identity = snapshot.identity
-            if not personalize:
-                return snapshot
-            state = (
-                snapshot.identity,
-                snapshot.headline,
-                snapshot.about,
-                snapshot.experience,
-                snapshot._content_ready,
-            )
-            if snapshot._content_ready:
-                if state != previous:
-                    stable_since = now
-                elif (
-                    stable_since is not None
-                    and now - stable_since >= _STABILITY_SECONDS
-                ):
-                    return snapshot
-            else:
-                stable_since = None
-            previous = state
-            # Trigger only already identified owner sections, never the window
-            # or recommendation branches. DOM extraction itself stays read-only.
-            for selector in snapshot._section_selectors:
-                if (
-                    not snapshot._content_ready
-                    and selector not in scrolled
-                    and now < deadline
-                ):
-                    scrolled.add(selector)
-                    try:
-                        page.locator(selector).scroll_into_view_if_needed(
-                            timeout=max(1, min(250, int((deadline - now) * 1000)))
-                        )
-                    except Exception:
-                        # Detached sections are re-read on the next iteration.
-                        pass
-        else:
-            previous = None
-            stable_since = None
+            return snapshot
+        now = time.monotonic()
         if now >= deadline:
-            if snapshot:
-                return replace(snapshot, content="", _content_ready=False)
-            _skip("profile_identity_mismatch" if identity else "profile_not_ready")
+            _skip("profile_not_ready")
         page.wait_for_timeout(min(_POLL_MS, max(1, int((deadline - now) * 1000))))
+
+
+def wait_for_profile_text(page, *, timeout_ms: int = 8000) -> str:
+    """Return the single <main>'s rendered text once it stops changing (bounded)."""
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000
+    last, since = "", time.monotonic()
+    while True:
+        try:
+            text = page.evaluate(_MAIN_TEXT_JS) or ""
+        except Exception:
+            text = ""
+        now = time.monotonic()
+        if text != last:
+            last, since = text, now
+        elif text and now - since >= _TEXT_STABLE_SECONDS:
+            break
+        if now >= deadline:
+            break
+        page.wait_for_timeout(_POLL_MS)
+    return last[:_MAX_PAGE_TEXT]
+
+
+def _clean(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def verify_profile_details(page_text: str, parsed) -> ProfileDetails | None:
+    """Keep only LLM values whose every line appears verbatim in the page text.
+
+    The LLM chooses which text belongs to the owner; this guard ensures it can
+    never contribute words, employers, or counts that are not on the page.
+    """
+    if not isinstance(parsed, dict):
+        return None
+    haystack = _clean(page_text)
+
+    def verified(value) -> str:
+        if not isinstance(value, str):
+            return ""
+        lines = [_clean(line) for line in value.splitlines() if _clean(line)]
+        return "\n".join(lines) if lines and all(line in haystack for line in lines) else ""
+
+    return ProfileDetails(
+        *(verified(parsed.get(key)) for key in ("headline", "about", "experience", "followers_text", "connections_text"))
+    )
 
 
 def assert_profile_identity(page, identity: ProfileIdentity) -> ProfileSnapshot:

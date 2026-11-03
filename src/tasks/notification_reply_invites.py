@@ -312,7 +312,7 @@ class NotificationReplyInviteScanner(BaseTask):
 
     def _get_connection_state(self, profile_url: str) -> ConnectionState:
         self.page.goto(profile_url, timeout=60000, wait_until="domcontentloaded")
-        snapshot = wait_for_profile(self.page, profile_url, personalize=False)
+        snapshot = wait_for_profile(self.page, profile_url)
         return detect_connection_state(self.page, snapshot.identity)
 
     def _find_existing_invite_task(

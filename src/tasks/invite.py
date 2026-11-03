@@ -13,7 +13,7 @@ from playwright.sync_api import Locator
 
 from .base import BaseTask
 from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
-from llm import generate_connection_message, get_next_connect_action
+from llm import generate_connection_message, get_next_connect_action, parse_profile
 from notifications import escape_html_text, send_notification
 from connection_state import detect_connection_state, ConnectionState
 from connect_heuristics import (
@@ -33,11 +33,14 @@ from invite_modal import (
     require_invite_dialog,
 )
 from linkedin_profile import (
+    ProfileDetails,
     ProfileIdentity,
     assert_profile_identity,
     canonical_profile_url,
     get_profile_topcard,
+    verify_profile_details,
     wait_for_profile,
+    wait_for_profile_text,
 )
 
 logger = logging.getLogger(__name__)
@@ -47,11 +50,10 @@ INVITE_HISTORY_RETENTION_DAYS = 30
 WEEKLY_LIMIT_CONFIRMATION_WINDOW = timedelta(minutes=15)
 MAX_INVITE_MESSAGE_LENGTH = 200
 
-# Audience thresholds apply only to the verified prospect's top card.
+# Audience thresholds apply only to the verified owner's own count phrases.
 AUDIENCE_FILTER_MIN_FOLLOWERS_ENV = "INVITE_MIN_FOLLOWERS"
 AUDIENCE_FILTER_REQUIRE_500_CONNECTIONS_ENV = "INVITE_REQUIRE_500_CONNECTIONS"
 AUDIENCE_STATS_TOPCARD_SLICE = 3000
-AUDIENCE_STATS_MAX_ATTEMPTS = 4
 CONNECTIONS_DISPLAY_CAP = 500
 
 # A stats line consists ONLY of counts + keywords + separators ("3,348
@@ -66,8 +68,8 @@ _STAT_LINE_LEFTOVER_RE = re.compile(r"[\s\u00b7\u2022|+\-]*")
 _BARE_COUNT_LINE_RE = re.compile(r"(\d[\d.,]*)\s*([KkMm]?)\s*(\+)?")
 _KEYWORD_LINE_RE = re.compile(r"(followers|connections?)", re.IGNORECASE)
 
-# Boundary markers for the audience-count parser only. Personalization uses
-# positively identified owner sections in linkedin_profile, never this denylist.
+# Boundary markers for the audience-count parser only. Personalization uses the
+# verified LLM profile parse, never this denylist.
 PROFILE_FOREIGN_MODULE_HEADINGS = [
     "more profiles for you",
     "people also viewed",
@@ -660,7 +662,9 @@ class InviteTask(BaseTask):
 
         return False
 
-    def _enforce_audience_filter(self, url: str) -> Optional[dict]:
+    def _enforce_audience_filter(
+        self, url: str, details: Optional[ProfileDetails]
+    ) -> Optional[dict]:
         """Skip the invite when the profile fails the configured audience filter.
 
         Runs at visit time on every invite — a queued DB task for a person who
@@ -671,19 +675,12 @@ class InviteTask(BaseTask):
         if min_followers <= 0 and not require_500_connections:
             return None
 
-        identity = self._require_target_identity()
-        stats = {"followers": None, "connections": None, "connections_capped": False}
-        for attempt in range(AUDIENCE_STATS_MAX_ATTEMPTS):
-            snapshot = assert_profile_identity(self.page, identity)
-            stats = parse_audience_stats(snapshot.audience_text)
-            has_needed_stats = (
-                min_followers <= 0 or stats["followers"] is not None
-            ) and (not require_500_connections or stats["connections"] is not None)
-            if has_needed_stats:
-                break
-            if attempt + 1 < AUDIENCE_STATS_MAX_ATTEMPTS:
-                self.human.random_sleep(0.7, 1.1)
-
+        stats = parse_audience_stats(
+            f"{details.followers_text}\n{details.connections_text}"
+        )
+        has_needed_stats = (
+            min_followers <= 0 or stats["followers"] is not None
+        ) and (not require_500_connections or stats["connections"] is not None)
         if not has_needed_stats:
             logger.info("Required audience counts unavailable for %s", url)
             raise TaskSkippedException(
@@ -706,15 +703,38 @@ class InviteTask(BaseTask):
         )
         return stats
 
-    def _read_preflight_profile(self, url: str, *, personalize: bool):
+    def _read_preflight_profile(self, url: str):
         try:
-            return wait_for_profile(self.page, url, personalize=personalize)
+            return wait_for_profile(self.page, url)
         except TaskSkippedException as exc:
             if exc.reason == "profile_not_ready":
                 raise TaskSkippedException(
                     exc.reason, cooldown_eligible=False, retryable_preflight=True
                 ) from exc
             raise
+
+    def _read_profile_details(self, identity: ProfileIdentity) -> ProfileDetails:
+        """LLM-parse the verified owner's fields from the settled page text."""
+        page_text = wait_for_profile_text(self.page)
+        assert_profile_identity(self.page, identity)
+        details = verify_profile_details(
+            page_text, parse_profile(page_text, identity.name, identity.url)
+        )
+        if details is None:
+            logger.warning("Profile parse unavailable for %s", identity.url)
+            raise TaskSkippedException(
+                "profile_not_ready", cooldown_eligible=False, retryable_preflight=True
+            )
+        logger.info(
+            "Parsed profile %s (headline=%d, about=%d, experience=%d characters, followers=%r, connections=%r)",
+            identity.url,
+            len(details.headline),
+            len(details.about),
+            len(details.experience),
+            details.followers_text,
+            details.connections_text,
+        )
+        return details
 
     def _require_target_identity(self) -> ProfileIdentity:
         identity = self._target_identity
@@ -1025,7 +1045,7 @@ class InviteTask(BaseTask):
         ) is not None:
             return ConnectionState.UNKNOWN
         self.page.goto(identity.url, timeout=60000, wait_until="domcontentloaded")
-        refreshed = wait_for_profile(self.page, identity.url, personalize=False)
+        refreshed = wait_for_profile(self.page, identity.url)
         if refreshed.identity != identity:
             raise TaskSkippedException(
                 "profile_identity_mismatch", cooldown_eligible=False
@@ -1295,7 +1315,7 @@ class InviteTask(BaseTask):
         logger.info("Sending connection request to %s", url)
         self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
         self.validate_session()
-        snapshot = self._read_preflight_profile(url, personalize=False)
+        snapshot = self._read_preflight_profile(url)
         identity = snapshot.identity
         self._target_identity = identity
         state = detect_connection_state(self.page, identity)
@@ -1304,30 +1324,23 @@ class InviteTask(BaseTask):
         if state == ConnectionState.CONNECTED:
             raise TaskSkippedException("already_connected", cooldown_eligible=False)
 
-        self._last_audience_stats = self._enforce_audience_filter(url)
+        min_followers, require_500_connections = get_invite_audience_filter()
+        details = (
+            self._read_profile_details(identity)
+            if try_personal_message or min_followers > 0 or require_500_connections
+            else None
+        )
+        self._last_audience_stats = self._enforce_audience_filter(url, details)
         connection_message = None
         if try_personal_message:
-            snapshot = self._read_preflight_profile(url, personalize=True)
-            if snapshot.identity != identity:
-                raise TaskSkippedException(
-                    "profile_identity_mismatch", cooldown_eligible=False
-                )
-            if not snapshot.content.strip():
+            content = details.content(identity.name)
+            if not content:
                 raise TaskSkippedException(
                     "profile_not_ready",
                     cooldown_eligible=False,
                     retryable_preflight=True,
                 )
-            logger.info(
-                "Owned profile ready for %s (headline=%d, about=%d, experience=%d characters)",
-                identity.url,
-                len(snapshot.headline),
-                len(snapshot.about),
-                len(snapshot.experience),
-            )
-            connection_message = generate_connection_message(
-                snapshot.content, identity.name
-            )
+            connection_message = generate_connection_message(content, identity.name)
             if (
                 not isinstance(connection_message, str)
                 or not connection_message.strip()

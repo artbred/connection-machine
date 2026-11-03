@@ -44,6 +44,14 @@ PROFILE = f"""
 <a href="/in/stranger/">Alex Stranger</a><p>Satellite propulsion at Moonshot Labs</p></div>
 </main>
 """
+# What the profile-parse LLM returns for PROFILE: verbatim owner fields only.
+PARSED = {
+    "headline": "Data engineer at Orchard Analytics",
+    "about": ABOUT,
+    "experience": "",
+    "followers_text": "5,000 followers",
+    "connections_text": "500+ connections",
+}
 DIALOG = """
 <div role="dialog" id="invite-dialog">
   <h2>Invite Jane Prospect to connect</h2>
@@ -168,15 +176,16 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         )
         environment_patch.start()
         self.addCleanup(environment_patch.stop)
+        parse_patch = patch.object(invite, "parse_profile", return_value=dict(PARSED))
+        self.parse_profile = parse_patch.start()
+        self.addCleanup(parse_patch.stop)
 
     def make_task(self, html):
         self.load_html(html, TARGET)
         task = invite.InviteTask(self.page)
         task.human = BrowserActions(self.page)
         task.invite_state = InviteStateStore(self.state_path)
-        task._target_identity = wait_for_profile(
-            self.page, TARGET, personalize=False
-        ).identity
+        task._target_identity = wait_for_profile(self.page, TARGET).identity
         return task
 
     def sent_records(self):
@@ -384,16 +393,17 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
                 self.assertEqual(self.page.locator("textarea").input_value(), "")
                 self.assert_nothing_sent()
 
-    def test_complete_flow_personalizes_only_owned_sections(self):
+    def test_complete_flow_personalizes_only_verified_owner_fields(self):
         task = self.make_task(fixture(already_open=False))
+        # An invented line is not on the page, so its whole field is dropped.
+        self.parse_profile.return_value = dict(PARSED, experience="Former astronaut at NASA")
 
         def generate(content, name):
             self.assertEqual(name, "Jane Prospect")
             self.assertEqual(self.page.locator("#invite-dialog").count(), 0)
             self.assertEqual(self.page.locator("#connect").inner_text(), "Connect")
             self.assertIn("inventory systems", content)
-            self.assertNotIn("Moonshot", content)
-            self.assertNotIn("Alex Stranger", content)
+            self.assertNotIn("NASA", content)
             return NOTE
 
         with patch.object(
@@ -402,6 +412,9 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             result = task.send_connection_request(TARGET)
         self.assertEqual(result, {"status": "pending", "message": NOTE})
         generator.assert_called_once()
+        page_text, name, url = self.parse_profile.call_args.args
+        self.assertIn(ABOUT, page_text)
+        self.assertEqual((name, url), ("Jane Prospect", TARGET))
         self.assertEqual(
             self.sent_records(),
             [{"name": "Invite Jane Prospect to connect", "note": NOTE}],
@@ -413,18 +426,9 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         )
 
     def test_missing_owned_content_stops_before_connect(self):
-        html = fixture(already_open=False).replace(ABOUT, "").replace(
-            "Data engineer at Orchard Analytics", ""
-        )
-        task = self.make_task(html)
+        task = self.make_task(fixture(already_open=False))
+        self.parse_profile.return_value = dict(PARSED, headline="", about="")
         with (
-            patch.object(
-                invite,
-                "wait_for_profile",
-                side_effect=lambda page, url, **kwargs: wait_for_profile(
-                    page, url, timeout_ms=200, **kwargs
-                ),
-            ),
             patch.object(invite, "generate_connection_message") as generator,
             patch.object(invite, "try_heuristic_connect") as connect,
             patch.object(invite, "get_cached_connect_button") as cached,

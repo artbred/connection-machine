@@ -1,18 +1,19 @@
 """Canonical identity and bounded profile hydration behavior, without live access."""
 
-import time
 import unittest
 from dataclasses import FrozenInstanceError
 
 from tests.browser_case import OfflineBrowserTestCase
 from exceptions import TaskSkippedException
 from linkedin_profile import (
+    ProfileDetails,
     ProfileIdentity,
     assert_profile_identity,
     canonical_profile_url,
     get_profile_topcard,
     is_profile_owned_element,
     read_profile_snapshot,
+    verify_profile_details,
     wait_for_profile,
 )
 
@@ -35,34 +36,6 @@ TOPCARD = f"""<section class="pv-top-card">
 <button id="connect">Connect</button></section>"""
 SECTIONS = f"""<section id="about"><h2>About</h2><p>{ABOUT}</p></section>
 <section id="experience"><h2>Experience</h2><p>{EXPERIENCE}</p></section>"""
-SDUI_EXPERIENCE = """<div componentkey="com.linkedin.sdui.profile.card.refTARGETExperienceTopLevelSection">
-  <div data-display-contents="true"><section>
-    <div>
-      <div data-display-contents="true">
-        <div componentkey="Profile_Top_Level_ExperienceTopLevelSectionjane-prospect"></div>
-      </div>
-      <div data-display-contents="true"><div>
-      <div><h2 componentkey="ProfileNullStateCardAnchor_Experience">Experience</h2></div>
-      <div data-component-type="LazyColumn">
-        <div componentkey="entity-collection-item-first"><div>
-          <a href="https://www.linkedin.com/company/orchard/"><div>
-            <div><p>Staff Engineer</p><p>Orchard Analytics · Full-time</p></div>
-            <p>Jun 2011 - Present · 15 yrs 5 mos</p>
-            <p>Bengaluru, Karnataka, India</p>
-          </div></a>
-          <div><p><span>Leading reliable inventory ingestion and analytics platforms.</span></p></div>
-        </div></div>
-        <div componentkey="entity-collection-item-second"><div>
-          <a href="https://www.linkedin.com/company/previous/"><div>
-            <div><p>Senior Engineer</p><p>Previous Systems · Full-time</p></div>
-            <p>Jan 2007 - May 2011 · 4 yrs 5 mos</p>
-          </div></a>
-        </div></div>
-      </div>
-      </div></div>
-    </div>
-  </section></div>
-</div>"""
 
 
 def profile_html(sections=SECTIONS, topcard=TOPCARD, extra=""):
@@ -157,7 +130,7 @@ class ProfileIdentityBrowserTests(OfflineBrowserTestCase):
 
     def test_identity_and_topcard_are_verified(self):
         self.load_html(profile_html())
-        snapshot = wait_for_profile(self.page, URL, personalize=False)
+        snapshot = wait_for_profile(self.page, URL)
         self.assertEqual(
             snapshot.identity, ProfileIdentity(URL, "jane-prospect", "Jane Prospect")
         )
@@ -224,7 +197,7 @@ class ProfileIdentityBrowserTests(OfflineBrowserTestCase):
 
     def test_name_change_invalidates_previously_verified_identity(self):
         self.load_html(profile_html())
-        identity = wait_for_profile(self.page, URL, personalize=False).identity
+        identity = wait_for_profile(self.page, URL).identity
         self.page.locator("h1").evaluate("el => el.textContent = 'Other Person'")
         with self.assertRaises(TaskSkippedException) as raised:
             assert_profile_identity(self.page, identity)
@@ -232,7 +205,7 @@ class ProfileIdentityBrowserTests(OfflineBrowserTestCase):
 
     def test_invitation_overlay_does_not_erase_underlying_identity(self):
         self.load_html(profile_html())
-        identity = wait_for_profile(self.page, URL, personalize=False).identity
+        identity = wait_for_profile(self.page, URL).identity
         self.page.evaluate("""() => {
           document.querySelector('main').setAttribute('aria-hidden', 'true');
           document.querySelector('main').setAttribute('inert', '');
@@ -256,16 +229,12 @@ class ProfileIdentityBrowserTests(OfflineBrowserTestCase):
 
 
 class SduiProfileBrowserTests(OfflineBrowserTestCase):
-    def test_nested_layout_preserves_identity_owned_content_and_actions(self):
+    def test_nested_layout_preserves_identity_and_owned_actions(self):
         self.load_html(sdui_profile_html())
         snapshot = wait_for_profile(self.page, URL, timeout_ms=1200)
         self.assertEqual(
             snapshot.identity, ProfileIdentity(URL, "jane-prospect", "Jane Prospect")
         )
-        self.assertEqual(snapshot.about, ABOUT)
-        self.assertEqual(snapshot.headline, "Building data platforms at Orchard Analytics")
-        self.assertNotIn("shared post", snapshot.content)
-        self.assertNotIn("Mutual Person", snapshot.content)
         self.assertEqual(
             get_profile_topcard(self.page, snapshot.identity).get_attribute("id"),
             "target-card",
@@ -280,150 +249,6 @@ class SduiProfileBrowserTests(OfflineBrowserTestCase):
                 self.page.locator("#foreign-connect"), self.page, snapshot.identity
             )
         )
-        self.assertIn("5,000 followers", snapshot.audience_text)
-        self.assertIn("500+", snapshot.audience_text)
-
-    def test_observed_experience_top_level_section_supplies_personalization(self):
-        short_about = (
-            "I build reliable platforms with experienced data engineering teams "
-            "across industries."
-        )
-        self.load_html(sdui_profile_html(SDUI_EXPERIENCE).replace(ABOUT, short_about))
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=1200)
-        self.assertEqual(snapshot.about, short_about)
-        self.assertEqual(snapshot.headline, "Building data platforms at Orchard Analytics")
-        self.assertIn("Staff Engineer", snapshot.experience)
-        self.assertIn("Orchard Analytics · Full-time", snapshot.experience)
-        self.assertIn("Previous Systems · Full-time", snapshot.experience)
-        self.assertIn("Experience:", snapshot.content)
-        self.assertNotIn("Example University", snapshot.content)
-        self.assertNotIn("shared post", snapshot.content)
-        self.assertNotIn("Mutual Person", snapshot.content)
-
-    def test_both_exact_owned_experience_suffixes_remain_supported(self):
-        for suffix in ("Experience", "ExperienceTopLevelSection"):
-            with self.subTest(suffix=suffix):
-                self.load_html(
-                    sdui_profile_html(
-                        SDUI_EXPERIENCE.replace("refTARGETExperienceTopLevelSection", "refTARGET" + suffix)
-                    )
-                )
-                snapshot = read_profile_snapshot(self.page, URL)
-                self.assertIn("Staff Engineer", snapshot.experience)
-                self.assertTrue(snapshot.content)
-
-    def test_foreign_owner_and_near_match_experience_keys_are_not_owned(self):
-        for key in (
-            "refOTHERExperienceTopLevelSection",
-            "refTARGET-extraExperienceTopLevelSection",
-            "refTARGETExperienceTopLevelSection-extra",
-        ):
-            with self.subTest(key=key):
-                self.load_html(
-                    sdui_profile_html(
-                        SDUI_EXPERIENCE.replace("refTARGETExperienceTopLevelSection", key)
-                    )
-                )
-                snapshot = read_profile_snapshot(self.page, URL)
-                self.assertEqual(snapshot.experience, "")
-                self.assertEqual(snapshot.content, "")
-
-    def test_experience_in_different_lazy_column_is_not_owned(self):
-        experience = f'<div data-component-type="LazyColumn">{SDUI_EXPERIENCE}</div>'
-        self.load_html(sdui_profile_html(experience))
-        snapshot = read_profile_snapshot(self.page, URL)
-        self.assertEqual(snapshot.experience, "")
-        self.assertEqual(snapshot.content, "")
-
-    def test_boxless_experience_wrappers_preserve_visibility_and_exclusions(self):
-        extra = """
-          <div data-display-contents="true">
-            <span data-display-contents="true">Visible boxless role description</span>
-            <p style="display:none">Hidden role details</p>
-            <div style="display:none"><span data-display-contents="true">Hidden direct text</span></div>
-            <span data-display-contents="true" style="visibility:hidden">Invisible direct text</span>
-            <div style="visibility:hidden"><span data-display-contents="true">Invisible ancestor text</span></div>
-            <button>Button marketing prose</button>
-            <div role="button">Action marketing prose</div>
-            <aside><p>Sidebar marketing prose</p></aside>
-            <section><h3>Recommended person</h3>
-              <a href="/in/foreign/">Foreign Person</a><p>Foreign marketing prose</p>
-            </section>
-          </div>
-        """
-        self.load_html(
-            sdui_profile_html(SDUI_EXPERIENCE.replace("</section>", extra + "</section>"))
-        )
-        snapshot = read_profile_snapshot(self.page, URL)
-        self.assertIn("Staff Engineer", snapshot.experience)
-        self.assertIn("Visible boxless role description", snapshot.experience)
-        self.assertNotIn("Hidden", snapshot.experience)
-        self.assertNotIn("Invisible", snapshot.experience)
-        self.assertNotIn("marketing", snapshot.experience)
-        self.assertNotIn("Foreign", snapshot.experience)
-
-    def test_boxless_loading_wrapper_requires_rendered_owned_content(self):
-        for hidden_style in ("", "display:none", "visibility:hidden"):
-            with self.subTest(hidden_style=hidden_style):
-                loading = (
-                    f'<div style="{hidden_style}"><div data-display-contents="true" aria-busy="true">'
-                    "<p>Loading role details</p></div></div>"
-                )
-                self.load_html(
-                    sdui_profile_html(SDUI_EXPERIENCE.replace("</section>", loading + "</section>"))
-                )
-                snapshot = read_profile_snapshot(self.page, URL)
-                if hidden_style:
-                    self.assertIn("Staff Engineer", snapshot.content)
-                    self.assertNotIn("Loading role details", snapshot.experience)
-                else:
-                    self.assertEqual(snapshot.experience, "")
-                    self.assertEqual(snapshot.content, "")
-
-    def test_experience_does_not_borrow_recommendation_prose(self):
-        experience = SDUI_EXPERIENCE.replace(
-            "</section>",
-            '<section><h3>People you may know</h3><a href="/in/foreign/">'
-            "Foreign Person</a><p>Foreign aerospace executive biography</p></section></section>",
-        )
-        self.load_html(sdui_profile_html(experience))
-        snapshot = read_profile_snapshot(self.page, URL)
-        self.assertIn("Staff Engineer", snapshot.content)
-        self.assertNotIn("Foreign", snapshot.content)
-        self.assertNotIn("aerospace", snapshot.experience)
-
-    def test_duplicate_foreign_experience_card_cannot_contaminate_owned_text(self):
-        foreign = SDUI_EXPERIENCE.replace("refTARGET", "refOTHER").replace(
-            "Staff Engineer", "Foreign Executive"
-        )
-        self.load_html(sdui_profile_html(SDUI_EXPERIENCE + foreign))
-        snapshot = read_profile_snapshot(self.page, URL)
-        self.assertEqual(snapshot.experience, "")
-        self.assertEqual(snapshot.content, "")
-
-    def test_headline_does_not_scan_adjacent_or_recommendation_text(self):
-        for replacement in (
-            "<div><p>Adjacent aerospace biography</p></div>",
-            '<section><h3>Recommended person</h3><p>Adjacent aerospace biography</p></section>',
-            '<p><a href="/in/foreign/">Adjacent aerospace biography</a></p>',
-        ):
-            with self.subTest(replacement=replacement):
-                html = sdui_profile_html().replace(
-                    "<p>Building data platforms at Orchard Analytics</p>",
-                    replacement,
-                )
-                self.load_html(html)
-                snapshot = read_profile_snapshot(self.page, URL)
-                self.assertEqual(snapshot.headline, "")
-                self.assertNotIn("aerospace", snapshot.content)
-
-    def test_headline_requires_a_bounded_name_and_degree_row(self):
-        html = sdui_profile_html().replace(
-            "<p>· 2nd</p>", "<p>Someone else's unbounded biography</p>"
-        )
-        self.load_html(html)
-        snapshot = read_profile_snapshot(self.page, URL)
-        self.assertEqual(snapshot.headline, "")
 
     def test_card_marker_alone_does_not_prove_recipient(self):
         self.load_html(sdui_profile_html().replace(f'href="{URL}', 'href="/unknown/'))
@@ -439,15 +264,6 @@ class SduiProfileBrowserTests(OfflineBrowserTestCase):
             wait_for_profile(self.page, URL, timeout_ms=200)
         self.assertEqual(raised.exception.reason, "profile_identity_mismatch")
 
-    def test_foreign_keyed_about_is_not_owned(self):
-        self.load_html(
-            sdui_profile_html().replace("card.refTARGETAbout", "card.refOTHERAbout")
-        )
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=200)
-        self.assertEqual(snapshot.identity.name, "Jane Prospect")
-        self.assertEqual(snapshot.about, "")
-        self.assertEqual(snapshot.content, "")
-
     def test_topcard_inside_recommendation_module_is_not_primary(self):
         self.load_html(
             sdui_profile_html().replace(
@@ -458,124 +274,37 @@ class SduiProfileBrowserTests(OfflineBrowserTestCase):
             wait_for_profile(self.page, URL, timeout_ms=200)
         self.assertEqual(raised.exception.reason, "profile_not_ready")
 
-    def test_about_inside_foreign_module_is_not_owned(self):
-        html = sdui_profile_html().replace(
-            '<div componentkey="profileCardsAboveActivity">',
-            '<div componentkey="profileCardsAboveActivity"><h2>Other Person</h2>',
+    def test_topcard_in_unkeyed_column_wrapper_is_verified(self):
+        # Observed 2026-11-03: LinkedIn wraps each LazyColumn item in a plain div.
+        self.load_html(sdui_profile_html())
+        self.page.evaluate("""() => {
+          const card = document.querySelector('[componentkey$="Topcard"]');
+          const wrapper = document.createElement('div');
+          card.replaceWith(wrapper);
+          wrapper.append(card);
+        }""")
+        snapshot = wait_for_profile(self.page, URL, timeout_ms=1200)
+        self.assertEqual(snapshot.identity.name, "Jane Prospect")
+        self.assertTrue(
+            is_profile_owned_element(
+                self.page.locator("#target-connect"), self.page, snapshot.identity
+            )
         )
-        self.load_html(html)
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=200)
-        self.assertEqual(snapshot.about, "")
-        self.assertEqual(snapshot.content, "")
+
+    def test_wrapper_shared_with_another_module_does_not_join_the_column(self):
+        self.load_html(sdui_profile_html())
+        self.page.evaluate("""() => {
+          const card = document.querySelector('[componentkey$="Topcard"]');
+          const wrapper = document.createElement('div');
+          card.replaceWith(wrapper);
+          wrapper.append(card, Object.assign(document.createElement('p'), {textContent: 'Promoted'}));
+        }""")
+        with self.assertRaises(TaskSkippedException) as raised:
+            wait_for_profile(self.page, URL, timeout_ms=200)
+        self.assertEqual(raised.exception.reason, "profile_not_ready")
 
 
 class ProfileReadinessBrowserTests(OfflineBrowserTestCase):
-    def test_five_second_delayed_about_is_not_preempted_by_stable_page_size(self):
-        script = f"""<script>setTimeout(() => {{
-          const section = document.createElement('section'); section.id = 'about';
-          section.innerHTML = '<h2>About</h2><p>{ABOUT}</p>';
-          document.querySelector('main').append(section);
-        }}, 5000);</script>"""
-        self.load_html(profile_html(sections="") + script)
-        started = time.monotonic()
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=7500)
-        self.assertGreaterEqual(time.monotonic() - started, 4.8)
-        self.assertIn(ABOUT, snapshot.content)
-
-    def test_experience_arriving_after_about_is_required(self):
-        sections = (
-            f'<section id="about"><h2>About</h2><p>{ABOUT}</p></section>'
-            + '<section id="experience"><h2>Experience</h2></section>'
-        )
-        self.load_html(
-            profile_html(sections=sections)
-            + f"""<script>setTimeout(() => {{
-                         document.getElementById('experience').innerHTML = '<h2>Experience</h2><p>{EXPERIENCE}</p>';
-                       }}, 700);</script>"""
-        )
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=2200)
-        self.assertIn(EXPERIENCE, snapshot.content)
-
-    def test_same_length_replacements_reset_content_stability(self):
-        old = "A" * 220
-        new = "B" * 220
-        self.load_html(
-            profile_html(
-                sections=f'<section><h2>About</h2><p id="changing">{old}</p></section>'
-                + f"<section><h2>Experience</h2><p>{EXPERIENCE}</p></section>"
-            )
-            + f"<script>setTimeout(() => document.getElementById('changing').textContent = '{new}', 350);</script>"
-        )
-        started = time.monotonic()
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=1800)
-        self.assertGreaterEqual(time.monotonic() - started, 0.85)
-        self.assertIn(new, snapshot.content)
-        self.assertNotIn(old, snapshot.content)
-
-    def test_busy_sections_wait_for_real_loaded_content(self):
-        sections = SECTIONS.replace('id="about"', 'id="about" aria-busy="true"')
-        self.load_html(
-            profile_html(sections=sections)
-            + "<script>setTimeout(() => document.getElementById('about').removeAttribute('aria-busy'), 500);</script>"
-        )
-        started = time.monotonic()
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=2000)
-        self.assertGreaterEqual(time.monotonic() - started, 0.95)
-        self.assertIn(ABOUT, snapshot.content)
-
-    def test_skeleton_sections_are_never_personalized(self):
-        self.load_html(
-            profile_html(
-                sections=SECTIONS.replace('id="about"', 'id="about" class="skeleton"')
-            )
-        )
-        snapshot = wait_for_profile(self.page, URL, timeout_ms=250)
-        self.assertEqual(snapshot.content, "")
-        self.assertEqual(snapshot.identity.name, "Jane Prospect")
-
-    def test_missing_empty_or_thin_sections_leave_content_unavailable(self):
-        for sections in (
-            "",
-            "<section><h2>About</h2></section><section><h2>Experience</h2></section>",
-            "<section><h2>About</h2><p>Hi</p></section><section><h2>Experience</h2><p>Engineer</p></section>",
-            f"<section><h2>About</h2><p>{ABOUT}</p></section><section><h2>Experience</h2><p>Loading…</p></section>",
-        ):
-            with self.subTest(sections=sections):
-                self.load_html(profile_html(sections=sections))
-                snapshot = wait_for_profile(self.page, URL, timeout_ms=200)
-                self.assertEqual(snapshot.content, "")
-                self.assertEqual(snapshot.identity.name, "Jane Prospect")
-
-    def test_about_only_and_experience_only_can_personalize(self):
-        for title, value in (("About", ABOUT), ("Experience", EXPERIENCE)):
-            with self.subTest(title=title):
-                self.load_html(
-                    profile_html(
-                        sections=f"<section><h2>{title}</h2><p>{value}</p></section>"
-                    )
-                )
-                snapshot = wait_for_profile(self.page, URL, timeout_ms=1600)
-                self.assertIn(value, snapshot.content)
-                self.assertEqual(snapshot.identity.name, "Jane Prospect")
-
-    def test_identity_only_does_not_wait_for_content(self):
-        self.load_html(profile_html(sections=""))
-        started = time.monotonic()
-        snapshot = wait_for_profile(self.page, URL, personalize=False, timeout_ms=3000)
-        self.assertLess(time.monotonic() - started, 1)
-        self.assertEqual(snapshot.content, "")
-
-    def test_identity_drift_during_hydration_fails_closed(self):
-        self.load_html(
-            profile_html(sections="")
-            + """<script>setTimeout(() => {
-          document.querySelector('.pv-top-card a').href = '/in/other/';
-        }, 200);</script>"""
-        )
-        with self.assertRaises(TaskSkippedException) as raised:
-            wait_for_profile(self.page, URL, timeout_ms=1200)
-        self.assertEqual(raised.exception.reason, "profile_identity_mismatch")
-
     def test_busy_topcard_has_no_established_identity(self):
         self.load_html(
             profile_html(
@@ -583,8 +312,45 @@ class ProfileReadinessBrowserTests(OfflineBrowserTestCase):
             )
         )
         with self.assertRaises(TaskSkippedException) as raised:
-            wait_for_profile(self.page, URL, personalize=False, timeout_ms=200)
+            wait_for_profile(self.page, URL, timeout_ms=200)
         self.assertEqual(raised.exception.reason, "profile_not_ready")
+
+
+class ProfileDetailsVerificationTests(unittest.TestCase):
+    PAGE = (
+        "Jane Prospect\n· 2nd\nBuilding data platforms\nActivity\n2,312 followers\n"
+        "500+\nconnections\nAbout\n" + ABOUT + "\nExperience\nStaff Engineer\n\n"
+        "Orchard  Analytics · Full-time\nMore profiles for you\nAlex Stranger"
+    )
+
+    def test_keeps_only_fields_found_verbatim_on_the_page(self):
+        details = verify_profile_details(self.PAGE, {
+            "headline": "Building data platforms",
+            "about": ABOUT,
+            "experience": "Staff Engineer\nOrchard Analytics · Full-time",
+            "followers_text": "2,312 followers",
+            "connections_text": "500+ connections",
+        })
+        self.assertEqual(details.experience, "Staff Engineer\nOrchard Analytics · Full-time")
+        self.assertEqual(details.connections_text, "500+ connections")
+        self.assertEqual(details.about, ABOUT)
+
+    def test_invented_or_malformed_values_are_dropped(self):
+        details = verify_profile_details(self.PAGE, {
+            "headline": "Building data platforms at NASA",
+            "about": ABOUT + "\nFormer astronaut",
+            "experience": None,
+            "followers_text": "20,000 followers",
+            "connections_text": "None",
+        })
+        self.assertEqual(details, ProfileDetails())
+        self.assertIsNone(verify_profile_details(self.PAGE, None))
+
+    def test_content_requires_enough_owner_prose(self):
+        self.assertEqual(ProfileDetails(headline="Engineer", about="Hi").content("Jane"), "")
+        content = ProfileDetails(headline="Engineer", about=ABOUT).content("Jane Prospect")
+        self.assertTrue(content.startswith("Jane Prospect\n\nHeadline:\nEngineer"))
+        self.assertIn("About:\n" + ABOUT, content)
 
 
 if __name__ == "__main__":

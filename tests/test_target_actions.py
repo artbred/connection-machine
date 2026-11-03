@@ -42,7 +42,7 @@ class TargetActionBrowserTests(OfflineBrowserTestCase):
 
     def load_profile(self, actions="", **kwargs):
         self.load_html(profile_html(actions, **kwargs))
-        return wait_for_profile(self.page, URL, personalize=False).identity
+        return wait_for_profile(self.page, URL).identity
 
     def assert_action_rejected(self, selector, identity=IDENTITY, **kwargs):
         try:

@@ -18,6 +18,7 @@ MODULE_ENVS = (
     llm.REFINE_TEXT_MODEL_ENV,
     llm.FEED_COMMENT_MODEL_ENV,
     llm.CONNECT_ACTION_MODEL_ENV,
+    llm.PROFILE_PARSE_MODEL_ENV,
 )
 
 CLEARED = {name: "" for name in (llm.LLM_MODEL_ENV,) + MODULE_ENVS}
@@ -138,6 +139,20 @@ class RequestPayloadModelTest(unittest.TestCase):
                 content=action,
             )
         self.assertEqual(model, "vendor/vision")
+
+    def test_profile_parse_uses_its_own_model(self):
+        env = {
+            **CLEARED,
+            "OPENROUTER_API_KEY": "test-key",
+            llm.LLM_MODEL_ENV: "vendor/global",
+            llm.PROFILE_PARSE_MODEL_ENV: "vendor/parser",
+        }
+        with patch.dict(os.environ, env):
+            model = self._capture_model(
+                lambda: llm.parse_profile("Ann Lee", "Ann Lee", "https://www.linkedin.com/in/ann/"),
+                content="{}",
+            )
+        self.assertEqual(model, "vendor/parser")
 
 
 if __name__ == "__main__":
