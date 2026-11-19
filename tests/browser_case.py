@@ -1,8 +1,10 @@
-"""Real Chromium DOM tests with isolated contexts and fixture-only networking."""
+"""Real WebKit DOM tests with isolated contexts and fixture-only networking."""
 
 import sys
 import unittest
 from pathlib import Path
+
+from playwright.sync_api import sync_playwright
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
@@ -13,27 +15,10 @@ class OfflineBrowserTestCase(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
-        try:
-            from patchright.sync_api import sync_playwright
-        except ImportError as exc:
-            raise unittest.SkipTest("patchright is not installed") from exc
-        cls._pw = sync_playwright().start()
-        try:
-            try:
-                cls._browser = cls._pw.chromium.launch(headless=True)
-            except Exception:
-                cls._browser = cls._pw.chromium.launch(headless=True, channel="chrome")
-        except Exception as exc:
-            cls._pw.stop()
-            raise unittest.SkipTest(
-                f"No local Chromium or Chrome available: {exc}"
-            ) from exc
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._browser.close()
-        cls._pw.stop()
-        super().tearDownClass()
+        playwright = sync_playwright().start()
+        cls.addClassCleanup(playwright.stop)
+        cls._browser = playwright.webkit.launch(headless=True)
+        cls.addClassCleanup(cls._browser.close)
 
     def setUp(self):
         super().setUp()

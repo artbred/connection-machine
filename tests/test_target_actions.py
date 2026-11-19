@@ -2,8 +2,8 @@ import os
 import unittest
 from unittest.mock import patch
 
-from patchright.sync_api import Locator as BrowserLocator
-from patchright.sync_api import TimeoutError as BrowserTimeoutError
+from playwright.sync_api import Locator as BrowserLocator
+from playwright.sync_api import TimeoutError as BrowserTimeoutError
 
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 

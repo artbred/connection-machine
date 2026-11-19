@@ -2,7 +2,6 @@ import logging
 import re
 from enum import Enum
 
-from patchright.sync_api import Error as PatchrightError
 from playwright.sync_api import Error as PlaywrightError, Page
 
 from connect_heuristics import (
@@ -72,7 +71,7 @@ def detect_connection_state(page: Page, identity: ProfileIdentity) -> Connection
                 has_connect = True
             elif text == "following" or aria == "following":
                 has_following = True
-        except (PlaywrightError, PatchrightError):
+        except PlaywrightError:
             continue
     badges = scope.locator(
         "[class*='distance-badge'], [class*='dist-value'], "
@@ -93,7 +92,7 @@ def detect_connection_state(page: Page, identity: ProfileIdentity) -> Connection
             }:
                 has_connected_marker = True
                 break
-        except (PlaywrightError, PatchrightError):
+        except PlaywrightError:
             continue
     # Identity drift during reads must not become an apparently benign UNKNOWN.
     assert_profile_identity(page, identity)

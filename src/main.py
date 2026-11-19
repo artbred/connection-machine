@@ -3,13 +3,13 @@ import json
 import logging
 import os
 import signal
-import sys
 import threading
+from contextlib import ExitStack, closing
 
 from datetime import datetime
 
 from dotenv import load_dotenv
-from patchright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
@@ -133,6 +133,11 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LinkedIn task automation")
     debug_group = parser.add_mutually_exclusive_group()
     debug_group.add_argument(
+        "--check-auth",
+        action="store_true",
+        help="Verify the WebKit login and exit without opening the task queue",
+    )
+    debug_group.add_argument(
         "--debug-invite",
         metavar="URL",
         help="Debug mode: send invite to a specific profile URL and exit",
@@ -237,29 +242,51 @@ def run_notification_reply_invite_task(
     NotificationReplyInviteScanner(page).mark_task_status(task_id, "completed")
 
 
-def launch_browser_context(playwright, user_data_dir: str):
-    context_kwargs = {
-        "headless": HEADLESS,
-        "viewport": {"height": 1080, "width": 1920},
-    }
+def authenticate(page, *, retry_delay=5):
+    for attempt in range(6):
+        if shutdown_event.is_set():
+            raise InterruptedError("Worker is shutting down")
+        authenticated = check_linkedin_auth(page)
+        metrics.set_linkedin_authenticated(authenticated)
+        if authenticated:
+            metrics.mark_login_success()
+            return
+        if attempt < 5:
+            metrics.inc_login_attempts()
+            login(page)
+            shutdown_event.wait(retry_delay)
+    raise RuntimeError("Failed to authenticate to LinkedIn after 5 attempts")
 
-    try:
-        return playwright.chromium.launch_persistent_context(
-            user_data_dir,
-            **context_kwargs,
-        )
-    except Exception as exc:
-        if "Executable doesn't exist" not in str(exc):
-            raise
 
-        logger.warning(
-            "Bundled Chromium is unavailable. Falling back to the local Google Chrome channel."
-        )
-        return playwright.chromium.launch_persistent_context(
-            user_data_dir,
-            channel="chrome",
-            **context_kwargs,
-        )
+class BrowserSession:
+    """One WebKit page while busy; no renderer or Playwright driver while idle."""
+
+    def __init__(self, profile_dir):
+        self.profile_dir = profile_dir
+        self._resources = ExitStack()
+        self.page = None
+        self.used = False
+
+    def acquire_page(self, *, log_ip=False):
+        self.used = True
+        if self.page is None:
+            playwright = self._resources.enter_context(sync_playwright())
+            context = playwright.webkit.launch_persistent_context(
+                self.profile_dir,
+                headless=HEADLESS,
+                viewport={"width": 1920, "height": 1080},
+            )
+            self._resources.callback(context.close)
+            page = context.pages[0] if context.pages else context.new_page()
+            if log_ip:
+                check_ip(page)
+            authenticate(page)
+            self.page = page
+        return self.page
+
+    def close(self):
+        self.page = None
+        self._resources.close()
 
 
 def main():
@@ -276,40 +303,14 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        init_db()
-        user_data_dir = os.path.join(os.getcwd(), "data", "connection-machine-chrome")
-        logger.info(f"Using user data dir: {user_data_dir}")
-
-        with sync_playwright() as p:
-            context = launch_browser_context(p, user_data_dir)
-
-            page = context.new_page()
-            check_ip(page)
-
-            is_logged_in = False
-            max_login_attempts = 5
-
-            for _ in range(max_login_attempts):
-                if shutdown_event.is_set():
-                    break
-
-                is_authenticated = check_linkedin_auth(page)
-                metrics.set_linkedin_authenticated(is_authenticated)
-
-                if is_authenticated:
-                    is_logged_in = True
-                    metrics.mark_login_success()
-                    logger.info("Logged in to LinkedIn successfully.")
-                    break
-                else:
-                    logger.info("Logging in to LinkedIn...")
-                    metrics.inc_login_attempts()
-                    login(page)
-                    if shutdown_event.wait(5):
-                        break
-
-            if not is_logged_in:
-                raise Exception("Failed to login to LinkedIn")
+        if not args.check_auth:
+            init_db()
+        profile_dir = os.path.join(os.getcwd(), "data", "connection-machine-webkit")
+        with closing(BrowserSession(profile_dir)) as browser:
+            page = browser.acquire_page(log_ip=True)
+            if args.check_auth:
+                logger.info("Verified LinkedIn authentication in WebKit.")
+                return
 
             # Debug mode: run single invite task and exit
             if args.debug_invite:
@@ -375,7 +376,7 @@ def main():
                     logger.info("Debug notification reply invite completed.")
                 return
 
-            dispatcher = TaskDispatcher(page, metrics=metrics)
+            dispatcher = TaskDispatcher(metrics=metrics, acquire_page=browser.acquire_page)
             logger.info("Task dispatcher initialized.")
             dispatcher.cleanup_zombie_tasks()
             dispatcher.cleanup_db_backed_feed_comment_tasks()
@@ -384,6 +385,7 @@ def main():
             logger.info("Starting task dispatcher loop...")
             while not shutdown_event.is_set():
                 watchdog.heartbeat("dispatcher poll")
+                browser.used = False
                 try:
                     dispatcher.poll()
                 except SessionExpiredException:
@@ -391,47 +393,23 @@ def main():
                     metrics.set_linkedin_authenticated(False)
                     metrics.inc_reauth()
 
-                    re_authenticated = False
-                    for attempt in range(max_login_attempts):
-                        if shutdown_event.is_set():
-                            break
+                    authenticate(browser.acquire_page(), retry_delay=60)
 
-                        metrics.inc_login_attempts()
-                        login(page)
-                        is_authenticated = check_linkedin_auth(page)
-                        metrics.set_linkedin_authenticated(is_authenticated)
-                        if is_authenticated:
-                            logger.info("Re-authentication successful.")
-                            metrics.mark_login_success()
-                            re_authenticated = True
-                            break
-                        else:
-                            logger.error(
-                                f"Re-authentication attempt {attempt + 1}/5 failed."
-                            )
-                            if shutdown_event.wait(60):
-                                break
-
-                    if not re_authenticated:
-                        if shutdown_event.is_set():
-                            break
-                        raise Exception(
-                            "Failed to re-authenticate to LinkedIn after 5 attempts"
-                        )
+                if not browser.used:
+                    browser.close()
 
                 if shutdown_event.wait(10):
                     break
 
-    except KeyboardInterrupt:
-        logger.info("KeyboardInterrupt received.")
-    except Exception as e:
-        logger.error(f"An error occurred: {e}")
+    except (KeyboardInterrupt, InterruptedError):
+        logger.info("Worker interrupted.")
+        if args.check_auth:
+            raise
     finally:
         metrics.set_up(False)
         metrics.shutdown()
         logger.info("Shutdown complete.")
         watchdog.stop()
-        sys.exit(0)
 
 
 if __name__ == "__main__":

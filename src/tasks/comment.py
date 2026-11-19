@@ -855,7 +855,7 @@ class FeedCommentTask(BaseTask):
                 return None
 
             self.page.context.grant_permissions(
-                ["clipboard-read", "clipboard-write"],
+                ["clipboard-read"],
                 origin="https://www.linkedin.com",
             )
 

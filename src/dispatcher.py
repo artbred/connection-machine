@@ -121,16 +121,11 @@ def build_cooldown_notification(
 
 
 class TaskDispatcher:
-    def __init__(self, page, metrics=None):
-        self.page = page
+    def __init__(self, page=None, metrics=None, *, acquire_page=None):
+        self._acquire_page = acquire_page
         self.metrics = metrics or NoopMetrics()
         self.invite_state = InviteStateStore()
-        self.feed_comment_handler = FeedCommentTask(page)
-        self.notification_reply_invite_scanner = NotificationReplyInviteScanner(page)
-        self.handlers = {
-            TaskType.SEND_INVITE: InviteTask(page),
-            TaskType.CREATE_POST: PostTask(page),
-        }
+        self._bind_page(page)
         self.rate_limits = {
             TaskType.SEND_INVITE: 10,
             TaskType.CREATE_POST: 50,
@@ -154,6 +149,21 @@ class TaskDispatcher:
         self._sync_invite_history_metrics()
         self._sync_invite_state_metrics()
         self._sync_notification_reply_invite_metrics()
+
+    def _bind_page(self, page):
+        self.page = page
+        self.feed_comment_handler = FeedCommentTask(page)
+        self.notification_reply_invite_scanner = NotificationReplyInviteScanner(page)
+        self.handlers = {
+            TaskType.SEND_INVITE: InviteTask(page),
+            TaskType.CREATE_POST: PostTask(page),
+        }
+
+    def _prepare_browser_work(self):
+        if self._acquire_page is not None:
+            page = self._acquire_page()
+            if page is not self.page:
+                self._bind_page(page)
 
     def _sync_next_execution_metrics(self):
         now = datetime.utcnow().timestamp()
@@ -681,6 +691,7 @@ class TaskDispatcher:
         if not self.can_run_autonomous_comment():
             return False
 
+        self._prepare_browser_work()
         logger.info("Executing autonomous feed comment action")
         started_at = time.monotonic()
         outcome = "completed"
@@ -761,6 +772,7 @@ class TaskDispatcher:
             and self._last_notification_reply_scan >= self._last_invite_quota_event_at
         ):
             return False
+        self._prepare_browser_work()
         self._last_notification_reply_scan = now
         try:
             self.notification_reply_invite_scanner.run({})
@@ -929,6 +941,9 @@ class TaskDispatcher:
                         self._last_idle_log = now
 
                 return
+
+            # A failed login or interrupted launch must leave an unsent invite pending.
+            self._prepare_browser_work()
 
             # Reset flags when we have work to do
             self._last_idle_log = None

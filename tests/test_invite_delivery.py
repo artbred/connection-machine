@@ -13,8 +13,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
-from patchright.sync_api import Locator as BrowserLocator  # noqa: E402
-from patchright.sync_api import TimeoutError as BrowserTimeoutError  # noqa: E402
+from playwright.sync_api import Locator as BrowserLocator  # noqa: E402
+from playwright.sync_api import TimeoutError as BrowserTimeoutError  # noqa: E402
 
 import connect_heuristics  # noqa: E402
 from exceptions import TaskSkippedException  # noqa: E402
@@ -189,8 +189,6 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         return task
 
     def sent_records(self):
-        # DOM attributes are shared between the page and Patchright's isolated
-        # evaluation world; page-owned window globals are not.
         return json.loads(self.page.locator("body").get_attribute("data-sent"))
 
     def assert_nothing_sent(self):

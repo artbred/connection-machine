@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -17,7 +17,7 @@ os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 import dispatcher as dispatch  # noqa: E402
 from db import Base, Task, TaskStatus, TaskType  # noqa: E402
-from exceptions import TaskSkippedException  # noqa: E402
+from exceptions import SessionExpiredException, TaskSkippedException  # noqa: E402
 from invite_state import InviteStateStore  # noqa: E402
 
 
@@ -42,17 +42,20 @@ class DispatcherSchedulingTests(unittest.TestCase):
         Clock.current = datetime(2030, 1, 1, 12)
         self.state = InviteStateStore(Path(directory.name) / "invite-state.json")
         self.actions = []
+        self.action_pages = []
         self.failures = {}
         self.duration = timedelta(0)
         self.preflight_safe = True
         owner = self
 
         class Handler:
-            def __init__(self, kind):
+            def __init__(self, kind, page):
                 self.kind = kind
+                self.page = page
 
             def run(self, payload):
                 owner.actions.append(self.kind)
+                owner.action_pages.append(self.page)
                 Clock.current += owner.duration
                 reason = owner.failures.get(payload.get("url"))
                 if reason:
@@ -85,16 +88,20 @@ class DispatcherSchedulingTests(unittest.TestCase):
             patch.object(dispatch, "datetime", Clock),
             patch.object(dispatch, "InviteStateStore", return_value=self.state),
             patch.object(
-                dispatch, "InviteTask", side_effect=lambda _: Handler("invite")
+                dispatch, "InviteTask", side_effect=lambda page: Handler("invite", page)
             ),
-            patch.object(dispatch, "PostTask", side_effect=lambda _: Handler("post")),
             patch.object(
-                dispatch, "FeedCommentTask", side_effect=lambda _: Handler("comment")
+                dispatch, "PostTask", side_effect=lambda page: Handler("post", page)
+            ),
+            patch.object(
+                dispatch,
+                "FeedCommentTask",
+                side_effect=lambda page: Handler("comment", page),
             ),
             patch.object(
                 dispatch,
                 "NotificationReplyInviteScanner",
-                side_effect=lambda _: Handler("scan"),
+                side_effect=lambda page: Handler("scan", page),
             ),
             patch.object(
                 dispatch,
@@ -142,6 +149,48 @@ class DispatcherSchedulingTests(unittest.TestCase):
         return self.add_task(
             f"sent-{when.isoformat()}", status=TaskStatus.COMPLETED, completed=when
         )
+
+    def test_only_due_invites_acquire_and_failed_login_leaves_them_pending(self):
+        page = object()
+        observed_status = []
+        due = Clock.current + timedelta(minutes=5)
+        task = self.add_task(not_before=due)
+
+        def acquire():
+            observed_status.append(self.row(task).status)
+            if len(observed_status) == 1:
+                raise SessionExpiredException()
+            return page
+
+        worker = dispatch.TaskDispatcher(acquire_page=acquire)
+        worker.poll()
+        self.assertEqual(observed_status, [])
+
+        Clock.current = due
+        with self.assertRaises(SessionExpiredException):
+            worker.poll()
+        self.assertEqual(self.row(task).status, TaskStatus.PENDING)
+        self.assertIsNone(self.row(task).executed_at)
+        self.assertEqual(self.actions, [])
+        worker.poll()
+        self.assertEqual(self.row(task).status, TaskStatus.COMPLETED)
+        self.assertEqual(self.action_pages, [page])
+        self.assertEqual(observed_status, [TaskStatus.PENDING, TaskStatus.PENDING])
+
+    def test_scan_and_comment_rebind_page_and_retry_after_login_failure(self):
+        scan, comment = object(), object()
+        acquire = Mock(
+            side_effect=[SessionExpiredException(), scan, SessionExpiredException(), comment]
+        )
+        worker = dispatch.TaskDispatcher(acquire_page=acquire)
+        for expected in ("scan", "comment"):
+            with self.assertRaises(SessionExpiredException):
+                worker.poll()
+            worker.poll()
+            self.assertEqual(self.actions[-1], expected)
+        self.assertEqual(self.action_pages, [scan, comment])
+        worker.poll()
+        self.assertEqual(acquire.call_count, 4)
 
     def test_due_invite_precedes_older_post_and_notification_scan(self):
         post = self.add_task(

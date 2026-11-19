@@ -1,4 +1,4 @@
-FROM ghcr.io/astral-sh/uv:python3.11-bookworm-slim
+FROM ghcr.io/astral-sh/uv:python3.11-trixie-slim
 
 WORKDIR /app
 
@@ -15,23 +15,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=bind,source=pyproject.toml,target=pyproject.toml \
     uv sync --frozen --no-install-project --no-dev
 
-# Then, add the rest of the project source code and install it
-# Installing separately from its dependencies allows optimal layer caching
-ADD . /app
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv sync --frozen --no-dev
+# Install only the engine used by the worker; source changes reuse this layer.
+RUN apt-get update && apt-get install -y --no-install-recommends libatomic1 \
+    && /app/.venv/bin/playwright install --with-deps webkit \
+    && rm -rf /var/lib/apt/lists/*
 
 # Place executables in the environment at the front of the path
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Install Playwright browsers and system dependencies
-RUN patchright install --with-deps chromium
-
-# Copy startup script
-COPY /utils/start.sh /app/start.sh
-RUN chmod +x /app/start.sh
+COPY src /app/src
+COPY utils /app/utils
 
 # Reset the entrypoint, don't invoke `uv`
 ENTRYPOINT []
 
-CMD ["/app/start.sh"]
+CMD ["bash", "/app/utils/start.sh"]

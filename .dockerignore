@@ -1,2 +1,7 @@
-.venv
-data
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!src/**/*.py
+!utils/*.py
+!utils/start.sh

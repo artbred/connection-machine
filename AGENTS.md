@@ -12,24 +12,24 @@ Today the codebase supports three practical automation flows:
 - Creating LinkedIn posts from queued database tasks
 - Generating feed comments autonomously when the account is idle and an OpenRouter key is configured
 
-The browser layer is built on Patchright plus Playwright, with human-like interaction helpers to reduce obvious automation patterns.
+The worker uses the official Python Playwright client and its pinned WebKit build. It keeps one page while processing adjacent tasks. On the first poll with no browser work it closes the persistent context and stops the driver; only Python, scheduling and metrics stay resident.
 
 ## High-Level Runtime
 
 ```text
 src/main.py
   -> load .env
-  -> launch persistent Chromium context
-  -> restore LinkedIn session or log in
   -> initialize database
+  -> launch WebKit with its own persistent profile
+  -> restore LinkedIn session or log in
   -> start TaskDispatcher loop
 
 TaskDispatcher
   -> polls pending DB tasks
   -> enforces spacing and per-day limits
-  -> runs matching task handler
-  -> records success / failure / cooldown state
-  -> opportunistically runs autonomous feed comments when no DB task is runnable
+  -> acquire an authenticated page only for eligible work, before claiming a queued task
+  -> run invite/post handlers, notification discovery or autonomous feed comments
+  -> record success / failure / cooldown; release browser and driver on an idle poll
 ```
 
 ## Main Components
@@ -80,7 +80,7 @@ Task statuses:
 - Runnable invitations take priority over other queued task types and notification scans
 - New notification scans/comments do not start within 15 minutes of a pending invitation becoming eligible; already-running synchronous actions are not forcibly interrupted
 - Notification discovery runs in available idle windows, with its existing 30-minute minimum interval. With recent invite history and a backlog, it runs at most once per quota event; it never runs during a durable invite cooldown or exhausted invite quota.
-- `src/worker_watchdog.py` bounds startup and each dispatcher cycle to 15 minutes without a progress heartbeat. Untimed Patchright reads can otherwise leave a running container stalled indefinitely. The watchdog emits a diagnostic stack and exits nonzero without waiting for browser cleanup; Docker's `restart: always` restarts the worker with the same persistent state. It never issues browser actions or retries an invitation itself; startup still quarantines interrupted `processing` invites. A standalone CLI process exits rather than restarting itself.
+- `src/worker_watchdog.py` bounds startup and each dispatcher cycle to 15 minutes without a progress heartbeat. Untimed browser reads can otherwise stall the worker. The watchdog emits a stack and exits nonzero without waiting for browser cleanup; Docker's `restart: always` restarts the worker. It never retries an invitation; startup still quarantines interrupted `processing` invites.
 
 ### Invitation identity and personalization
 
@@ -120,13 +120,24 @@ Additional cooldowns are applied for known LinkedIn skip reasons:
 
 ## Persistence and Local State
 
-- browser session data: `data/connection-machine-chrome`
+- WebKit profile: `data/connection-machine-webkit`; the legacy `data/connection-machine-chrome` profile is not read, converted or deleted
 - SQLite database: whatever `DATABASE_URL` points to
 - autonomous feed-comment history: `data/feed_comment_history.json`
 
-The browser runs in a persistent context, so successful login state is meant to survive restarts.
+Each wake checks authentication before any task is claimed. Persistent login cookies and local storage belong to the WebKit profile; keep it private on the worker host.
 
 Startup runs `init_db()` before browser activity. Existing task databases receive additive, idempotent `not_before` and `preflight_retries` columns without replacing task rows. Back up live state before rollout. Older workers can read the expanded schema but do not honor deferred-retry deadlines, so rollback requires attention to pending deferred tasks.
+
+### Migrating an existing worker
+
+Previously Patchright held Chromium, a page and its driver open through every quota wait. The replacement keeps the Python dispatcher, database, task code, OpenRouter calls and metrics. WebKit supplies the layout, screenshots, clicks, editable controls and JavaScript that the handlers require. An HTTP client cannot run those flows unchanged; swapping in a Rust Chrome driver would still run Chrome.
+
+1. Build the new image and keep the old image for rollback. Stop the old worker after its current action finishes. Back up the task database and mounted `data/` while stopped. Never run two consumers against the same queue or two browsers on the same profile.
+2. On the worker host, with the same account configuration and data mount, run `docker compose run --rm --no-deps connection-machine python src/main.py --check-auth`. This opens the feed and logs in if needed; it does not initialize the database, start the dispatcher, queue invitations or post. WebKit needs its own first login. Do not rename the Chrome profile or export cookies. If the account requires a checkpoint, stop and resolve it with the account owner before enabling the worker.
+3. Run the auth check a second time after the first process exits. Require an authenticated feed without a new login. Start one new worker with the existing volume. Monitor auth, `invite_not_confirmed`, failed tasks, polling and container memory through an actual workload before lowering any container limit.
+4. To roll back, stop WebKit and restart the old image using the **current** queue, history, quota state and untouched Chrome profile. Do not restore an earlier database snapshot just to change engines: it can replay work completed since the backup.
+
+On an offline Linux/arm64 comparison, both Docker workers scanned the same synthetic notifications page, polled idle, then processed a queued post. Cgroup anonymous resident memory after the idle poll was 148.8 MiB (old) vs 49.2 MiB (new); after the post, with the page still open, it was 152.5 vs 305.3 MiB. These are point samples, not peak RSS, production LinkedIn measurements or a billing estimate. The saving is for low-duty-cycle workers; budget for WebKit's active footprint.
 
 ## Environment Variables
 
@@ -162,8 +173,9 @@ Behavior notes:
 ## Local Development
 
 ```bash
-# install dependencies
-uv sync
+# Install the locked Python client and its matching browser
+uv sync --frozen
+uv run playwright install webkit  # Linux: use install --with-deps webkit
 
 # run the main worker
 uv run python src/main.py
@@ -190,9 +202,11 @@ Run the isolated regression suite from the repository root:
 DATABASE_URL=sqlite:///:memory: uv run python -m unittest discover -v
 ```
 
-Browser regressions use intercepted synthetic pages in fresh contexts, never the persistent LinkedIn session. The suite blanks Telegram/OpenRouter credentials and blocks non-fixture browser traffic. It uses installed Chromium or local Chrome without downloading a browser; missing browser support is reported as skipped coverage, not a verified browser pass.
+Browser regressions use intercepted synthetic pages and temporary profiles, never the live session. The suite blanks Telegram/OpenRouter credentials and blocks non-fixture browser traffic. Missing WebKit fails browser setup; tests do not download browsers or silently fall back to Chrome.
 
 ## Docker
+
+The image contains the worker, import utility and WebKit, not local `.env`, prospect lists or browser profiles. To run `utils/populate_db.py` in Docker, mount the input CSV read-only at `/app/utils/people_all.csv`.
 
 The container expects `.env` through `docker-compose.yaml` and mounts `./data` into `/app/data`.
 
@@ -216,6 +230,6 @@ When changing this codebase:
 ## Common Pitfalls
 
 - `DATABASE_URL` must be set or imports from `src/db.py` will fail immediately
-- a missing browser binary may cause Patchright to fall back to local Chrome
+- after a Playwright upgrade, install its matching WebKit build or rebuild the container; there is no system-browser fallback
 - LinkedIn auth can land on `/checkpoint`; that is treated as not authenticated
 - autonomous comments are intentionally disabled when no OpenRouter key is present

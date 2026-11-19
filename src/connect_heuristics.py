@@ -2,7 +2,6 @@ import logging
 import re
 from urllib.parse import parse_qs, quote, urljoin, urlparse
 
-from patchright.sync_api import Error as PatchrightError
 from playwright.sync_api import Error as PlaywrightError, Locator, Page
 
 from exceptions import TaskSkippedException
@@ -179,7 +178,7 @@ def is_target_action(
             owned
             or _href_identity(locator.get_attribute("href") or "", identity) is True
         )
-    except (PlaywrightError, PatchrightError):
+    except PlaywrightError:
         return False
 
 
@@ -204,7 +203,7 @@ def is_actionable_target(
     actionable = True
     try:
         locator.click(trial=True, timeout=1000)
-    except (PlaywrightError, PatchrightError) as exc:
+    except PlaywrightError as exc:
         logger.debug("Connect/More actionability trial failed (%s): %.1200s",
                      type(exc).__name__, str(exc))
         actionable = False
@@ -285,7 +284,7 @@ def _click_action(
         raise TaskSkippedException("profile_identity_mismatch", cooldown_eligible=False)
     try:
         locator.click(delay=100, timeout=5000)
-    except (PlaywrightError, PatchrightError) as exc:
+    except PlaywrightError as exc:
         # A timeout can occur after dispatch. Never attempt another Connect.
         logger.warning("Connect/More click outcome is uncertain (%s): %.1200s",
                        type(exc).__name__, str(exc))
@@ -326,7 +325,7 @@ def get_cached_connect_button(page: Page, identity: ProfileIdentity) -> Locator 
             candidate = candidates.nth(index)
             if is_actionable_target(candidate, page, identity):
                 return candidate
-    except (PlaywrightError, PatchrightError) as exc:
+    except PlaywrightError as exc:
         logger.debug("Cached Connect selector is no longer usable: %s", exc)
     return None
 
@@ -341,5 +340,5 @@ def save_selector_to_cache(
             if is_target_action(candidates.nth(index), page, identity):
                 selector_cache["connect"] = selector
                 return
-    except (PlaywrightError, PatchrightError) as exc:
+    except PlaywrightError as exc:
         logger.debug("Not caching unusable Connect selector: %s", exc)
