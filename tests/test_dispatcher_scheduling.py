@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
@@ -16,6 +16,7 @@ if str(SRC) not in sys.path:
 os.environ.setdefault("DATABASE_URL", "sqlite:///:memory:")
 
 import dispatcher as dispatch  # noqa: E402
+import main  # noqa: E402
 from db import Base, Task, TaskStatus, TaskType  # noqa: E402
 from exceptions import SessionExpiredException, TaskSkippedException  # noqa: E402
 from invite_state import InviteStateStore  # noqa: E402
@@ -58,6 +59,8 @@ class DispatcherSchedulingTests(unittest.TestCase):
                 owner.action_pages.append(self.page)
                 Clock.current += owner.duration
                 reason = owner.failures.get(payload.get("url"))
+                if isinstance(reason, Exception):
+                    raise reason
                 if reason:
                     raise TaskSkippedException(
                         reason,
@@ -149,6 +152,92 @@ class DispatcherSchedulingTests(unittest.TestCase):
         return self.add_task(
             f"sent-{when.isoformat()}", status=TaskStatus.COMPLETED, completed=when
         )
+
+    def run_worker(self, wait):
+        def dispatcher(**kwargs):
+            self.worker = dispatch.TaskDispatcher(**kwargs)
+            return self.worker
+
+        shutdown = Mock()
+        shutdown.is_set.return_value = False
+        shutdown.wait.side_effect = wait
+        with (
+            patch.object(sys, "argv", ["worker"]),
+            patch.object(main, "init_db"),  # setUp already initialized the isolated queue
+            patch.object(main.signal, "signal"),
+            patch.object(main, "shutdown_event", shutdown),
+            patch.object(main, "TaskDispatcher", dispatcher),
+            patch.dict(os.environ, METRICS_ENABLED="false"),
+        ):
+            main.main()
+
+    def test_worker_stays_browser_free_from_start_during_durable_invite_limits(self):
+        task = self.add_task()
+        for hours in range(10):
+            self.seed_success(Clock.current - timedelta(hours=hours))
+
+        for limit in ("rolling quota", "cooldown"):
+            with self.subTest(limit=limit), patch.dict(os.environ, OPENROUTER_API_KEY=""):
+                if limit == "cooldown":
+                    Clock.current += timedelta(days=2)
+                    self.state.set_cooldown(
+                        "weekly_limit_reached", Clock.current + timedelta(days=7), source="test"
+                    )
+                idle_handlers = []
+
+                def wait(seconds):
+                    self.assertEqual(seconds, 10)
+                    idle_handlers.append(self.worker.handlers)
+                    Clock.current += timedelta(minutes=31)
+                    return len(idle_handlers) == 3
+
+                with patch.object(main, "sync_playwright", side_effect=AssertionError) as start:
+                    self.run_worker(wait)
+                start.assert_not_called()
+                self.assertEqual(len(idle_handlers), 3)
+                self.assertTrue(all(group is idle_handlers[0] for group in idle_handlers))
+                self.assertEqual(self.row(task).status, TaskStatus.PENDING)
+                self.assertEqual(self.actions, [])
+
+    def test_worker_releases_each_browser_poll_even_on_reauth_failure(self):
+        invite = self.add_task()
+        post = self.add_task("post", task_type=TaskType.CREATE_POST)
+        self.failures["https://www.linkedin.com/in/post/"] = SessionExpiredException()
+        pages = [object(), object()]
+        contexts = [Mock(pages=[page]) for page in pages]
+
+        with (
+            patch.object(main, "sync_playwright") as start,
+            patch.object(main, "check_ip") as check_ip,
+            patch.object(main, "authenticate", side_effect=[None, None, RuntimeError("reauth")]) as auth,
+        ):
+            driver = start.return_value
+            driver.__enter__.return_value.webkit.launch_persistent_context.side_effect = contexts
+
+            def assert_released(index):
+                contexts[index].close.assert_called_once_with()
+                self.assertEqual(driver.__exit__.call_count, index + 1)
+                self.assertIsNone(self.worker.page)
+                for handler in (
+                    self.worker.feed_comment_handler, self.worker.notification_reply_invite_scanner,
+                    *self.worker.handlers.values(),
+                ):
+                    self.assertIsNone(handler.page)
+
+            def wait(seconds):
+                self.assertEqual(seconds, 10)
+                assert_released(0)
+                return False
+
+            with self.assertRaisesRegex(RuntimeError, "reauth"):
+                self.run_worker(wait)
+            assert_released(1)
+            self.assertEqual(start.call_count, 2)
+            check_ip.assert_called_once_with(pages[0])
+            self.assertEqual(auth.call_args_list, [call(pages[0]), call(pages[1]), call(pages[1], retry_delay=60)])
+        self.assertEqual(self.action_pages, pages)
+        self.assertEqual(self.row(invite).status, TaskStatus.COMPLETED)
+        self.assertEqual(self.row(post).status, TaskStatus.PENDING)
 
     def test_only_due_invites_acquire_and_failed_login_leaves_them_pending(self):
         page = object()

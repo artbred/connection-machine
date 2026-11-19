@@ -162,7 +162,11 @@ class InviteStateStore:
         )
 
     def get_active_cooldown(self, now: datetime | None = None) -> dict[str, Any] | None:
-        state = self.load()
+        return self._active_cooldown(self.load(), now)
+
+    def _active_cooldown(
+        self, state: dict[str, Any], now: datetime | None = None
+    ) -> dict[str, Any] | None:
         cooldown = state.get("cooldown")
         current_time = now or datetime.utcnow()
         if not cooldown or cooldown["active_until"] <= current_time:
@@ -243,34 +247,33 @@ class InviteStateStore:
         return event
 
     def get_recent_events(self, limit: int = 25) -> list[dict[str, Any]]:
-        state = self.load()
-        return list(state.get("events", []))[:limit]
+        return self.load()["events"][:limit]
 
     def get_event_counts(self) -> dict[tuple[str, str], int]:
-        counts: dict[tuple[str, str], int] = {}
-        for event in self.load().get("events", []):
-            key = (event.get("outcome") or "unknown", event.get("reason") or "")
-            counts[key] = counts.get(key, 0) + 1
-        return counts
+        return self.get_metrics_snapshot(recent_limit=0)["event_counts"]
 
     def get_reason_counts(self) -> dict[str, int]:
-        counts: dict[str, int] = {}
-        for event in self.load().get("events", []):
-            reason = event.get("reason") or ""
-            if not reason:
-                continue
-            counts[reason] = counts.get(reason, 0) + 1
-        return counts
+        return self.get_metrics_snapshot(recent_limit=0)["reason_counts"]
 
     def get_last_event(self) -> dict[str, Any] | None:
         events = self.get_recent_events(limit=1)
         return events[0] if events else None
 
     def get_metrics_snapshot(self, recent_limit: int = 25) -> dict[str, Any]:
+        state = self.load()
+        events = state["events"]
+        event_counts: dict[tuple[str, str], int] = {}
+        reason_counts: dict[str, int] = {}
+        for event in events:
+            reason = event["reason"]
+            key = (event["outcome"], reason)
+            event_counts[key] = event_counts.get(key, 0) + 1
+            if reason:
+                reason_counts[reason] = reason_counts.get(reason, 0) + 1
         return {
-            "cooldown": self.get_active_cooldown(),
-            "last_event": self.get_last_event(),
-            "recent_events": self.get_recent_events(limit=recent_limit),
-            "event_counts": self.get_event_counts(),
-            "reason_counts": self.get_reason_counts(),
+            "cooldown": self._active_cooldown(state),
+            "last_event": events[0] if events else None,
+            "recent_events": events[:recent_limit],
+            "event_counts": event_counts,
+            "reason_counts": reason_counts,
         }

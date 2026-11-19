@@ -4,6 +4,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -99,7 +100,7 @@ class InviteStateStoreTests(unittest.TestCase):
             self.assertIsNone(store.get_active_cooldown(now=now))
             self.assertIsNone(store.load()["cooldown"])
 
-    def test_metrics_snapshot_includes_active_cooldown(self):
+    def test_metrics_snapshot_loads_once_and_keeps_last_event_at_zero_limit(self):
         now = datetime.utcnow()
         with tempfile.TemporaryDirectory() as tmpdir:
             store = InviteStateStore(path=Path(tmpdir) / "invite_state.json")
@@ -118,14 +119,24 @@ class InviteStateStoreTests(unittest.TestCase):
                 cooldown_until=active_until,
                 recorded_at=now,
             )
+            store.record_event(
+                outcome="success",
+                source="invite_task",
+                recorded_at=now - timedelta(minutes=1),
+            )
 
-            snapshot = store.get_metrics_snapshot(recent_limit=5)
+            with patch.object(store, "load", wraps=store.load) as load:
+                snapshot = store.get_metrics_snapshot(recent_limit=0)
+                load.assert_called_once_with()
 
         self.assertEqual(snapshot["cooldown"]["reason"], "withdrawal_cooldown")
         self.assertEqual(snapshot["last_event"]["reason"], "withdrawal_cooldown")
         self.assertEqual(
-            snapshot["event_counts"][("skipped", "withdrawal_cooldown")], 1
+            snapshot["event_counts"],
+            {("skipped", "withdrawal_cooldown"): 1, ("success", ""): 1},
         )
+        self.assertEqual(snapshot["reason_counts"], {"withdrawal_cooldown": 1})
+        self.assertEqual(snapshot["recent_events"], [])
 
     def test_dispatcher_reuses_existing_invite_cooldown_without_extending_it(self):
         now = datetime.utcnow()

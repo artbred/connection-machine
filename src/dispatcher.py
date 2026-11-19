@@ -159,6 +159,11 @@ class TaskDispatcher:
             TaskType.CREATE_POST: PostTask(page),
         }
 
+    def release_page(self):
+        if self.page is not None:
+            # Idle scheduling and metrics still need page-free history readers.
+            self._bind_page(None)
+
     def _prepare_browser_work(self):
         if self._acquire_page is not None:
             page = self._acquire_page()

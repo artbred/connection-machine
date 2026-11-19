@@ -630,6 +630,8 @@ class FeedCommentTask(BaseTask):
 
     def _log_feed_debug(self):
         """Log debug info about the current feed page structure."""
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
         try:
             debug_info = self.page.evaluate("""
                 () => {
@@ -663,7 +665,7 @@ class FeedCommentTask(BaseTask):
                     };
                 }
             """)
-            logger.info(
+            logger.debug(
                 "Feed debug: url=%s articles=%s listItems=%s feedItems=%s totalButtons=%s commentButtons=%s visibleCommentButtons=%s pageHeight=%s viewport=%s scrollY=%s buttonTexts=%s",
                 debug_info.get("url"),
                 debug_info.get("articleCount"),

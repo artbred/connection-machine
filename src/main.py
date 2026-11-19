@@ -179,7 +179,7 @@ def get_next_notification_reply_invite_task() -> Task | None:
                 Task.status == TaskStatus.PENDING,
             )
             .order_by(Task.created_at)
-            .all()
+            .yield_per(64)
         )
         for task in pending_tasks:
             try:
@@ -265,10 +265,9 @@ class BrowserSession:
         self.profile_dir = profile_dir
         self._resources = ExitStack()
         self.page = None
-        self.used = False
+        self._checked_ip = False
 
-    def acquire_page(self, *, log_ip=False):
-        self.used = True
+    def acquire_page(self):
         if self.page is None:
             playwright = self._resources.enter_context(sync_playwright())
             context = playwright.webkit.launch_persistent_context(
@@ -278,8 +277,9 @@ class BrowserSession:
             )
             self._resources.callback(context.close)
             page = context.pages[0] if context.pages else context.new_page()
-            if log_ip:
+            if not self._checked_ip:
                 check_ip(page)
+                self._checked_ip = True
             authenticate(page)
             self.page = page
         return self.page
@@ -307,15 +307,15 @@ def main():
             init_db()
         profile_dir = os.path.join(os.getcwd(), "data", "connection-machine-webkit")
         with closing(BrowserSession(profile_dir)) as browser:
-            page = browser.acquire_page(log_ip=True)
             if args.check_auth:
+                browser.acquire_page()
                 logger.info("Verified LinkedIn authentication in WebKit.")
                 return
 
             # Debug mode: run single invite task and exit
             if args.debug_invite:
                 logger.info(f"Debug mode: sending invite to {args.debug_invite}")
-                invite_task = InviteTask(page)
+                invite_task = InviteTask(browser.acquire_page())
                 invite_task.run(
                     {
                         "url": args.debug_invite,
@@ -330,7 +330,7 @@ def main():
                     "Debug mode: generating one feed comment (%s)",
                     "submit" if args.submit_comment else "dry run",
                 )
-                comment_task = FeedCommentTask(page)
+                comment_task = FeedCommentTask(browser.acquire_page())
                 comment_task.run({"dry_run": not args.submit_comment})
                 logger.info("Debug feed comment completed.")
                 return
@@ -342,6 +342,7 @@ def main():
                     if args.send_notification_invite
                     else "",
                 )
+                page = browser.acquire_page()
                 scanner = NotificationReplyInviteScanner(page)
                 queued = scanner.run(
                     {
@@ -385,7 +386,6 @@ def main():
             logger.info("Starting task dispatcher loop...")
             while not shutdown_event.is_set():
                 watchdog.heartbeat("dispatcher poll")
-                browser.used = False
                 try:
                     dispatcher.poll()
                 except SessionExpiredException:
@@ -394,8 +394,8 @@ def main():
                     metrics.inc_reauth()
 
                     authenticate(browser.acquire_page(), retry_delay=60)
-
-                if not browser.used:
+                finally:
+                    dispatcher.release_page()
                     browser.close()
 
                 if shutdown_event.wait(10):

@@ -42,9 +42,12 @@ class BrowserSessionTests(unittest.TestCase):
             page.context.route("**/*", serve)
             authenticate(page)
 
-        with tempfile.TemporaryDirectory() as profile, patch.object(
-            main, "authenticate", fixture_auth
-        ), patch.dict(os.environ, LINKEDIN_USERNAME="fixture", LINKEDIN_PASSWORD="fixture"):
+        with (
+            tempfile.TemporaryDirectory() as profile,
+            patch.object(main, "check_ip"),
+            patch.object(main, "authenticate", fixture_auth),
+            patch.dict(os.environ, LINKEDIN_USERNAME="fixture", LINKEDIN_PASSWORD="fixture"),
+        ):
             with closing(main.BrowserSession(profile)) as session:
                 first = session.acquire_page()
                 self.assertIs(session.acquire_page(), first)

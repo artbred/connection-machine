@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
 
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .base import BaseTask
@@ -320,15 +321,26 @@ class NotificationReplyInviteScanner(BaseTask):
         db: Session,
         normalized_url: str,
     ) -> Task | None:
-        tasks = db.query(Task).filter(Task.type == TaskType.SEND_INVITE).all()
-        for task in tasks:
-            try:
-                payload = json.loads(task.payload)
-            except (TypeError, json.JSONDecodeError):
-                continue
-            if normalize_profile_url(str(payload.get("url") or "")) == normalized_url:
-                return task
-        return None
+        rows = select(Task.id, Task.payload).where(Task.type == TaskType.SEND_INVITE)
+        with db.execute(rows.execution_options(yield_per=64)) as result:
+            for task_id, raw_payload in result:
+                try:
+                    payload = json.loads(raw_payload)
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                url = str(payload.get("url") or "")
+                if normalize_profile_url(url) == normalized_url:
+                    break
+            else:
+                return None
+
+        # Fail closed if the matching row disappeared or changed targets mid-scan.
+        match = select(Task).where(
+            Task.id == task_id,
+            Task.type == TaskType.SEND_INVITE,
+            Task.payload == raw_payload,
+        )
+        return db.scalars(match.execution_options(populate_existing=True)).one()
 
     def _prioritize_existing_task(
         self,

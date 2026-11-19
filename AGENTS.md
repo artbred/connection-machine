@@ -12,7 +12,7 @@ Today the codebase supports three practical automation flows:
 - Creating LinkedIn posts from queued database tasks
 - Generating feed comments autonomously when the account is idle and an OpenRouter key is configured
 
-The worker uses the official Python Playwright client and its pinned WebKit build. It keeps one page while processing adjacent tasks. On the first poll with no browser work it closes the persistent context and stops the driver; only Python, scheduling and metrics stay resident.
+The worker uses the official Python Playwright client and its pinned WebKit build. Only the Python scheduler and metrics stay resident. Each poll that needs browser work gets a fresh driver and persistent context; both close before the worker sleeps, including on errors. Consecutive tasks cannot accumulate tabs or driver state across polls. This reduces idle and long-running usage, **not** the memory needed to run one page.
 
 ## High-Level Runtime
 
@@ -20,16 +20,14 @@ The worker uses the official Python Playwright client and its pinned WebKit buil
 src/main.py
   -> load .env
   -> initialize database
-  -> launch WebKit with its own persistent profile
-  -> restore LinkedIn session or log in
-  -> start TaskDispatcher loop
+  -> start TaskDispatcher without launching or authenticating a browser
 
 TaskDispatcher
   -> polls pending DB tasks
   -> enforces spacing and per-day limits
   -> acquire an authenticated page only for eligible work, before claiming a queued task
   -> run invite/post handlers, notification discovery or autonomous feed comments
-  -> record success / failure / cooldown; release browser and driver on an idle poll
+  -> record outcome; drop page references and close context and driver before sleep
 ```
 
 ## Main Components
@@ -124,7 +122,7 @@ Additional cooldowns are applied for known LinkedIn skip reasons:
 - SQLite database: whatever `DATABASE_URL` points to
 - autonomous feed-comment history: `data/feed_comment_history.json`
 
-Each wake checks authentication before any task is claimed. Persistent login cookies and local storage belong to the WebKit profile; keep it private on the worker host.
+The first acquisition checks the public IP. Each acquisition checks authentication before any queued task is claimed; debug and auth-only commands still acquire immediately. Persistent login cookies and local storage belong to the WebKit profile; keep it private on the worker host.
 
 Startup runs `init_db()` before browser activity. Existing task databases receive additive, idempotent `not_before` and `preflight_retries` columns without replacing task rows. Back up live state before rollout. Older workers can read the expanded schema but do not honor deferred-retry deadlines, so rollback requires attention to pending deferred tasks.
 
@@ -137,7 +135,37 @@ Previously Patchright held Chromium, a page and its driver open through every qu
 3. Run the auth check a second time after the first process exits. Require an authenticated feed without a new login. Start one new worker with the existing volume. Monitor auth, `invite_not_confirmed`, failed tasks, polling and container memory through an actual workload before lowering any container limit.
 4. To roll back, stop WebKit and restart the old image using the **current** queue, history, quota state and untouched Chrome profile. Do not restore an earlier database snapshot just to change engines: it can replay work completed since the backup.
 
-On an offline Linux/arm64 comparison, both Docker workers scanned the same synthetic notifications page, polled idle, then processed a queued post. Cgroup anonymous resident memory after the idle poll was 148.8 MiB (old) vs 49.2 MiB (new); after the post, with the page still open, it was 152.5 vs 305.3 MiB. These are point samples, not peak RSS, production LinkedIn measurements or a billing estimate. The saving is for low-duty-cycle workers; budget for WebKit's active footprint.
+### 100 MB acceptance (not met)
+
+Do not put a 100 MB limit on the live worker: browser startup failed at that limit, even before an account or a real feed was involved. A process killed during a send may require manual reconciliation. No authenticated end-to-end success at this limit has been established.
+
+```sh
+docker build -t connection-machine:100mb-check .
+python3 utils/accept_100mb.py > /tmp/connection-machine-acceptance.jsonl
+```
+
+The runner tests the packaged source in fresh Linux containers without a network, credentials or production volumes. The hard limit is **99,999,744 bytes** (100 decimal MB rounded down to a kernel page); `memory.swap.max=0`. Each record contains cgroup peak bytes, CPU microseconds, exit status and any OOM or timeout. A skip or missing measurement is not a pass. On Linux/arm64, 12 of 20 fixtures passed; all eight real-browser fixtures (login persistence, four invite paths, posting, commenting, notifications) encountered OOM. Those workflows did **not** complete.
+
+Separate measurement of the actual idle worker with metrics enabled and a durable invite cooldown: 57.62 MB cgroup peak from startup through shutdown, no browser child or profile, 0.012 CPU-seconds in an 11-second idle interval. After streaming the notification lookup, ten last-row lookups on a synthetic 10,000-invite SQLite queue used 53.33 MB peak vs 67.07 MB, and 0.705 vs 1.092 CPU-seconds. One hundred metrics snapshots of a 1,000-event history used 0.100 vs 0.429 CPU-seconds after replacing five parses with one. These are local fixtures, not estimates of live memory or CPU.
+
+Candidate probes below used the same whole-container limit with no swap. A renderer-only failure rules out that tested configuration; a renderer-only success does not prove a worker with its scheduler, real login and live page fits. The fixtures differ by capability; the peaks are **not** a performance ranking.
+
+| Local implementation path | Peak MB, decimal (rounded) | Observed gate |
+|---|---:|---|
+| Playwright + WebKit worker | 100.0 | OOM before the live auth preflight could submit a password |
+| Native WPE MiniBrowser, no automation driver | 100.0 | Software rendering and JIT off; OOM before fixture JS proof |
+| Native WebKitGTK + Xvfb/Cairo | 100.0 | Trusted click on a tiny fixture without the worker; separate resident scheduler killed in one run |
+| WebKitGTK embedded via `ctypes` in the scheduler | 100.0 | No Node or MiniBrowser; OOM before fixture JS or click proof |
+| Rust Servo 0.8.0, headless | 100.0 | Killed before producing the requested fixture screenshot |
+| Firefox ESR 153.7, headless | 100.0 | No verified page before the 12-second deadline; also reported a container namespace warning |
+| Chromium 156 headless shell, single process (comparison only) | 100.0 | Requested fixture, did not finish within 12 seconds |
+| NetSurf GTK 3.11 | 74.1 | Requested fixture; no JS hit-test or module success signal before timeout |
+| Lightpanda native PandaScript, no Playwright | 31.6 | Editor typing worked. The covered-click fixture used 13.3 MB but **dispatched** on the covered control; the screenshot missed its opaque overlay. Not safe for invites |
+| HtmlUnit 5.8, constrained JVM | 69.0 | No working hit-test for the covered control |
+| jsdom 31 | 100.0 | Zero target bounds and no hit-test |
+| Happy DOM 21 | 56.2 | Zero target bounds and no hit-test |
+
+A browserless worker would need an authorized interface for **all** of the actions and data above. LinkedIn’s [Invitations API](https://learn.microsoft.com/en-us/linkedin/shared/integrations/communications/invitations) and [Profile API](https://learn.microsoft.com/en-us/linkedin/shared/integrations/people/profile-api) are restricted. Ordinary member OAuth is not equivalent to an authorized source of prospects’ full profiles, the member’s home feed and personal notifications. A cookie is not an API grant.
 
 ## Environment Variables
 

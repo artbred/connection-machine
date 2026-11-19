@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import cast
 
+from sqlalchemy import event
+
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
 if str(SRC) not in sys.path:
@@ -301,6 +303,31 @@ class NotificationReplyInviteTests(unittest.TestCase):
                     self.assertEqual(task.status, TaskStatus.FAILED)
                     self.assertEqual(task.error, reason)
                     self.assertEqual(task.preflight_retries, 2)
+
+    def test_existing_invite_lookup_loads_only_the_matching_task(self):
+        target = normalize_profile_url("/in/ada/")
+        with tempfile.TemporaryDirectory() as directory, SessionLocal() as db:
+            scanner = FakeScanner([], Path(directory) / "state.json")
+            for payload in (
+                "not json",
+                '{"url":"https://example.com/in/ada/"}',
+                '{"url":"/in/grace/"}',
+                '{"url":"/in/ADA?tracking=1"}',
+            ):
+                db.add(Task(type=TaskType.SEND_INVITE, payload=payload))
+            db.commit()
+            db.expunge_all()
+            loaded = []
+            event.listen(
+                db, "loaded_as_persistent", lambda _, task: loaded.append(task)
+            )
+
+            missing = normalize_profile_url("/in/no-match/")
+            self.assertIsNone(scanner._find_existing_invite_task(db, missing))
+            self.assertEqual(loaded, [])
+            match = scanner._find_existing_invite_task(db, target)
+            self.assertIsNotNone(match)
+            self.assertEqual(loaded, [match])
 
     def test_notification_priority_preserves_deferred_retry_budget_and_deadline(self):
         due = datetime.utcnow() + timedelta(hours=6)
