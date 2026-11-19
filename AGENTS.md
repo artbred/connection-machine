@@ -144,7 +144,7 @@ docker build -t connection-machine:100mb-check .
 python3 utils/accept_100mb.py > /tmp/connection-machine-acceptance.jsonl
 ```
 
-The runner tests the packaged source in fresh Linux containers without a network, credentials or production volumes. The hard limit is **99,999,744 bytes** (100 decimal MB rounded down to a kernel page); `memory.swap.max=0`. Each record contains cgroup peak bytes, CPU microseconds, exit status and any OOM or timeout. A skip or missing measurement is not a pass. On Linux/arm64, 12 of 20 fixtures passed; all eight real-browser fixtures (login persistence, four invite paths, posting, commenting, notifications) encountered OOM. Those workflows did **not** complete.
+The runner tests the packaged source in fresh Linux containers without a network, credentials or production volumes. The hard limit is **99,999,744 bytes** (100 decimal MB rounded down to a kernel page); `memory.swap.max=0`. Each record contains cgroup peak bytes, CPU microseconds, exit status and any OOM or timeout. A skip or missing measurement is not a pass. On Linux/arm64, 15 of 26 checks passed; all 11 browser fixtures (login persistence, four invitation paths, posting, commenting, notifications and three dry runs) encountered OOM. Those workflows did **not** complete.
 
 Separate measurement of the actual idle worker with metrics enabled and a durable invite cooldown: 57.62 MB cgroup peak from startup through shutdown, no browser child or profile, 0.012 CPU-seconds in an 11-second idle interval. After streaming the notification lookup, ten last-row lookups on a synthetic 10,000-invite SQLite queue used 53.33 MB peak vs 67.07 MB, and 0.705 vs 1.092 CPU-seconds. One hundred metrics snapshots of a 1,000-event history used 0.100 vs 0.429 CPU-seconds after replacing five parses with one. These are local fixtures, not estimates of live memory or CPU.
 
@@ -208,6 +208,11 @@ uv run playwright install webkit  # Linux: use install --with-deps webkit
 # run the main worker
 uv run python src/main.py
 
+# Three independent previews against an already authenticated WebKit profile.
+uv run python src/main.py --dry-run post
+uv run python src/main.py --dry-run comment
+uv run python src/main.py --dry-run notifications
+
 # run one invite directly without using the DB queue
 uv run python src/main.py --debug-invite "https://linkedin.com/in/profile-url"
 
@@ -223,6 +228,10 @@ uv run python src/main.py --debug-feed-comment --submit-comment
 # populate DB tasks from CSV
 uv run python utils/populate_db.py
 ```
+
+`--dry-run post` verifies a visible, editable post composer without typing into a possibly autosaved draft. `comment` selects a feed post and generates a comment through OpenRouter, without opening the editor, notifying Telegram or storing history. `notifications` discovers a qualifying reply candidate without opening the database or updating discovery state; no candidate is a skip, not confirmation. These commands require member navigation on the expected LinkedIn route and refuse an expired session rather than submitting credentials. Normal page views may still be visible to LinkedIn.
+
+`--debug-invite URL` is **live**, not a preview: Connect can send immediately. Only use it with the designated recipient and verified account quota; it does not go through dispatcher scheduling. The notification debug command can enqueue tasks even without `--send-notification-invite`; use `--dry-run notifications` for a non-enqueuing check.
 
 Run the isolated regression suite from the repository root:
 

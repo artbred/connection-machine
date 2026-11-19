@@ -84,13 +84,12 @@ PAGE_COUNTER_PATTERN = re.compile(r"^\d+\s*/\s*\d+$")
 
 
 class FeedCommentTask(BaseTask):
-    def run(self, payload: dict):
+    def prepare_comment(self, payload: dict) -> dict[str, Any]:
         if not os.getenv("OPENROUTER_API_KEY"):
             raise ValueError("OPENROUTER_API_KEY is required for feed comment task")
 
         self.validate_session()
 
-        dry_run = bool(payload.get("dry_run", False))
         feed_url = payload.get("feed_url") or FEED_URL
         max_candidates = int(payload.get("max_candidates", MAX_CANDIDATES_PER_RUN))
 
@@ -104,6 +103,11 @@ class FeedCommentTask(BaseTask):
             candidate.get("author") or "unknown author",
         )
         logger.info("Generated comment: %s", candidate["comment"])
+        return candidate
+
+    def run(self, payload: dict):
+        candidate = self.prepare_comment(payload)
+        dry_run = bool(payload.get("dry_run", False))
 
         if dry_run:
             send_notification(

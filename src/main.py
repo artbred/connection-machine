@@ -7,6 +7,7 @@ import threading
 from contextlib import ExitStack, closing
 
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
 from playwright.sync_api import sync_playwright
@@ -19,6 +20,7 @@ from exceptions import SessionExpiredException, TaskSkippedException  # noqa: E4
 from metrics import NoopMetrics, create_metrics  # noqa: E402
 from tasks.invite import InviteTask, normalize_invite_skip_reason  # noqa: E402
 from tasks.comment import FeedCommentTask  # noqa: E402
+from tasks.post import PostTask  # noqa: E402
 from tasks.notification_reply_invites import (  # noqa: E402
     NOTIFICATION_REPLY_INVITE_SOURCE,
     NotificationReplyInviteScanner,
@@ -133,6 +135,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LinkedIn task automation")
     debug_group = parser.add_mutually_exclusive_group()
     debug_group.add_argument(
+        "--dry-run", choices=("post", "comment", "notifications"),
+        help="Inspect the composer, prepare a comment, or discover a reply; do not publish, notify or enqueue",
+    )
+    debug_group.add_argument(
         "--check-auth",
         action="store_true",
         help="Verify the WebKit login and exit without opening the task queue",
@@ -167,7 +173,42 @@ def parse_args():
         action="store_true",
         help="Actually send the first queued invite when used with --debug-notification-reply-invites",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.dry_run and (args.submit_comment or args.send_notification_invite or args.no_message):
+        parser.error("--dry-run cannot be combined with action modifiers")
+    return args
+
+
+def _require_member_route(page, path):
+    url = urlsplit(page.url)
+    if (url.scheme, url.netloc, url.path.rstrip("/")) != ("https", "www.linkedin.com", path):
+        raise RuntimeError("Dry run did not reach the expected LinkedIn page")
+    nav = page.locator(
+        "nav a[href^='/mynetwork/']:visible, nav a[href^='/messaging/']:visible, "
+        "nav a[href^='https://www.linkedin.com/mynetwork/']:visible, "
+        "nav a[href^='https://www.linkedin.com/messaging/']:visible"
+    )
+    if not nav.count():
+        raise RuntimeError("Dry run could not verify signed-in member navigation")
+
+
+def run_dry_run(page, operation):
+    _require_member_route(page, "/feed")
+    if operation == "post":
+        PostTask(page).inspect_composer()
+        result = "Editable post composer found; draft untouched"
+    elif operation == "comment":
+        candidate = FeedCommentTask(page).prepare_comment({})
+        result = f"Comment prepared for post {candidate['post_key']}; not submitted or recorded"
+    elif operation == "notifications":
+        candidates = NotificationReplyInviteScanner(page).find_reply_candidates(max_candidates=1)
+        if not candidates:
+            raise TaskSkippedException("no_notification_reply_candidates")
+        result = f"Reply candidate {candidates[0]['notification_key']} found; not enqueued or recorded"
+    else:
+        raise ValueError(f"Unknown dry run: {operation}")
+    _require_member_route(page, "/notifications" if operation == "notifications" else "/feed")
+    logger.info("Dry run: %s.", result)
 
 
 def get_next_notification_reply_invite_task() -> Task | None:
@@ -267,8 +308,10 @@ class BrowserSession:
         self.page = None
         self._checked_ip = False
 
-    def acquire_page(self):
+    def acquire_page(self, *, existing_session_only=False):
         if self.page is None:
+            if existing_session_only and not os.path.isdir(self.profile_dir):
+                raise SessionExpiredException("Dry run requires an existing authenticated WebKit profile")
             playwright = self._resources.enter_context(sync_playwright())
             context = playwright.webkit.launch_persistent_context(
                 self.profile_dir,
@@ -277,10 +320,14 @@ class BrowserSession:
             )
             self._resources.callback(context.close)
             page = context.pages[0] if context.pages else context.new_page()
-            if not self._checked_ip:
-                check_ip(page)
-                self._checked_ip = True
-            authenticate(page)
+            if existing_session_only:
+                if not check_linkedin_auth(page):
+                    raise SessionExpiredException("Dry run requires an authenticated WebKit profile")
+            else:
+                if not self._checked_ip:
+                    check_ip(page)
+                    self._checked_ip = True
+                authenticate(page)
             self.page = page
         return self.page
 
@@ -293,7 +340,7 @@ def main():
     global metrics
 
     args = parse_args()
-    metrics = create_metrics()
+    metrics = NoopMetrics() if args.dry_run else create_metrics()
     metrics.set_up(True)
     watchdog = WorkerWatchdog()
     watchdog.start()
@@ -303,10 +350,13 @@ def main():
     signal.signal(signal.SIGINT, signal_handler)
 
     try:
-        if not args.check_auth:
+        if not (args.check_auth or args.dry_run):
             init_db()
         profile_dir = os.path.join(os.getcwd(), "data", "connection-machine-webkit")
         with closing(BrowserSession(profile_dir)) as browser:
+            if args.dry_run:
+                run_dry_run(browser.acquire_page(existing_session_only=True), args.dry_run)
+                return
             if args.check_auth:
                 browser.acquire_page()
                 logger.info("Verified LinkedIn authentication in WebKit.")
@@ -403,7 +453,7 @@ def main():
 
     except (KeyboardInterrupt, InterruptedError):
         logger.info("Worker interrupted.")
-        if args.check_auth:
+        if args.check_auth or args.dry_run:
             raise
     finally:
         metrics.set_up(False)

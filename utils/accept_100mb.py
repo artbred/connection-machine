@@ -31,6 +31,9 @@ CASES = (
     "test_dispatcher_scheduling.DispatcherSchedulingTests.test_worker_stays_browser_free_from_start_during_durable_invite_limits",
     "test_dispatcher_scheduling.DispatcherSchedulingTests.test_worker_releases_each_browser_poll_even_on_reauth_failure",
     "test_notification_reply_invites.NotificationReplyInviteTests.test_queue_reply_invite_creates_prioritized_send_invite_task",
+    "test_dry_run.DryRunTests.test_dry_run_rejects_send_options_before_startup",
+    "test_dry_run.DryRunTests.test_logged_out_preview_neither_submits_credentials_nor_initializes_queue",
+    "test_dry_run.DryRunTests.test_login_wall_and_unverified_feed_do_not_pass_preview",
     "test_browser_session.BrowserSessionTests.test_idle_close_and_restart_reuse_persistent_login",
     "test_invite_delivery.InviteDeliveryTest.test_complete_flow_personalizes_only_verified_owner_fields",
     "test_invite_delivery.InviteDeliveryTest.test_no_note_path_removes_preexisting_editor_text",
@@ -39,6 +42,9 @@ CASES = (
     "test_task_browser.TaskBrowserTests.test_post_composer_submits_requested_content",
     "test_task_browser.TaskBrowserTests.test_feed_dry_run_then_submit",
     "test_task_browser.TaskBrowserTests.test_notification_scan_selects_comment_engagement",
+    "test_task_browser.TaskBrowserTests.test_post_dry_run_leaves_existing_draft_untouched",
+    "test_task_browser.TaskBrowserTests.test_comment_dry_run_does_not_notify_or_store_history",
+    "test_task_browser.TaskBrowserTests.test_notification_dry_run_never_opens_the_queue",
 )
 
 # Keep a small PID 1 alive to read the kernel counters after unittest/renderer exit.
