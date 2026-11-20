@@ -22,11 +22,14 @@ class BrowserSessionTests(unittest.TestCase):
         def serve(route):
             if route.request.url == login:
                 login_visits.append(login)
-                html = """<form onsubmit="event.preventDefault();
-                    document.cookie='fixture_login=yes; Path=/; Max-Age=3600; Secure';
-                    localStorage.setItem('owner','fixture'); location.href='/feed/'">
-                    <input id=username><input id=password type=password>
-                    <button type=submit>Sign in</button></form>"""
+                html = """<div hidden><input autocomplete=username>
+                    <input type=password autocomplete=current-password><button>Sign in</button></div>
+                    <input type=email autocomplete=username>
+                    <input type=password autocomplete=current-password>
+                    <button type=button onclick="if (document.querySelector('input[type=email]').value==='fixture'
+                      && document.querySelector('body > input[type=password]').value==='fixture') {
+                        document.cookie='fixture_login=yes; Path=/; Max-Age=3600; Secure';
+                        localStorage.setItem('owner','fixture'); location.href='/feed/'}">Sign in</button>"""
             elif route.request.url == feed:
                 html = """<body><script>if (document.cookie.includes('fixture_login=yes')
                     && localStorage.owner === 'fixture') document.body.innerHTML = '<nav>Feed</nav>';

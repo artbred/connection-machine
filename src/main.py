@@ -51,11 +51,11 @@ def check_linkedin_auth(page):
             wait_until="domcontentloaded",
         )
 
-        current_url = page.url
-
-        # Check for login-related URLs
-        if "/login" in current_url or "/checkpoint" in current_url:
-            logger.info(f"Detected auth redirect: {current_url}")
+        route = urlsplit(page.url)
+        if (route.scheme, route.netloc, route.path.rstrip("/")) != (
+            "https", "www.linkedin.com", "/feed"
+        ):
+            logger.info("Feed redirected away from the authenticated route")
             return False
 
         # Check for login form
@@ -79,20 +79,30 @@ def check_linkedin_auth(page):
         return False
 
 
+def _linkedin_login_route(url):
+    route = urlsplit(url)
+    return (route.scheme, route.netloc) == ("https", "www.linkedin.com") and (
+        route.path.rstrip("/") in {"/login", "/uas/login"}
+    )
+
+
 def login(page):
     """Login to LinkedIn."""
     logger.info("Logging in to LinkedIn...")
+    if urlsplit(page.url).path.startswith(("/checkpoint", "/challenge")):
+        raise RuntimeError("LinkedIn requires account-owner verification")
     try:
-        page.goto(
-            "https://www.linkedin.com/login",
-            timeout=60000,
-            wait_until="domcontentloaded",
-        )
-
-        page.wait_for_selector("#username", timeout=30000)
-        page.fill("#username", os.getenv("LINKEDIN_USERNAME"))
-        page.fill("#password", os.getenv("LINKEDIN_PASSWORD"))
-        page.click("button[type='submit']")
+        # The feed may already have redirected to login. Do not replace that navigation.
+        if not _linkedin_login_route(page.url):
+            page.goto("https://www.linkedin.com/login", timeout=60000, wait_until="load")
+        username = page.locator('input:is(#username, [autocomplete="username"]):visible')
+        password = page.locator('input[type="password"]:is(#password, [autocomplete="current-password"]):visible')
+        username.wait_for(state="visible", timeout=30000)
+        if not _linkedin_login_route(page.url):
+            raise RuntimeError("Not on the first-party login route")
+        username.fill(os.environ["LINKEDIN_USERNAME"])
+        password.fill(os.environ["LINKEDIN_PASSWORD"])
+        page.get_by_role("button", name="Sign in", exact=True).click()
 
         # Wait for navigation after login (feed or checkpoint)
         try:
@@ -106,19 +116,22 @@ def login(page):
             # If URL wait times out, give a short delay for page to settle
             shutdown_event.wait(5)
     except Exception as e:
-        logger.error(f"Error logging in: {e}")
+        logger.error("Login failed: %s", type(e).__name__)
 
 
 def check_ip(page):
     """Check and log the current IP address."""
     logger.info("Checking current IP address...")
     try:
-        response = page.goto("https://api.ipify.org?format=json")
-        if response and response.ok:
-            ip_data = json.loads(response.text())
-            logger.info(f"Current IP: {ip_data.get('ip')}")
-        else:
-            logger.warning("Failed to get IP address.")
+        # Do not send the login tab through a cross-site navigation for diagnostics.
+        response = page.request.get("https://api.ipify.org?format=json", timeout=10000)
+        try:
+            if response.ok:
+                logger.info("Current IP: %s", response.json().get("ip"))
+            else:
+                logger.warning("Failed to get IP address.")
+        finally:
+            response.dispose()
     except Exception as e:
         logger.error(f"Error checking IP: {e}")
 

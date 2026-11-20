@@ -123,7 +123,7 @@ Additional cooldowns are applied for known LinkedIn skip reasons:
 - SQLite database: whatever `DATABASE_URL` points to
 - autonomous feed-comment history: `data/feed_comment_history.json`
 
-The first acquisition checks the public IP. Each acquisition checks authentication before any queued task is claimed; debug and auth-only commands still acquire immediately. Persistent login cookies and local storage belong to the WebKit profile; keep it private on the worker host.
+The first acquisition checks the public IP via the browser context’s request client, without navigating the login tab. Each ordinary acquisition checks authentication before a queued task is claimed; debug and auth-only commands still acquire immediately. Login uses the visible username/current-password fields and Sign in button on the first-party login route; hidden responsive copies are ignored. Persistent login cookies and local storage belong to the WebKit profile; keep it private on the worker host.
 
 Startup runs `init_db()` before browser activity. Existing task databases receive the `not_before` and `preflight_retries` columns plus three indexes for runnable order, earliest deferral and recent quota events. Index creation is idempotent but can hold a write lock on first upgrade: back up live state, allow disk space for the indexes, and stop the previous worker. Older workers do not honor deferred-retry deadlines. Local history files retain the same JSON schema; writes stream compact JSON to a sibling temporary file and atomically replace the previous snapshot.
 
