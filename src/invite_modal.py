@@ -1,8 +1,9 @@
 """Resolve invitation controls only inside a verified recipient's dialog."""
 
-import re
+from __future__ import annotations
 
-from playwright.sync_api import Locator, ElementHandle
+import re
+from typing import TYPE_CHECKING
 
 from exceptions import TaskSkippedException
 from linkedin_profile import (
@@ -10,6 +11,9 @@ from linkedin_profile import (
     assert_profile_identity,
     canonical_profile_url,
 )
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Locator, ElementHandle
 
 ADD_NOTE_SELECTOR = "button[aria-label*='Add a note' i], button:has-text('Add a note')"
 INVITE_NOTE_SELECTOR = (

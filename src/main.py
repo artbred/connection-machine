@@ -10,7 +10,6 @@ from datetime import datetime
 from urllib.parse import urlsplit
 
 from dotenv import load_dotenv
-from playwright.sync_api import sync_playwright
 
 load_dotenv()
 
@@ -312,6 +311,8 @@ class BrowserSession:
         if self.page is None:
             if existing_session_only and not os.path.isdir(self.profile_dir):
                 raise SessionExpiredException("Dry run requires an existing authenticated WebKit profile")
+            from playwright.sync_api import sync_playwright
+
             playwright = self._resources.enter_context(sync_playwright())
             context = playwright.webkit.launch_persistent_context(
                 self.profile_dir,

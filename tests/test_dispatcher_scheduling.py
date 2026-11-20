@@ -191,7 +191,7 @@ class DispatcherSchedulingTests(unittest.TestCase):
                     Clock.current += timedelta(minutes=31)
                     return len(idle_handlers) == 3
 
-                with patch.object(main, "sync_playwright", side_effect=AssertionError) as start:
+                with patch("playwright.sync_api.sync_playwright", side_effect=AssertionError) as start:
                     self.run_worker(wait)
                 start.assert_not_called()
                 self.assertEqual(len(idle_handlers), 3)
@@ -207,7 +207,7 @@ class DispatcherSchedulingTests(unittest.TestCase):
         contexts = [Mock(pages=[page]) for page in pages]
 
         with (
-            patch.object(main, "sync_playwright") as start,
+            patch("playwright.sync_api.sync_playwright") as start,
             patch.object(main, "check_ip") as check_ip,
             patch.object(main, "authenticate", side_effect=[None, None, RuntimeError("reauth")]) as auth,
         ):
@@ -298,6 +298,16 @@ class DispatcherSchedulingTests(unittest.TestCase):
             self.worker.next_execution_at[TaskType.SEND_INVITE],
             started + timedelta(minutes=100, seconds=48),
         )
+
+    def test_oldest_due_invite_wins_with_id_breaking_timestamp_ties(self):
+        future = self.add_task("deferred", not_before=Clock.current + timedelta(hours=1))
+        newer = self.add_task("newer", created=Clock.current + timedelta(minutes=1))
+        oldest = self.add_task("oldest", not_before=Clock.current)
+        tied = self.add_task("tied")
+        self.worker.poll()
+        self.assertEqual(self.row(oldest).status, TaskStatus.COMPLETED)
+        for other in (future, newer, tied):
+            self.assertEqual(self.row(other).status, TaskStatus.PENDING)
 
     def test_rolling_cap_includes_exact_boundary_then_releases_one_slot(self):
         now = Clock.current
@@ -492,17 +502,41 @@ class DispatcherSchedulingTests(unittest.TestCase):
             oldest + timedelta(hours=24, microseconds=1),
         )
 
+    def test_startup_deletes_only_stale_pending_posts_and_all_legacy_comments(self):
+        cutoff = Clock.current - timedelta(hours=1)
+        stale = cutoff - timedelta(microseconds=1)
+        old_post = self.add_task(task_type=TaskType.CREATE_POST, created=stale)
+        keep = [
+            self.add_task(task_type=TaskType.CREATE_POST, created=cutoff),
+            self.add_task(task_type=TaskType.CREATE_POST, status=TaskStatus.FAILED, created=stale),
+            self.add_task(created=stale),
+        ]
+        legacy = [
+            self.add_task(task_type=TaskType.COMMENT_FEED_POST, status=status)
+            for status in TaskStatus
+        ]
+        self.worker.cleanup_old_pending_posts()
+        self.assertIsNone(self.row(old_post))
+        self.worker.cleanup_db_backed_feed_comment_tasks()
+        for task_id in legacy:
+            self.assertIsNone(self.row(task_id))
+        for task_id in keep:
+            self.assertIsNotNone(self.row(task_id))
+
     def test_interrupted_invites_are_held_not_replayed_on_restart(self):
-        uncertain = self.add_task("interrupted", status=TaskStatus.PROCESSING)
+        deadline = Clock.current + timedelta(hours=1)
+        uncertain = self.add_task("interrupted", status=TaskStatus.PROCESSING, not_before=deadline)
         post = self.add_task(
-            "post", status=TaskStatus.PROCESSING, task_type=TaskType.CREATE_POST
+            "post", status=TaskStatus.PROCESSING, task_type=TaskType.CREATE_POST, not_before=deadline
         )
         self.worker.cleanup_zombie_tasks()
         held = self.row(uncertain)
         self.assertEqual(held.status, TaskStatus.FAILED)
         self.assertEqual(held.error, "invite_not_confirmed")
         self.assertEqual(held.executed_at, Clock.current)
+        self.assertIsNone(held.not_before)
         self.assertEqual(self.row(post).status, TaskStatus.PENDING)
+        self.assertEqual(self.row(post).not_before, deadline)
         self.assertIn(
             TaskType.SEND_INVITE,
             self.worker.get_rate_limited_types({TaskType.SEND_INVITE}),

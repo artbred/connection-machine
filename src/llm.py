@@ -2,9 +2,6 @@ import os
 import re
 import json
 import logging
-import httpx
-
-from dom_minifier import minify_dom
 
 logger = logging.getLogger(__name__)
 
@@ -170,6 +167,8 @@ def _refine_text_length(
     api_key: str,
     content_label: str,
 ) -> str | None:
+    import httpx
+
     url = "https://openrouter.ai/api/v1/chat/completions"
 
     headers = {
@@ -214,6 +213,8 @@ def generate_connection_message(
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping message generation.")
         return None
+
+    import httpx
 
     url = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -294,6 +295,8 @@ def generate_feed_comment(post_content: str) -> dict | None:
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping comment generation.")
         return None
+
+    import httpx
 
     url = "https://openrouter.ai/api/v1/chat/completions"
 
@@ -397,6 +400,9 @@ def get_next_connect_action(
         )
         return None
 
+    import httpx
+    from dom_minifier import minify_dom
+
     minified_html = minify_dom(raw_html, max_length=MAX_DOM_LENGTH)
     logger.debug(f"DOM minified: {len(raw_html)} -> {len(minified_html)} chars")
 
@@ -478,6 +484,8 @@ def parse_profile(page_text: str, profile_name: str, profile_url: str) -> dict |
     if not api_key:
         logger.warning("OPENROUTER_API_KEY is not set. Skipping profile parsing.")
         return None
+
+    import httpx
 
     text_field = {"type": "string"}
     count_field = {"type": ["string", "null"]}

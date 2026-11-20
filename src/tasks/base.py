@@ -1,10 +1,12 @@
 from abc import ABC, abstractmethod
 import logging
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from playwright.sync_api import Page
 from human_actions import HumanActions
 from exceptions import SessionExpiredException
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 logger = logging.getLogger(__name__)
 

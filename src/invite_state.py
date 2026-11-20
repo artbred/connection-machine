@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from state_json import write_state_json
+
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +156,7 @@ class InviteStateStore:
         return state
 
     def save(self, state: dict[str, Any]) -> None:
-        serialized = self._serialize_state(state)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            json.dumps(serialized, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_state_json(self.path, self._serialize_state(state))
 
     def get_active_cooldown(self, now: datetime | None = None) -> dict[str, Any] | None:
         return self._active_cooldown(self.load(), now)

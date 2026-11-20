@@ -4,6 +4,7 @@ import logging
 import re
 
 from datetime import datetime, timedelta
+from functools import lru_cache
 from pathlib import Path
 from typing import Any
 from urllib.parse import urljoin
@@ -12,6 +13,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from .base import BaseTask
+from state_json import write_state_json
 from connection_state import ConnectionState, detect_connection_state
 from db import Task, TaskStatus, TaskType
 from linkedin_profile import canonical_profile_url, wait_for_profile
@@ -53,6 +55,16 @@ def notification_key(profile_url: str, text: str) -> str:
 
 def is_comment_engagement_notification(text: str) -> bool:
     return bool(COMMENT_ENGAGEMENT_RE.search(" ".join(text.split())))
+
+
+@lru_cache(maxsize=1)
+def _read_last_scan(path: Path, revision: tuple[int, ...]) -> dict:
+    # Cache only dashboard counters, never profile or deduplication decisions.
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict) or not ("profiles" in raw or "seen_notifications" in raw):
+        return {}
+    summary = raw.get("last_scan")
+    return summary if isinstance(summary, dict) else {}
 
 
 class NotificationReplyInviteScanner(BaseTask):
@@ -321,7 +333,7 @@ class NotificationReplyInviteScanner(BaseTask):
         db: Session,
         normalized_url: str,
     ) -> Task | None:
-        rows = select(Task.id, Task.payload).where(Task.type == TaskType.SEND_INVITE)
+        rows = select(Task.id, Task.payload).where(Task.type == TaskType.SEND_INVITE).order_by(Task.id)
         with db.execute(rows.execution_options(yield_per=64)) as result:
             for task_id, raw_payload in result:
                 try:
@@ -416,11 +428,7 @@ class NotificationReplyInviteScanner(BaseTask):
         }
 
     def _save_state(self, state: dict[str, Any]) -> None:
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        self.state_path.write_text(
-            json.dumps(state, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_state_json(self.state_path, state)
 
     def _record_state(
         self,
@@ -483,9 +491,14 @@ class NotificationReplyInviteScanner(BaseTask):
             self._save_state(state)
 
     def get_metrics_snapshot(self) -> dict[str, Any]:
-        state = self._load_state()
-        last_scan = state.get("last_scan") if isinstance(state, dict) else {}
-        if not isinstance(last_scan, dict):
+        try:
+            stat = self.state_path.stat()
+            revision = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            last_scan = _read_last_scan(self.state_path, revision)
+        except FileNotFoundError:
+            last_scan = {}
+        except (OSError, ValueError) as exc:
+            logger.warning("Failed to read notification reply scan summary: %s", exc)
             last_scan = {}
 
         scanned_at = None

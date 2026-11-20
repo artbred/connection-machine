@@ -1,21 +1,17 @@
 import logging
 import re
 from enum import Enum
+from typing import TYPE_CHECKING
 
-from playwright.sync_api import Error as PlaywrightError, Page
-
-from connect_heuristics import (
-    ACTION_SELECTOR,
-    _control_identity_matches,
-    _normalize,
-    is_target_action,
-)
 from linkedin_profile import (
     ProfileIdentity,
     assert_profile_identity,
     get_profile_topcard,
     is_profile_owned_element,
 )
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page
 
 logger = logging.getLogger(__name__)
 
@@ -44,8 +40,16 @@ def resolve_connection_state(
     return ConnectionState.UNKNOWN
 
 
-def detect_connection_state(page: Page, identity: ProfileIdentity) -> ConnectionState:
+def detect_connection_state(page: "Page", identity: ProfileIdentity) -> ConnectionState:
     """Read only the verified owner's controls and degree badge; never sidebars."""
+    from playwright.sync_api import Error as PlaywrightError
+    from connect_heuristics import (
+        ACTION_SELECTOR,
+        _control_identity_matches,
+        _normalize,
+        is_target_action,
+    )
+
     assert_profile_identity(page, identity)
     scope = get_profile_topcard(page, identity)
     if scope is None:

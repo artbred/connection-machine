@@ -3,7 +3,6 @@ import logging
 import os
 import re
 
-import httpx
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -35,6 +34,8 @@ def _telegram_config() -> tuple[str | None, str | None, str | None]:
 
 
 def _post_notification(url: str, api_key: str, payload: dict) -> None:
+    import httpx
+
     headers = {
         "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",

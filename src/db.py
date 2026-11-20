@@ -12,6 +12,7 @@ from sqlalchemy.orm import (
 )
 from sqlalchemy import (
     create_engine,
+    Index,
     Integer,
     Text,
     DateTime,
@@ -56,8 +57,13 @@ class TaskStatus(str, enum.Enum):
 
 class Task(Base):
     __tablename__ = "linkedin_tasks"
+    __table_args__ = (
+        Index("ix_tasks_queue", "status", "type", "created_at", "id", "not_before"),
+        Index("ix_tasks_deadline", "status", "type", "not_before"),
+        Index("ix_tasks_history", "status", "type", "executed_at"),
+    )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True, index=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
     type: Mapped[TaskType] = mapped_column(
         SqlEnum(
             TaskType,
@@ -103,7 +109,7 @@ def get_db() -> Generator[Session, None, None]:
 
 
 def init_db():
-    """Create tables and add deferred-preflight fields without rewriting tasks."""
+    """Create tables and add missing retry fields and scheduling indexes in place."""
     try:
         if engine.dialect.name == "sqlite":
             db_path = engine.url.database
@@ -128,6 +134,9 @@ def init_db():
                     connection.exec_driver_sql(
                         f"ALTER TABLE {table_name} ADD {column_ddl}"
                     )
+            # create_all skips indexes on tables that already existed.
+            for index in Task.__table__.indexes:
+                index.create(bind=connection, checkfirst=True)
         logger.info("Database initialized and task schema upgraded.")
     except Exception as e:
         logger.error(f"Error initializing database: {e}")

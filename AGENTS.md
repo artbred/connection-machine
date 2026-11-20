@@ -72,6 +72,7 @@ Task statuses:
 ### Dispatcher cadence
 
 - Poll interval is 10 seconds
+- Cold startup does not import Playwright or HTTPX; after first use Python may retain the libraries, but not the browser/driver processes. Disabled metrics skip history and dashboard-count queries, not scheduling checks. Notification metrics cache only the last scan summary, keyed by the file revision; eligibility, cooldowns and deduplication still read authoritative state.
 - Interrupted `processing` invitations are held as `failed` / `invite_not_confirmed` for reconciliation, never blindly replayed; other stuck task types are reset to `pending`
 - stale pending `create_post` tasks older than one hour are deleted
 - legacy DB-backed feed-comment tasks are deleted
@@ -124,7 +125,7 @@ Additional cooldowns are applied for known LinkedIn skip reasons:
 
 The first acquisition checks the public IP. Each acquisition checks authentication before any queued task is claimed; debug and auth-only commands still acquire immediately. Persistent login cookies and local storage belong to the WebKit profile; keep it private on the worker host.
 
-Startup runs `init_db()` before browser activity. Existing task databases receive additive, idempotent `not_before` and `preflight_retries` columns without replacing task rows. Back up live state before rollout. Older workers can read the expanded schema but do not honor deferred-retry deadlines, so rollback requires attention to pending deferred tasks.
+Startup runs `init_db()` before browser activity. Existing task databases receive the `not_before` and `preflight_retries` columns plus three indexes for runnable order, earliest deferral and recent quota events. Index creation is idempotent but can hold a write lock on first upgrade: back up live state, allow disk space for the indexes, and stop the previous worker. Older workers do not honor deferred-retry deadlines. Local history files retain the same JSON schema; writes stream compact JSON to a sibling temporary file and atomically replace the previous snapshot.
 
 ### Migrating an existing worker
 
@@ -144,9 +145,27 @@ docker build -t connection-machine:100mb-check .
 python3 utils/accept_100mb.py > /tmp/connection-machine-acceptance.jsonl
 ```
 
-The runner tests the packaged source in fresh Linux containers without a network, credentials or production volumes. The hard limit is **99,999,744 bytes** (100 decimal MB rounded down to a kernel page); `memory.swap.max=0`. Each record contains cgroup peak bytes, CPU microseconds, exit status and any OOM or timeout. A skip or missing measurement is not a pass. On Linux/arm64, 15 of 26 checks passed; all 11 browser fixtures (login persistence, four invitation paths, posting, commenting, notifications and three dry runs) encountered OOM. Those workflows did **not** complete.
+The runner tests the packaged source in fresh Linux containers without a network, credentials or production volumes. The hard limit is **99,999,744 bytes** (100 decimal MB rounded down to a kernel page); `memory.swap.max=0`. Each record contains cgroup peak bytes, CPU microseconds, exit status and any OOM or timeout. A skip or missing measurement is not a pass. On the optimized Linux/arm64 image, 15 of 26 checks passed. All 11 browser fixtures reached the limit and failed: seven reported OOM, four timed out. Login persistence, invitation delivery, posting, commenting and real-page previews remain unverified under this cap.
 
-Separate measurement of the actual idle worker with metrics enabled and a durable invite cooldown: 57.62 MB cgroup peak from startup through shutdown, no browser child or profile, 0.012 CPU-seconds in an 11-second idle interval. After streaming the notification lookup, ten last-row lookups on a synthetic 10,000-invite SQLite queue used 53.33 MB peak vs 67.07 MB, and 0.705 vs 1.092 CPU-seconds. One hundred metrics snapshots of a 1,000-event history used 0.100 vs 0.429 CPU-seconds after replacing five parses with one. These are local fixtures, not estimates of live memory or CPU.
+### Local optimization measurements
+
+Compared with `da3b5be` in separate offline Linux/arm64 containers, one CPU, no swap, the same 99,999,744-byte limit. CPU figures are process CPU time for the named work, excluding fixture setup; peaks include the container's charged file cache and are not a production sizing guarantee.
+
+| Workload | Before | After |
+|---|---:|---:|
+| Cold idle worker with metrics: Python RSS, two polls under a durable cooldown | 64.82 MB | 54.10 MB |
+| Same run, whole-container peak from startup to shutdown | 89.69 MB | 46.55 MB |
+| 100 full-quota polls, 10,000 pending invites, metrics enabled | 1.565 CPU-s / 1,000 SQL statements | 0.528 CPU-s / 600 statements |
+| Same polls, metrics disabled | 1.543 CPU-s / 1,000 statements | 0.226 CPU-s / 400 statements |
+| 100 dashboard reads of unchanged 2,000-profile notification state | 0.330 CPU-s | 0.0041 CPU-s |
+| Cleanup of 36,000 interrupted or obsolete fixture tasks | 0.433 CPU-s / 97.62 MB peak | 0.064 CPU-s / 56.63 MB peak |
+| Minify a 1.60-million-character selector context to the existing 50,000-character budget | 0.106 CPU-s | 0.0050 CPU-s, identical output |
+| Write/read notification state with 15,000 profiles | 93.65 MB peak / 6.61 MB file | 69.08 MB peak / 5.32 MB file |
+| Import a 300,000-row synthetic CSV | OOM on 15 MB input | 10,000 selected and verified in order, 78.31 MB peak |
+
+The importer also completed a **135.38 MB** CSV under the same cap, at the memory limit without an OOM kill. It uses temporary disk for exact first-occurrence deduplication. Selection still takes the top 10,000 *before* excluding invites already in the database. These measurements exercise the scheduler, import and serialization paths; none demonstrates that a real authenticated page fits.
+
+### Browser alternatives measured
 
 Candidate probes below used the same whole-container limit with no swap. A renderer-only failure rules out that tested configuration; a renderer-only success does not prove a worker with its scheduler, real login and live page fits. The fixtures differ by capability; the peaks are **not** a performance ranking.
 

@@ -247,7 +247,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
                     if discovery == 'heuristic':
                         result = task.send_connection_request(TARGET)
                     else:
-                        with patch.object(invite, 'try_heuristic_connect', return_value=False):
+                        with patch.object(connect_heuristics, 'try_heuristic_connect', return_value=False):
                             result = task.send_connection_request(TARGET)
                 generator.assert_called_once()
                 self.assertEqual(llm.call_count, 1 if discovery == 'llm' else 0)
@@ -428,8 +428,8 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
         self.parse_profile.return_value = dict(PARSED, headline="", about="")
         with (
             patch.object(invite, "generate_connection_message") as generator,
-            patch.object(invite, "try_heuristic_connect") as connect,
-            patch.object(invite, "get_cached_connect_button") as cached,
+            patch.object(connect_heuristics, "try_heuristic_connect") as connect,
+            patch.object(connect_heuristics, "get_cached_connect_button") as cached,
             patch.object(invite, "get_next_connect_action") as selector,
             self.assertRaises(TaskSkippedException) as caught,
         ):
@@ -451,8 +451,8 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
                     patch.object(
                         invite, "generate_connection_message", return_value=note
                     ) as generator,
-                    patch.object(invite, "try_heuristic_connect") as connect,
-                    patch.object(invite, "get_cached_connect_button") as cached,
+                    patch.object(connect_heuristics, "try_heuristic_connect") as connect,
+                    patch.object(connect_heuristics, "get_cached_connect_button") as cached,
                     patch.object(invite, "get_next_connect_action") as selector,
                     self.assertRaises(TaskSkippedException) as caught,
                 ):
@@ -653,7 +653,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             patch.object(
                 invite, "generate_connection_message", side_effect=change_recipient
             ),
-            patch.object(invite, "try_heuristic_connect") as connect,
+            patch.object(connect_heuristics, "try_heuristic_connect") as connect,
             self.assertRaises(TaskSkippedException) as caught,
         ):
             task.send_connection_request(TARGET)
@@ -674,7 +674,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             patch.object(
                 invite, "generate_connection_message", side_effect=change_profile
             ),
-            patch.object(invite, "try_heuristic_connect") as connect,
+            patch.object(connect_heuristics, "try_heuristic_connect") as connect,
             self.assertRaises(TaskSkippedException) as caught,
         ):
             task.send_connection_request(TARGET)
@@ -764,7 +764,7 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             {"selector": "#menu-connect", "expected_text": "Connect"},
         ]
         with (
-            patch.object(invite, "try_heuristic_connect", return_value=False),
+            patch.object(connect_heuristics, "try_heuristic_connect", return_value=False),
             patch.object(invite, "get_next_connect_action", side_effect=actions),
         ):
             result = task.send_connection_request(TARGET, try_personal_message=False)

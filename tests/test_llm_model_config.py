@@ -78,7 +78,7 @@ class RequestPayloadModelTest(unittest.TestCase):
             sent["model"] = json["model"]
             return FakeResponse()
 
-        with patch.object(llm.httpx, "post", side_effect=fake_post):
+        with patch("httpx.post", side_effect=fake_post):
             call()
         self.assertIn("model", sent, "request was never sent")
         return sent["model"]

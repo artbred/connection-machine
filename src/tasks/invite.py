@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import base64
 import hashlib
 import json
@@ -7,23 +9,14 @@ import re
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Optional, Tuple
-
-from playwright.sync_api import Locator
+from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 from .base import BaseTask
 from invite_state import InviteStateStore, INVITE_SKIP_COOLDOWNS
 from llm import generate_connection_message, get_next_connect_action, parse_profile
 from notifications import escape_html_text, send_notification
+from state_json import write_state_json
 from connection_state import detect_connection_state, ConnectionState
-from connect_heuristics import (
-    MENU_SELECTOR,
-    try_heuristic_connect,
-    get_cached_connect_button,
-    is_target_action,
-    is_actionable_target,
-    save_selector_to_cache,
-)
 from exceptions import TaskSkippedException
 from invite_modal import (
     ADD_NOTE_SELECTOR,
@@ -42,6 +35,9 @@ from linkedin_profile import (
     wait_for_profile,
     wait_for_profile_text,
 )
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Locator
 
 logger = logging.getLogger(__name__)
 
@@ -758,6 +754,8 @@ class InviteTask(BaseTask):
         identity = self._require_target_identity()
         assert_profile_identity(self.page, identity)
         if self._profile_menu_open:
+            from connect_heuristics import MENU_SELECTOR
+
             roots = []
             for menu in self.page.locator(MENU_SELECTOR).all():
                 if menu.is_visible() and menu.evaluate(
@@ -1168,11 +1166,7 @@ class InviteTask(BaseTask):
             "url": url,
         }
 
-        INVITE_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        INVITE_HISTORY_PATH.write_text(
-            json.dumps(history, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_state_json(INVITE_HISTORY_PATH, history)
 
     def _after_connect_click(self, url: str, connection_message: Optional[str]) -> dict:
         try:
@@ -1286,6 +1280,8 @@ class InviteTask(BaseTask):
     def _click_connect_target(
         self, target: Locator, connection_message: Optional[str]
     ) -> dict:
+        from connect_heuristics import is_target_action
+
         identity = self._require_target_identity()
         target.scroll_into_view_if_needed()
         if not is_target_action(
@@ -1307,6 +1303,14 @@ class InviteTask(BaseTask):
     def send_connection_request(
         self, url: str, try_personal_message: bool = True
     ) -> dict:
+        from connect_heuristics import (
+            get_cached_connect_button,
+            is_actionable_target,
+            is_target_action,
+            save_selector_to_cache,
+            try_heuristic_connect,
+        )
+
         url = self._normalize_profile_url(url)
         self._target_identity = None
         self._profile_menu_open = False

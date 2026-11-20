@@ -52,6 +52,15 @@ class DatabaseMigrationTests(unittest.TestCase):
         }
         self.assertTrue(columns["not_before"]["nullable"])
         self.assertFalse(columns["preflight_retries"]["nullable"])
+        indexes = inspect(engine).get_indexes("linkedin_tasks")
+        self.assertCountEqual(
+            [index["column_names"] for index in indexes if index["name"].startswith("ix_tasks_")],
+            [
+                ["status", "type", "created_at", "id", "not_before"],
+                ["status", "type", "not_before"],
+                ["status", "type", "executed_at"],
+            ],
+        )
         with engine.begin() as connection:
             connection.execute(
                 text(
@@ -141,9 +150,8 @@ class DatabaseMigrationTests(unittest.TestCase):
                         ).all(),
                         [(None, 0)] * 4,
                     )
-                self.assertEqual(
-                    inspect(engine).get_indexes("linkedin_tasks"), original_indexes
-                )
+                for original_index in original_indexes:
+                    self.assertIn(original_index, inspect(engine).get_indexes("linkedin_tasks"))
                 with Session(engine) as session:
                     self.assertEqual(
                         [

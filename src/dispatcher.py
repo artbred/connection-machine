@@ -15,7 +15,7 @@ from tasks.comment import FeedCommentTask
 from tasks.post import PostTask
 from exceptions import SessionExpiredException, TaskSkippedException
 from notifications import send_notification
-from sqlalchemy import case, func, or_
+from sqlalchemy import func, or_
 from invite_schedule import next_invite_time
 
 logger = logging.getLogger(__name__)
@@ -142,8 +142,12 @@ class TaskDispatcher:
         self._logged_no_pending: bool = False
         self._init_spacing_from_db()
         self._init_autonomous_spacing()
-        self._apply_durable_invite_cooldown()
         self._sync_next_execution_metrics()
+        self._refresh_metrics()
+
+    def _refresh_metrics(self):
+        if isinstance(self.metrics, NoopMetrics):
+            return
         self._sync_db_task_counts()
         self._sync_comment_history_metrics()
         self._sync_invite_history_metrics()
@@ -187,15 +191,25 @@ class TaskDispatcher:
                     .group_by(Task.type, Task.status)
                     .all()
                 )
+                today = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+                sent_today = db.query(func.count(Task.id)).filter(
+                    Task.type == TaskType.SEND_INVITE,
+                    Task.status == TaskStatus.COMPLETED,
+                    Task.executed_at >= today,
+                ).scalar()
             counts = {
                 (task_type.value, status.value): count
                 for task_type, status, count in rows
             }
             self.metrics.set_db_task_counts(counts)
+            total = counts.get((TaskType.SEND_INVITE.value, TaskStatus.COMPLETED.value), 0)
+            self.metrics.set_invite_summary(total, sent_today)
         except Exception as exc:
             logger.warning("Failed to refresh DB task count metrics: %s", exc)
 
     def _sync_comment_history_metrics(self):
+        if isinstance(self.metrics, NoopMetrics):
+            return
         try:
             history_entries = self.feed_comment_handler.get_comment_history_entries()
             today = datetime.utcnow().date()
@@ -238,33 +252,7 @@ class TaskDispatcher:
             )
             if not callable(get_history_entries):
                 self.metrics.set_invite_history([])
-                self.metrics.set_invite_summary(0, 0)
                 return
-
-            today_start = datetime.utcnow().replace(
-                hour=0,
-                minute=0,
-                second=0,
-                microsecond=0,
-            )
-            with SessionLocal() as db:
-                invites_sent_total = (
-                    db.query(Task)
-                    .filter(
-                        Task.type == TaskType.SEND_INVITE,
-                        Task.status == TaskStatus.COMPLETED,
-                    )
-                    .count()
-                )
-                invites_sent_today = (
-                    db.query(Task)
-                    .filter(
-                        Task.type == TaskType.SEND_INVITE,
-                        Task.status == TaskStatus.COMPLETED,
-                        Task.executed_at >= today_start,
-                    )
-                    .count()
-                )
 
             recent_entries = [
                 {
@@ -277,12 +265,13 @@ class TaskDispatcher:
                 }
                 for entry in get_history_entries()[:INVITE_HISTORY_RECENT_ENTRY_LIMIT]
             ]
-            self.metrics.set_invite_summary(invites_sent_total, invites_sent_today)
             self.metrics.set_invite_history(recent_entries)
         except Exception as exc:
             logger.warning("Failed to refresh invite history metrics: %s", exc)
 
     def _sync_invite_state_metrics(self):
+        if isinstance(self.metrics, NoopMetrics):
+            return
         try:
             snapshot = self.invite_state.get_metrics_snapshot()
             cooldown = snapshot.get("cooldown")
@@ -331,6 +320,8 @@ class TaskDispatcher:
             logger.warning("Failed to refresh invite state metrics: %s", exc)
 
     def _sync_notification_reply_invite_metrics(self):
+        if isinstance(self.metrics, NoopMetrics):
+            return
         try:
             snapshot = self.notification_reply_invite_scanner.get_metrics_snapshot()
             self.metrics.set_notification_reply_invite_scan(
@@ -369,14 +360,15 @@ class TaskDispatcher:
         )
 
     def _invite_quota_events(self, db, now: datetime):
-        return db.query(Task.executed_at).filter(
+        history = db.query(Task.executed_at).filter(
             Task.type == TaskType.SEND_INVITE,
-            or_(
-                Task.status == TaskStatus.COMPLETED,
-                (Task.status == TaskStatus.FAILED)
-                & (Task.error == "invite_not_confirmed"),
-            ),
             Task.executed_at >= now - timedelta(hours=24),
+        )
+        # Merge two ordered index ranges; equal timestamps still reserve separate slots.
+        return history.filter(Task.status == TaskStatus.COMPLETED).union_all(
+            history.filter(
+                Task.status == TaskStatus.FAILED, Task.error == "invite_not_confirmed"
+            )
         )
 
     def _refresh_invite_schedule(
@@ -413,7 +405,7 @@ class TaskDispatcher:
                     self._refresh_invite_schedule(db)
                     continue
                 last_task = (
-                    db.query(Task)
+                    db.query(Task.executed_at)
                     .filter(
                         Task.type == task_type,
                         Task.status == TaskStatus.COMPLETED,
@@ -476,7 +468,7 @@ class TaskDispatcher:
         max_cooldown = max(cooldowns_for_type.values())
         lookback_start = datetime.utcnow() - max_cooldown
         recent_skips = (
-            db.query(Task)
+            db.query(Task.executed_at, Task.error)
             .filter(
                 Task.type == task_type,
                 Task.status == TaskStatus.FAILED,
@@ -484,7 +476,7 @@ class TaskDispatcher:
                 Task.executed_at >= lookback_start,
             )
             .order_by(Task.executed_at.desc())
-            .all()
+            .yield_per(64)
         )
 
         for skipped_task in recent_skips:
@@ -524,55 +516,59 @@ class TaskDispatcher:
     def cleanup_zombie_tasks(self):
         """Hold interrupted invitations; only other task types can safely be reset here."""
         with SessionLocal() as db:
-            zombies = db.query(Task).filter(Task.status == TaskStatus.PROCESSING).all()
-            for task in zombies:
-                if task.type == TaskType.SEND_INVITE:
-                    task.status = TaskStatus.FAILED
-                    task.error = "invite_not_confirmed"
-                    task.executed_at = datetime.utcnow()
-                    task.not_before = None
-                    logger.warning(
-                        "Holding interrupted invite task %s for reconciliation", task.id
-                    )
-                else:
-                    task.status = TaskStatus.PENDING
+            processing = db.query(Task).filter(Task.status == TaskStatus.PROCESSING)
+            held = processing.filter(Task.type == TaskType.SEND_INVITE).update(
+                {
+                    Task.status: TaskStatus.FAILED,
+                    Task.error: "invite_not_confirmed",
+                    Task.executed_at: datetime.utcnow(),
+                    Task.not_before: None,
+                },
+                synchronize_session=False,
+            )
+            processing.filter(Task.type != TaskType.SEND_INVITE).update(
+                {Task.status: TaskStatus.PENDING}, synchronize_session=False
+            )
+            if held:
+                logger.warning(
+                    "Holding %d interrupted invite tasks for reconciliation", held
+                )
             db.commit()
 
     def cleanup_old_pending_posts(self):
         """Delete pending CREATE_POST tasks older than 1 hour."""
         with SessionLocal() as db:
             one_hour_ago = datetime.utcnow() - timedelta(hours=1)
-            old_posts = (
+            deleted = (
                 db.query(Task)
                 .filter(
                     Task.type == TaskType.CREATE_POST,
                     Task.status == TaskStatus.PENDING,
                     Task.created_at < one_hour_ago,
                 )
-                .all()
+                .delete(synchronize_session=False)
             )
-            if old_posts:
+            if deleted:
                 logger.warning(
-                    f"Deleting {len(old_posts)} stale pending CREATE_POST tasks (older than 1 hour)."
+                    "Deleting %d stale pending CREATE_POST tasks (older than 1 hour).",
+                    deleted,
                 )
-                for task in old_posts:
-                    db.delete(task)
                 db.commit()
 
     def cleanup_db_backed_feed_comment_tasks(self):
         """Remove legacy DB-backed feed comment tasks. Feed comments now run autonomously."""
         with SessionLocal() as db:
-            comment_tasks = (
-                db.query(Task).filter(Task.type == TaskType.COMMENT_FEED_POST).all()
+            deleted = (
+                db.query(Task)
+                .filter(Task.type == TaskType.COMMENT_FEED_POST)
+                .delete(synchronize_session=False)
             )
-            if not comment_tasks:
+            if not deleted:
                 return
 
             logger.warning(
-                f"Deleting {len(comment_tasks)} legacy COMMENT_FEED_POST tasks from the database."
+                "Deleting %d legacy COMMENT_FEED_POST tasks from the database.", deleted
             )
-            for task in comment_tasks:
-                db.delete(task)
             db.commit()
 
     def schedule_next_execution(self, task_type: TaskType, *, db=None):
@@ -722,16 +718,20 @@ class TaskDispatcher:
         )
         return True
 
+    @staticmethod
+    def _first_pending_deadline(db, task_type):
+        pending = db.query(Task.not_before).filter(
+            Task.type == task_type, Task.status == TaskStatus.PENDING
+        )
+        head = pending.order_by(Task.not_before).first()
+        # Some databases sort NULL last; it denotes immediate eligibility, not no row.
+        if head is not None and head.not_before is not None:
+            return pending.filter(Task.not_before.is_(None)).first() or head
+        return head
+
     def _next_pending_invite_at(self, now: datetime) -> datetime | None:
         with SessionLocal() as db:
-            pending = (
-                db.query(Task.not_before)
-                .filter(
-                    Task.type == TaskType.SEND_INVITE, Task.status == TaskStatus.PENDING
-                )
-                .order_by(Task.not_before.asc().nullsfirst())
-                .first()
-            )
+            pending = self._first_pending_deadline(db, TaskType.SEND_INVITE)
         if pending is None:
             return None
         due = max(now, pending[0] or now, self._refresh_invite_schedule(now=now))
@@ -752,26 +752,20 @@ class TaskDispatcher:
             < NOTIFICATION_REPLY_SCAN_INTERVAL
         ):
             return False
-        if not self._background_window_open():
+        with SessionLocal() as db:
+            limit = self.rate_limits[TaskType.SEND_INVITE]
+            recent_count = self._invite_quota_events(db, now).limit(limit).count()
+        if recent_count >= limit:
             return False
         if self.invite_state.get_active_cooldown(now=now):
             return False
-        with SessionLocal() as db:
-            recent_count = self._invite_quota_events(db, now).count()
-            pending_exists = (
-                db.query(Task.id)
-                .filter(
-                    Task.type == TaskType.SEND_INVITE, Task.status == TaskStatus.PENDING
-                )
-                .first()
-                is not None
-            )
-        if recent_count >= self.rate_limits[TaskType.SEND_INVITE]:
+        due = self._next_pending_invite_at(now)
+        if due is not None and due - now < INVITE_BACKGROUND_GUARD:
             return False
         # Move the old once-per-invite scan into idle time, without multiplying
         # profile visits just because the worker has a large pending backlog.
         if (
-            pending_exists
+            due is not None
             and self._last_invite_quota_event_at
             and self._last_notification_reply_scan
             and self._last_notification_reply_scan >= self._last_invite_quota_event_at
@@ -785,6 +779,19 @@ class TaskDispatcher:
         except Exception as exc:
             logger.warning("Notification reply invite scan failed: %s", exc)
         return True
+
+    @staticmethod
+    def _completed_quota_reached(db, task_type, since, limit):
+        return (
+            db.query(Task.executed_at)
+            .filter(
+                Task.type == task_type,
+                Task.status == TaskStatus.COMPLETED,
+                Task.executed_at >= since,
+            )
+            .limit(limit)
+            .count() >= limit
+        )
 
     def get_rate_limited_types(self, pending_types: set[TaskType]) -> list[TaskType]:
         """Return list of task types currently blocked by rate limits or spacing delays.
@@ -808,16 +815,7 @@ class TaskDispatcher:
                     continue
 
                 # Check daily rate limit
-                count = (
-                    db.query(Task)
-                    .filter(
-                        Task.type == task_type,
-                        Task.executed_at >= last_24h,
-                        Task.status == TaskStatus.COMPLETED,
-                    )
-                    .count()
-                )
-                if count >= limit:
+                if self._completed_quota_reached(db, task_type, last_24h, limit):
                     blocked.append(task_type)
                     continue
 
@@ -854,16 +852,7 @@ class TaskDispatcher:
             return self._refresh_invite_schedule() > datetime.utcnow()
 
         with SessionLocal() as db:
-            count = (
-                db.query(Task)
-                .filter(
-                    Task.type == task_type,
-                    Task.executed_at >= last_24h,
-                    Task.status == TaskStatus.COMPLETED,
-                )
-                .count()
-            )
-            if count >= limit:
+            if self._completed_quota_reached(db, task_type, last_24h, limit):
                 return True
 
         next_allowed = self.next_execution_at.get(task_type)
@@ -871,27 +860,19 @@ class TaskDispatcher:
 
     def poll(self):
         """Fetch and execute pending tasks."""
-        self._apply_durable_invite_cooldown()
         self.metrics.mark_poll()
-        self._sync_db_task_counts()
-        self._sync_comment_history_metrics()
-        self._sync_invite_history_metrics()
-        self._sync_invite_state_metrics()
-        self._sync_notification_reply_invite_metrics()
+        self._refresh_metrics()
 
-        # Get distinct pending task types first
         with SessionLocal() as db:
-            pending_types = set(
-                row[0]
-                for row in db.query(Task.type)
-                .filter(
-                    Task.status == TaskStatus.PENDING,
-                    Task.type.in_(tuple(self.handlers.keys())),
-                )
-                .distinct()
-                .all()
-            )
-
+            first_deadlines = {
+                kind: head.not_before
+                for kind in self.handlers
+                if (head := self._first_pending_deadline(db, kind)) is not None
+            }
+        pending_types = set(first_deadlines)
+        # With pending invites the rate check itself reloads the durable cooldown.
+        if TaskType.SEND_INVITE not in pending_types:
+            self._apply_durable_invite_cooldown()
         blocked_types = self.get_rate_limited_types(pending_types)
 
         # Short per-visit throttle: block SEND_INVITE while a recent profile
@@ -904,20 +885,28 @@ class TaskDispatcher:
         ):
             blocked_types = [*blocked_types, TaskType.SEND_INVITE]
 
+        now = datetime.utcnow()
+        runnable_types = {
+            kind
+            for kind, deadline in first_deadlines.items()
+            if kind not in blocked_types and (deadline is None or deadline <= now)
+        }
         with SessionLocal() as db:
-            query = db.query(Task).filter(
-                Task.status == TaskStatus.PENDING,
-                Task.type.in_(tuple(self.handlers.keys())),
-                or_(Task.not_before.is_(None), Task.not_before <= datetime.utcnow()),
-            )
-            if blocked_types:
-                query = query.filter(Task.type.notin_(blocked_types))
-
-            task_to_run = query.order_by(
-                case((Task.type == TaskType.SEND_INVITE, 0), else_=1),
-                Task.created_at,
-                Task.id,
-            ).first()
+            task_to_run = None
+            if runnable_types:
+                query = (
+                    db.query(Task)
+                    .filter(
+                        Task.status == TaskStatus.PENDING,
+                        or_(Task.not_before.is_(None), Task.not_before <= now),
+                    )
+                    .order_by(Task.created_at, Task.id)
+                )
+                if TaskType.SEND_INVITE in runnable_types:
+                    task_to_run = query.filter(Task.type == TaskType.SEND_INVITE).first()
+                    runnable_types.remove(TaskType.SEND_INVITE)
+                if task_to_run is None and runnable_types:
+                    task_to_run = query.filter(Task.type.in_(runnable_types)).first()
 
             if not task_to_run:
                 if self._maybe_scan_notification_replies():
@@ -1083,11 +1072,7 @@ class TaskDispatcher:
                     outcome,
                     time.monotonic() - started_at,
                 )
-                self._sync_db_task_counts()
-                self._sync_comment_history_metrics()
-                self._sync_invite_history_metrics()
-                self._sync_invite_state_metrics()
-                self._sync_notification_reply_invite_metrics()
+                self._refresh_metrics()
                 try:
                     state_payload = json.loads(task_to_run.payload)
                     if state_payload.get("source") == "notification_reply":

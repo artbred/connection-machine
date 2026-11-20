@@ -31,7 +31,7 @@ class DryRunTests(unittest.TestCase):
             tempfile.TemporaryDirectory() as work,
             chdir(work),
             patch.object(main.signal, 'signal'),
-            patch.object(main, 'sync_playwright', return_value=playwright),
+            patch('playwright.sync_api.sync_playwright', return_value=playwright),
             patch.object(main, 'check_linkedin_auth', return_value=False),
             patch.object(main, 'login', side_effect=AssertionError('Preview submitted credentials')),
             patch.object(main, 'init_db', side_effect=AssertionError('Preview opened queue')),

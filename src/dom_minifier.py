@@ -24,13 +24,28 @@ REMOVE_ELEMENTS = frozenset({
 MAX_CLASSES = 4
 
 
+class _PrefixComplete(Exception):
+    """The parser produced more than the caller can use."""
+
+
 class DOMMinifier(HTMLParser):
-    def __init__(self):
+    def __init__(self, max_length: int | None = None):
         super().__init__()
         self.output = []
+        self.remaining = max_length if max_length and max_length > 0 else None
         self.skip_depth = 0
         self.skip_element = None
         
+    def _emit(self, text: str):
+        # Each emitted fragment either is a tag or has already been stripped.
+        compact = re.sub(r'\s+', ' ', text).replace('> <', '><')
+        if self.remaining is not None:
+            if len(compact) > self.remaining:
+                self.output.append(compact[:self.remaining + 1])
+                raise _PrefixComplete
+            self.remaining -= len(compact)
+        self.output.append(compact)
+
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]):
         if self.skip_depth > 0:
             if tag == self.skip_element:
@@ -53,9 +68,9 @@ class DOMMinifier(HTMLParser):
         
         if filtered_attrs:
             attr_str = ' '.join(f'{n}="{v}"' for n, v in filtered_attrs)
-            self.output.append(f'<{tag} {attr_str}>')
+            self._emit(f'<{tag} {attr_str}>')
         else:
-            self.output.append(f'<{tag}>')
+            self._emit(f'<{tag}>')
     
     def handle_endtag(self, tag: str):
         if self.skip_depth > 0:
@@ -65,7 +80,7 @@ class DOMMinifier(HTMLParser):
                     self.skip_element = None
             return
         
-        self.output.append(f'</{tag}>')
+        self._emit(f'</{tag}>')
     
     def handle_data(self, data: str):
         if self.skip_depth > 0:
@@ -73,7 +88,7 @@ class DOMMinifier(HTMLParser):
         
         text = ' '.join(data.split())
         if text:
-            self.output.append(text)
+            self._emit(text)
     
     def handle_startendtag(self, tag: str, attrs: list[tuple[str, Optional[str]]]):
         if self.skip_depth > 0 or tag in REMOVE_ELEMENTS:
@@ -90,21 +105,21 @@ class DOMMinifier(HTMLParser):
         
         if filtered_attrs:
             attr_str = ' '.join(f'{n}="{v}"' for n, v in filtered_attrs)
-            self.output.append(f'<{tag} {attr_str}/>')
+            self._emit(f'<{tag} {attr_str}/>')
         else:
-            self.output.append(f'<{tag}/>')
+            self._emit(f'<{tag}/>')
     
     def get_minified(self) -> str:
-        result = ''.join(self.output)
-        result = re.sub(r'\s+', ' ', result)
-        result = re.sub(r'>\s+<', '><', result)
-        return result.strip()
+        return ''.join(self.output)
 
 
 def minify_dom(html: str, max_length: Optional[int] = None) -> str:
     try:
-        parser = DOMMinifier()
-        parser.feed(html)
+        parser = DOMMinifier(max_length)
+        try:
+            parser.feed(html)
+        except _PrefixComplete:
+            pass
         result = parser.get_minified()
         
         if max_length and len(result) > max_length:

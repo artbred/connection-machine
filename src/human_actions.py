@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import random
 import time
 import math
 import logging
-from typing import Union, List, Tuple
-from playwright.sync_api import Page, Locator
+from typing import TYPE_CHECKING, Union, List, Tuple
+
+if TYPE_CHECKING:
+    from playwright.sync_api import Page, Locator
 
 logger = logging.getLogger(__name__)
 

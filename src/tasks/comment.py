@@ -14,6 +14,7 @@ from .base import BaseTask
 from exceptions import TaskSkippedException
 from llm import generate_feed_comment
 from notifications import send_notification
+from state_json import write_state_json
 
 logger = logging.getLogger(__name__)
 
@@ -826,11 +827,7 @@ class FeedCommentTask(BaseTask):
             "post_href": candidate.get("post_href"),
         }
 
-        COMMENT_HISTORY_PATH.parent.mkdir(parents=True, exist_ok=True)
-        COMMENT_HISTORY_PATH.write_text(
-            json.dumps(history, ensure_ascii=False, indent=2),
-            encoding="utf-8",
-        )
+        write_state_json(COMMENT_HISTORY_PATH, history)
 
     def _extract_shareable_post_link(self, candidate: dict[str, Any]) -> str | None:
         """Try to extract a proper shareable LinkedIn post link.

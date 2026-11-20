@@ -1,8 +1,11 @@
 import csv
 import json
-import os
-import sys
 import logging
+import os
+import sqlite3
+import sys
+from contextlib import closing
+from itertools import islice
 
 # Add the project root directory to sys.path so we can import from src
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -14,138 +17,104 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 
-def get_existing_urls(session) -> set:
-    """Get all existing LinkedIn URLs from the database."""
-    tasks = session.query(Task).filter(Task.type == TaskType.SEND_INVITE).all()
-    existing_urls = set()
-    for task in tasks:
+def _select_candidates(spool, csv_path):
+    # WITHOUT ROWID stores each URL only once. The first qualifying row wins.
+    spool.execute(
+        "CREATE TABLE candidates (url TEXT PRIMARY KEY, rank TEXT, seq INTEGER) WITHOUT ROWID"
+    )
+    add = spool.cursor()
+    filtered = 0
+    with open(csv_path, encoding="utf-8") as f:
+        for row in csv.DictReader(f):
+            url = row.get("linkedin_url", "").strip()
+            rank_str = row.get("rank", "").strip()
+            if "/in/" not in url:
+                continue
+            try:
+                rank = int(rank_str)
+            except ValueError:
+                continue
+            if rank > 1000:
+                add.execute(
+                    "INSERT OR IGNORE INTO candidates VALUES (?, ?, ?)",
+                    (url, str(rank), filtered),
+                )
+                filtered += 1
+    csv_duplicates = filtered - spool.total_changes
+    # Positive decimal strings ordered by length then digits retain Python's
+    # integer ordering even for ranks too large for SQLite's signed integers.
+    spool.execute("CREATE TABLE selected (url TEXT UNIQUE)")
+    selected = spool.execute(
+        "INSERT INTO selected SELECT url FROM candidates "
+        "ORDER BY length(rank), rank, seq LIMIT 10000"
+    ).rowcount
+    return selected, csv_duplicates
+
+
+def _existing_urls(session):
+    payloads = session.query(Task.payload).filter(Task.type == TaskType.SEND_INVITE)
+    for (payload,) in payloads.yield_per(1):
         try:
-            payload = json.loads(task.payload)
-            existing_urls.add(payload.get("url"))
+            url = json.loads(payload).get("url")
         except (json.JSONDecodeError, AttributeError):
             continue
-    return existing_urls
+        if isinstance(url, str):
+            # Escaped lone surrogates are legal in stored JSON but cannot match UTF-8 CSV.
+            yield (url.encode("utf-8", errors="surrogatepass"),)
+        elif isinstance(url, (dict, list)):
+            raise TypeError("Unhashable URL in stored invite payload")
 
 
-def populate_db_from_csv():
-    """
-    Reads people_all.csv and populates the database with 'send_invite' tasks.
-    Filters: rank > 1000, /in/ URLs only, sorts by rank, limits to 10,000.
-    """
-    csv_path = os.path.join(os.path.dirname(__file__), "people_all.csv")
+def populate_db_from_csv(
+    csv_path=os.path.join(os.path.dirname(__file__), "people_all.csv"),
+):
+    """Queue the first 10,000 unique eligible CSV URLs by rank, less existing invites."""
 
     if not os.path.exists(csv_path):
         logger.error(f"CSV file not found at: {csv_path}")
         return
 
-    # Initialize DB (ensure tables exist)
     init_db()
 
     session = SessionLocal()
 
     try:
-        # Get existing URLs from database
-        existing_urls = get_existing_urls(session)
-        logger.info(f"Found {len(existing_urls)} existing URLs in database")
-
-        # Read and filter CSV
-        filtered_rows = []
-        with open(csv_path, mode="r", encoding="utf-8") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                linkedin_url = row.get("linkedin_url", "").strip()
-                rank_str = row.get("rank", "").strip()
-
-                # Filter 1: Skip empty linkedin_url
-                if not linkedin_url:
-                    continue
-
-                # Filter 2: Skip if /in/ not in URL
-                if "/in/" not in linkedin_url:
-                    continue
-
-                # Filter 3: Skip empty/invalid rank
-                if not rank_str:
-                    continue
-
-                try:
-                    rank = int(rank_str)
-                except ValueError:
-                    continue
-
-                # Filter 4: Skip rank <= 1000 (we want rank > 1000)
-                if rank <= 1000:
-                    continue
-
-                filtered_rows.append({"url": linkedin_url, "rank": rank})
-
-        logger.info(
-            f"Filtered {len(filtered_rows)} rows with rank > 1000 and /in/ URLs"
-        )
-
-        # Deduplicate by linkedin_url first (keep first occurrence = lowest rank)
-        # This must happen before taking 10,000 to get 10,000 unique URLs
-        seen_urls = {}
-        for row in filtered_rows:
-            url = row["url"]
-            if url not in seen_urls:
-                seen_urls[url] = row
-
-        deduplicated_rows = list(seen_urls.values())
-        csv_duplicates = len(filtered_rows) - len(deduplicated_rows)
-        logger.info(
-            f"After deduplication: {len(deduplicated_rows)} rows ({csv_duplicates} duplicates removed)"
-        )
-
-        # Sort by rank ascending
-        deduplicated_rows.sort(key=lambda x: x["rank"])
-
-        # Take first 10,000
-        deduplicated_rows = deduplicated_rows[:10000]
-        logger.info(
-            f"After deduplication: {len(deduplicated_rows)} rows ({csv_duplicates} duplicates removed)"
-        )
-
-        # Skip URLs already in database
-        new_rows = []
-        db_duplicates = 0
-        for row in deduplicated_rows:
-            if row["url"] in existing_urls:
-                db_duplicates += 1
-            else:
-                new_rows.append(row)
-
-        logger.info(
-            f"After DB deduplication: {len(new_rows)} new tasks ({db_duplicates} already in DB)"
-        )
-
-        # Batch insert: 1000 tasks per commit
-        batch_size = 1000
-        added_count = 0
-
-        for i in range(0, len(new_rows), batch_size):
-            batch = new_rows[i : i + batch_size]
-            tasks_to_add = []
-
-            for row in batch:
-                payload_dict = {"url": row["url"]}
-                new_task = Task(
-                    type=TaskType.SEND_INVITE,
-                    payload=json.dumps(payload_dict),
-                    status=TaskStatus.PENDING,
-                )
-                tasks_to_add.append(new_task)
-
-            session.add_all(tasks_to_add)
-            session.commit()
-            added_count += len(tasks_to_add)
-            logger.info(
-                f"Inserted batch {i // batch_size + 1}: {len(tasks_to_add)} tasks"
+        # An empty SQLite filename creates a private disk-backed spool deleted on close.
+        with closing(sqlite3.connect("")) as spool:
+            spool.execute("PRAGMA temp_store=FILE")
+            spool.execute("PRAGMA journal_mode=OFF")  # Only scratch data, never the queue.
+            selected, csv_duplicates = _select_candidates(spool, csv_path)
+            db_duplicates = spool.executemany(
+                "DELETE FROM selected WHERE url = CAST(? AS TEXT)", _existing_urls(session)
+            ).rowcount
+            new_count = selected - db_duplicates
+            rows = spool.execute("SELECT url FROM selected ORDER BY rowid")
+            insert = Task.__table__.insert().values(
+                type=TaskType.SEND_INVITE, status=TaskStatus.PENDING
             )
-
-        logger.info(
-            f"Added {added_count} new tasks, skipped {db_duplicates} duplicates (DB), skipped {csv_duplicates} duplicates (CSV)"
-        )
+            for offset in range(0, new_count, 1000):
+                batch = []
+                size = 0
+                for (url,) in islice(rows, 1000):
+                    payload = json.dumps({"url": url})
+                    batch.append({"payload": payload})
+                    size += len(payload)
+                    # Long URLs must not turn a 1,000-row transaction into a huge buffer.
+                    if size >= 1024 * 1024:
+                        session.execute(insert, batch)
+                        batch.clear()
+                        size = 0
+                if batch:
+                    session.execute(insert, batch)
+                session.commit()
+                logger.info(
+                    "Inserted batch %d: %d tasks",
+                    offset // 1000 + 1, min(1000, new_count - offset),
+                )
+            logger.info(
+                "Added %d new tasks, skipped %d duplicates (DB), skipped %d duplicates (CSV)",
+                new_count, db_duplicates, csv_duplicates,
+            )
 
     except Exception as e:
         session.rollback()
