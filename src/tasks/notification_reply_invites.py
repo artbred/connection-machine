@@ -262,12 +262,40 @@ class NotificationReplyInviteScanner(BaseTask):
         max_candidates: int = MAX_LATEST_COMMENT_ENGAGEMENTS,
     ) -> list[dict[str, Any]]:
         raw_candidates = self.page.evaluate(
-            """
+            r"""
 ({ maxCandidates }) => {
-  const containers = Array.from(document.querySelectorAll('li, article, div[role="listitem"], div[data-urn], div.nt-card'));
+  const modern = 'main [data-testid="lazy-column"][data-component-type="LazyColumn"] > div';
+  const containers = document.querySelectorAll(
+    'li, article, div[role="listitem"], div[data-urn], div.nt-card, ' + modern
+  );
   const candidates = [];
 
   for (const container of containers) {
+    const row = container.closest(modern);
+    if (row && row !== container) continue;
+    if (row) {
+      // SDUI links the post to its notification headline via aria-labelledby.
+      // Match that headline, not quoted post/comment text elsewhere in the row.
+      const actors = row.querySelectorAll('a[href*="/in/"]');
+      const posts = [...row.querySelectorAll('a[href][aria-labelledby]')].filter(link => {
+        const u = new URL(link.href);
+        return u.origin === location.origin && u.pathname.startsWith('/feed/');
+      });
+      if (actors.length !== 1 || !actors[0].querySelector('img[alt="View profile" i]') ||
+          posts.length !== 1) continue;
+      const labels = posts[0].getAttribute('aria-labelledby').trim().split(/\s+/)
+        .map(id => document.getElementById(id))
+        .filter(el => el && row.contains(el) && el.firstElementChild?.matches('strong'));
+      if (labels.length !== 1) continue;
+      const name = labels[0].firstElementChild.textContent.trim();
+      const text = labels[0].textContent.replace(/\s+/g, ' ').trim();
+      if (!name || !text.startsWith(name + ' ') || text.length > 500 ||
+          !/^(?:liked|loved|celebrated|supported|shared|reposted|(?:replied|responded|reacted) to|commented on) your comments?\b/i
+            .test(text.slice(name.length + 1))) continue;
+      candidates.push({profile_url: actors[0].href, name, text});
+      if (candidates.length >= Math.max(maxCandidates * 4, 40)) break;
+      continue;
+    }
     const text = (container.textContent || '').replace(/\s+/g, ' ').trim();
     if (!text || text.length < 20 || text.length > 2000) continue;
 

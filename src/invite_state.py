@@ -121,7 +121,7 @@ class InviteStateStore:
             "events": serialized_events,
         }
 
-    def load(self) -> dict[str, Any]:
+    def load(self, *, prune: bool = True) -> dict[str, Any]:
         now = datetime.utcnow()
         state = self._default_state()
 
@@ -150,7 +150,7 @@ class InviteStateStore:
                     len(state["events"]) != len(raw_events)
                     or (raw.get("cooldown") is not None and state["cooldown"] is None)
                 )
-                if should_save_pruned:
+                if prune and should_save_pruned:
                     self.save(state)
 
         return state

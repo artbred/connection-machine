@@ -549,17 +549,7 @@ class InviteTask(BaseTask):
         active_cooldown = self.invite_state.get_active_cooldown()
 
         try:
-            if active_cooldown:
-                logger.warning(
-                    "Invite cooldown active for %s until %s",
-                    active_cooldown.get("reason") or "unknown",
-                    active_cooldown["active_until"].isoformat(),
-                )
-                raise TaskSkippedException(
-                    active_cooldown["reason"],
-                    cooldown_until=active_cooldown["active_until"],
-                    from_active_cooldown=True,
-                )
+            self._check_cooldown(active_cooldown)
 
             self.send_connection_request(url, try_personal_message)
         except TaskSkippedException as exc:
@@ -633,6 +623,20 @@ class InviteTask(BaseTask):
                 source="invite_task",
             )
             raise
+
+    @staticmethod
+    def _check_cooldown(active_cooldown: dict | None) -> None:
+        if active_cooldown:
+            logger.warning(
+                "Invite cooldown active for %s until %s",
+                active_cooldown.get("reason") or "unknown",
+                active_cooldown["active_until"].isoformat(),
+            )
+            raise TaskSkippedException(
+                active_cooldown["reason"],
+                cooldown_until=active_cooldown["active_until"],
+                from_active_cooldown=True,
+            )
 
     def _has_recent_weekly_limit_signal(self, profile_url: str) -> bool:
         cutoff = datetime.utcnow() - WEEKLY_LIMIT_CONFIRMATION_WINDOW
@@ -1300,33 +1304,36 @@ class InviteTask(BaseTask):
             ) from exc
         return self._after_connect_click(identity.url, connection_message)
 
-    def send_connection_request(
-        self, url: str, try_personal_message: bool = True
-    ) -> dict:
-        from connect_heuristics import (
-            get_cached_connect_button,
-            is_actionable_target,
-            is_target_action,
-            save_selector_to_cache,
-            try_heuristic_connect,
-        )
-
-        url = self._normalize_profile_url(url)
-        self._target_identity = None
-        self._profile_menu_open = False
-        self._send_attempted = False
-        self._last_audience_stats = None
-        logger.info("Sending connection request to %s", url)
-        self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
-        self.validate_session()
-        snapshot = self._read_preflight_profile(url)
-        identity = snapshot.identity
-        self._target_identity = identity
+    def _check_connection_state(self, identity: ProfileIdentity) -> ConnectionState:
         state = detect_connection_state(self.page, identity)
         if state == ConnectionState.PENDING:
             raise TaskSkippedException("already_pending", cooldown_eligible=False)
         if state == ConnectionState.CONNECTED:
             raise TaskSkippedException("already_connected", cooldown_eligible=False)
+        return state
+
+    def _require_no_invite_dialog(self, identity: ProfileIdentity) -> None:
+        # A stale dialog is unsafe even when its recipient happens to match.
+        if find_invite_dialog(self.page, identity) is not None:
+            raise TaskSkippedException(
+                "modal_recipient_mismatch", cooldown_eligible=False
+            )
+
+    def _prepare_connection_request(
+        self, url: str, try_personal_message: bool
+    ) -> tuple[ProfileIdentity, str | None]:
+        url = self._normalize_profile_url(url)
+        self._target_identity = None
+        self._profile_menu_open = False
+        self._send_attempted = False
+        self._last_audience_stats = None
+        logger.info("Preparing connection request for %s", url)
+        self.page.goto(url, timeout=60000, wait_until="domcontentloaded")
+        self.validate_session()
+        snapshot = self._read_preflight_profile(url)
+        identity = snapshot.identity
+        self._target_identity = identity
+        self._check_connection_state(identity)
 
         min_followers, require_500_connections = get_invite_audience_filter()
         details = (
@@ -1354,12 +1361,47 @@ class InviteTask(BaseTask):
                     "llm_invalid_response", cooldown_eligible=False
                 )
             assert_profile_identity(self.page, identity)
-        # An invitation dialog left by an earlier task must not be mistaken for the result
-        # of a new Connect click, even when its recipient happens to match.
-        if find_invite_dialog(self.page, identity) is not None:
-            raise TaskSkippedException(
-                "modal_recipient_mismatch", cooldown_eligible=False
-            )
+        self._require_no_invite_dialog(identity)
+        return identity, connection_message
+
+    def preview_connection_request(
+        self, url: str, try_personal_message: bool = True
+    ) -> dict:
+        """Prepare the invite and trial its first control without dispatching it."""
+        from connect_heuristics import _find_action
+
+        self._check_cooldown(self.invite_state.load(prune=False)["cooldown"])
+        identity, message = self._prepare_connection_request(url, try_personal_message)
+        for kind in ("connect", "more"):
+            if _find_action(self.page, identity, more=(kind == "more")) is None:
+                continue
+            # Actionability trials can scroll and the page may have changed.
+            self._require_no_invite_dialog(identity)
+            state = self._check_connection_state(identity)
+            if state != ConnectionState.CONNECTABLE:
+                break
+            return {
+                "control_kind": kind,
+                "connection_state": state.value,
+                "note_length": len(message or ""),
+            }
+        raise TaskSkippedException("connect_unavailable", cooldown_eligible=False)
+
+    def send_connection_request(
+        self, url: str, try_personal_message: bool = True
+    ) -> dict:
+        from connect_heuristics import (
+            get_cached_connect_button,
+            is_actionable_target,
+            is_target_action,
+            save_selector_to_cache,
+            try_heuristic_connect,
+        )
+
+        identity, connection_message = self._prepare_connection_request(
+            url, try_personal_message
+        )
+        url = identity.url
 
         if try_heuristic_connect(self.page, self.human, identity):
             return self._after_connect_click(url, connection_message)

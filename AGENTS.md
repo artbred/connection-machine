@@ -227,10 +227,11 @@ uv run playwright install webkit  # Linux: use install --with-deps webkit
 # run the main worker
 uv run python src/main.py
 
-# Three independent previews against an already authenticated WebKit profile.
+# Non-writing previews against an already authenticated WebKit profile.
 uv run python src/main.py --dry-run post
 uv run python src/main.py --dry-run comment
 uv run python src/main.py --dry-run notifications
+uv run python src/main.py --dry-run invite --profile-url "https://www.linkedin.com/in/profile-url/"
 
 # run one invite directly without using the DB queue
 uv run python src/main.py --debug-invite "https://linkedin.com/in/profile-url"
@@ -248,7 +249,9 @@ uv run python src/main.py --debug-feed-comment --submit-comment
 uv run python utils/populate_db.py
 ```
 
-`--dry-run post` verifies a visible, editable post composer without typing into a possibly autosaved draft. `comment` selects a feed post and generates a comment through OpenRouter, without opening the editor, notifying Telegram or storing history. `notifications` discovers a qualifying reply candidate without opening the database or updating discovery state; no candidate is a skip, not confirmation. These commands require member navigation on the expected LinkedIn route and refuse an expired session rather than submitting credentials. Normal page views may still be visible to LinkedIn.
+`--dry-run post` uses Start a post on the member feed, waits for the composer (including `/sharing/compose`), and verifies its scoped editable textbox and Post control without typing into a potentially autosaved draft. Real post tasks use the same controls, refuse existing drafts, verify text before the single submit click, and require composer dismissal. `comment` selects a feed post and generates a comment through OpenRouter without opening the editor, notifying Telegram or storing history. `notifications` discovers a qualifying reply without opening the database or updating discovery state; SDUI rows use the linked notification headline and a unique profile avatar, not quoted post content. No candidate is a skip, not confirmation.
+
+`--dry-run invite --profile-url URL` checks a real target, audience requirements, personalized note and the first actionable Connect/More control without dispatching it, opening its menu, claiming a queue slot, or recording invite history. It does not confirm delivery. All previews require a signed-in member on the expected first-party route and refuse an expired session rather than submitting credentials. LinkedIn can still see normal page views.
 
 `--debug-invite URL` is **live**, not a preview: Connect can send immediately. Only use it with the designated recipient and verified account quota; it does not go through dispatcher scheduling. The notification debug command can enqueue tasks even without `--send-notification-invite`; use `--dry-run notifications` for a non-enqueuing check.
 

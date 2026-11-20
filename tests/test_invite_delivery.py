@@ -213,6 +213,62 @@ class InviteDeliveryTest(OfflineBrowserTestCase):
             <button id="connect" class="connect-choice"''',
         )
 
+    def test_preview_reports_only_the_trialled_control_without_dispatch_or_writes(self):
+        html = fixture(already_open=False) + """
+        <script>
+          for (const event of ['pointerdown', 'click', 'input'])
+            document.addEventListener(event, () => document.body.dataset.dispatched = event, true);
+        </script>
+        """
+        more_html = html.replace("</button>", "</button><button>More</button>", 1)
+        more_html += "<style>#connect {pointer-events:none}</style>"
+        # A normal state load would prune this expired cooldown.
+        expired = '{"cooldown":{"active_until":"2000-01-01T00:00:00"},"events":[]}'
+        self.state_path.write_text(expired)
+        for kind, page_html in (("connect", html), ("more", more_html)):
+            with self.subTest(kind=kind):
+                task = self.make_task(page_html)
+                with patch.object(invite, "generate_connection_message", return_value=NOTE):
+                    evidence = task.preview_connection_request(TARGET + "?trk=preview")
+                self.assertEqual(self.page.url, TARGET)
+                self.assertEqual(evidence, {
+                    "control_kind": kind, "connection_state": "connectable", "note_length": len(NOTE),
+                })
+                self.assertIsNone(self.page.locator("body").get_attribute("data-dispatched"))
+                self.assertEqual(self.page.locator("#invite-dialog").count(), 0)
+                self.assertEqual(self.state_path.read_text(), expired)
+                self.assert_nothing_sent()
+
+    def test_preview_rejects_blocked_unknown_and_stale_dialog(self):
+        html = fixture(already_open=False)
+        for label, reason in (("Pending", "already_pending"), ("More", "connect_unavailable"),
+                              ("Connect", "modal_recipient_mismatch")):
+            with self.subTest(label=label):
+                page_html = html.replace("Invite Jane Prospect to connect", label).replace(
+                    ">Connect</button>", f">{label}</button>"
+                ) if label != "Connect" else fixture()
+                task = self.make_task(page_html)
+                with self.assertRaises(TaskSkippedException) as caught:
+                    task.preview_connection_request(TARGET, try_personal_message=False)
+                self.assertEqual(caught.exception.reason, reason)
+                self.assertEqual(self.page.locator("#invite-dialog").count(), int(label == "Connect"))
+                self.assertFalse(self.state_path.exists())
+                self.assert_nothing_sent()
+
+    def test_preview_rejects_foreign_url_and_active_cooldown_before_navigation(self):
+        task = self.make_task(fixture(already_open=False))
+        with patch.object(self.page, "goto") as navigate:
+            with self.assertRaises(ValueError):
+                task.preview_connection_request("https://linkedin.com.example/in/jane-prospect/")
+            active = '{"cooldown":{"reason":"weekly_limit_reached","active_until":"2999-01-01T00:00:00"},"events":[]}'
+            self.state_path.write_text(active)
+            with self.assertRaises(TaskSkippedException) as caught:
+                task.preview_connection_request(TARGET)
+            self.assertEqual(caught.exception.reason, "weekly_limit_reached")
+            self.assertEqual(self.state_path.read_text(), active)
+            navigate.assert_not_called()
+        self.assert_nothing_sent()
+
     def test_covered_sticky_connect_is_skipped_without_dispatch(self):
         task = self.make_task(self.covered_connect_fixture())
         self.assertTrue(self.page.locator('#sticky').is_visible())

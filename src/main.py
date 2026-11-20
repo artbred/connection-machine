@@ -147,9 +147,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="LinkedIn task automation")
     debug_group = parser.add_mutually_exclusive_group()
     debug_group.add_argument(
-        "--dry-run", choices=("post", "comment", "notifications"),
-        help="Inspect the composer, prepare a comment, or discover a reply; do not publish, notify or enqueue",
+        "--dry-run", choices=("post", "comment", "notifications", "invite"),
+        help="Prepare an operation without publishing, connecting, notifying or enqueuing",
     )
+    parser.add_argument("--profile-url", help="Real target profile for --dry-run invite only")
     debug_group.add_argument(
         "--check-auth",
         action="store_true",
@@ -188,12 +189,14 @@ def parse_args():
     args = parser.parse_args()
     if args.dry_run and (args.submit_comment or args.send_notification_invite or args.no_message):
         parser.error("--dry-run cannot be combined with action modifiers")
+    if bool(args.profile_url) != (args.dry_run == "invite"):
+        parser.error("--profile-url is required for and only allowed with --dry-run invite")
     return args
 
 
-def _require_member_route(page, path):
+def _require_member_route(page, *paths):
     url = urlsplit(page.url)
-    if (url.scheme, url.netloc, url.path.rstrip("/")) != ("https", "www.linkedin.com", path):
+    if (url.scheme, url.netloc) != ("https", "www.linkedin.com") or url.path.rstrip("/") not in paths:
         raise RuntimeError("Dry run did not reach the expected LinkedIn page")
     nav = page.locator(
         "nav a[href^='/mynetwork/']:visible, nav a[href^='/messaging/']:visible, "
@@ -204,11 +207,13 @@ def _require_member_route(page, path):
         raise RuntimeError("Dry run could not verify signed-in member navigation")
 
 
-def run_dry_run(page, operation):
+def run_dry_run(page, operation, profile_url=None):
     _require_member_route(page, "/feed")
+    paths = ("/feed",)
     if operation == "post":
         PostTask(page).inspect_composer()
         result = "Editable post composer found; draft untouched"
+        paths = ("/feed", "/sharing/compose")
     elif operation == "comment":
         candidate = FeedCommentTask(page).prepare_comment({})
         result = f"Comment prepared for post {candidate['post_key']}; not submitted or recorded"
@@ -217,9 +222,21 @@ def run_dry_run(page, operation):
         if not candidates:
             raise TaskSkippedException("no_notification_reply_candidates")
         result = f"Reply candidate {candidates[0]['notification_key']} found; not enqueued or recorded"
+        paths = ("/notifications",)
+    elif operation == "invite":
+        from linkedin_profile import canonical_profile_url
+
+        target = canonical_profile_url(profile_url)
+        if not target:
+            raise ValueError("A canonical LinkedIn profile URL is required")
+        proof = InviteTask(page).preview_connection_request(target)
+        result = f"Verified {proof['control_kind']} control and {proof['note_length']}-character note; no click"
+        if canonical_profile_url(page.url) != target:
+            raise RuntimeError("Dry run left the target profile")
+        paths = (urlsplit(page.url).path.rstrip("/"),)
     else:
         raise ValueError(f"Unknown dry run: {operation}")
-    _require_member_route(page, "/notifications" if operation == "notifications" else "/feed")
+    _require_member_route(page, *paths)
     logger.info("Dry run: %s.", result)
 
 
@@ -369,7 +386,7 @@ def main():
         profile_dir = os.path.join(os.getcwd(), "data", "connection-machine-webkit")
         with closing(BrowserSession(profile_dir)) as browser:
             if args.dry_run:
-                run_dry_run(browser.acquire_page(existing_session_only=True), args.dry_run)
+                run_dry_run(browser.acquire_page(existing_session_only=True), args.dry_run, args.profile_url)
                 return
             if args.check_auth:
                 browser.acquire_page()
